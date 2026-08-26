@@ -1,0 +1,15 @@
+# Optional vector store services for future backend support.
+# The default in-memory backend requires no external services.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    profiles:
+      - qdrant
+
+volumes:
+  qdrant_storage:

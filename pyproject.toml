@@ -1,0 +1,56 @@
+[project]
+name = "doc-etl-api"
+version = "0.1.0"
+description = "Documents ETL API using Docling and LlamaIndex"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Doc ETL API Contributors" },
+]
+keywords = ["etl", "documents", "rag", "llamaindex", "docling", "fastapi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "docling>=2.5.0",
+    "llama-index>=0.12.0",
+    "llama-index-embeddings-huggingface>=0.4.0",
+    "python-multipart>=0.0.17",
+    "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+doc-etl-api = "doc_etl_api.main:run"
+
+[tool.setuptools.packages.find]
+include = ["doc_etl_api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.ruff]
+line-length = 100
