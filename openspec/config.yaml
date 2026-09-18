@@ -1,0 +1,13 @@
+schema: spec-driven
+
+# This project's planning artifacts live in the `team-plans` store, not in
+# this repository. Only the `store:` pointer below is read from this file —
+# OpenSpec resolves the store as the working root, so every `openspec`
+# command run from this directory reads and writes there, and the store's
+# own config supplies the project context and rules.
+#
+# Do not create openspec/specs/ or openspec/changes/ here. A local planning
+# shape takes precedence over this pointer and the declaration is silently
+# ignored ("this directory is a real OpenSpec root; the declaration is
+# ignored"), which would split the spec library in two.
+store: team-plans

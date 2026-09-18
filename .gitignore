@@ -181,4 +181,10 @@ temp/
 qdrant_storage/
 
 .claude*
-openspec*
+
+# Planning artifacts live in the team-plans store, not in this repo. Only the
+# store pointer is tracked, so a fresh clone resolves to the same specs.
+# (`openspec*` would exclude this directory itself, and git cannot re-include
+# a file whose parent directory is excluded — hence `openspec/*` + a negation.)
+openspec/*
+!openspec/config.yaml
