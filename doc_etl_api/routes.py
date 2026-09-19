@@ -1,3 +1,5 @@
+import logging
+import time
 import uuid
 from io import BytesIO
 from typing import Annotated
@@ -13,11 +15,14 @@ from fastapi import (
     UploadFile,
     status,
 )
+from starlette.concurrency import run_in_threadpool
 
+from doc_etl_api.bootstrap import BootstrapState
 from doc_etl_api.config import Settings, settings
 from doc_etl_api.jobs import JobRegistry
 from doc_etl_api.pipeline import IndexPipeline
 from doc_etl_api.schemas import (
+    HealthResponse,
     IngestFileResponse,
     IngestUrlResponse,
     JobStatusResponse,
@@ -34,6 +39,8 @@ def _is_valid_http_url(url: str) -> bool:
 
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 def get_pipeline(request: Request) -> IndexPipeline:
@@ -92,6 +99,29 @@ def _run_url_ingestion(
         job.fail(str(exc))
 
 
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Service readiness",
+    description="Report whether the service is ready and what is currently in the index. "
+    "Performs no retrieval and no embedding, so it stays responsive regardless of "
+    "index size or search load.",
+)
+async def health(
+    request: Request,
+    pipeline: PipelineDep,
+    jobs: JobsDep,
+) -> HealthResponse:
+    bootstrap: BootstrapState = request.app.state.bootstrap
+    return HealthResponse(
+        status="ready",
+        indexed_sources=pipeline.indexed_sources,
+        indexed_chunks=pipeline.indexed_chunks,
+        jobs_in_flight=jobs.in_flight,
+        bootstrap=bootstrap.status.value,
+    )
+
+
 @router.post(
     "/sources/files",
     response_model=list[IngestFileResponse],
@@ -114,13 +144,19 @@ async def ingest_files(
         )
 
     results: list[IngestFileResponse] = []
+    # A file's identity is its filename, so two uploads sharing one filename are
+    # one source. Queuing both would race two replacements of the same content,
+    # so the request reports that source once. Validation still runs for every
+    # upload, so a rejected file is reported rather than silently skipped.
+    queued_names: set[str] = set()
     for upload in files:
+        name = upload.filename or "unnamed"
         if upload.size == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"File {upload.filename!r} is empty.",
             )
-        if not pipeline.converter.is_supported_file(upload.filename or ""):
+        if not pipeline.converter.is_supported_file(name):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -128,6 +164,9 @@ async def ingest_files(
                     f"Supported extensions: {sorted(pipeline.converter.SUPPORTED_FILE_EXTENSIONS)}"
                 ),
             )
+        if name in queued_names:
+            continue
+        queued_names.add(name)
 
         file_bytes = await upload.read()
         source_id = str(uuid.uuid4())
@@ -139,14 +178,14 @@ async def ingest_files(
             job.job_id,
             source_id,
             file_bytes,
-            upload.filename or "unnamed",
+            name,
             upload.content_type,
         )
         results.append(
             IngestFileResponse(
                 job_id=job.job_id,
                 source_id=source_id,
-                name=upload.filename or "unnamed",
+                name=name,
                 mime_type=upload.content_type,
             )
         )
@@ -176,8 +215,16 @@ async def ingest_urls(
                 detail=f"Invalid URL: {url!r}. Only HTTP and HTTPS URLs are supported.",
             )
 
+    # The same URL submitted twice is one source; a second job would race a
+    # replacement of content the first is already storing. URLs that differ but
+    # redirect to one page collapse later, when their final URL is known.
     results: list[IngestUrlResponse] = []
+    queued_urls: set[str] = set()
     for url in request.urls:
+        if url in queued_urls:
+            continue
+        queued_urls.add(url)
+
         source_id = str(uuid.uuid4())
         job = jobs.create(source_id=source_id)
         background_tasks.add_task(
@@ -236,6 +283,17 @@ async def search(
             detail="Query must contain non-whitespace characters.",
         )
     top_k = request.top_k or app_settings.default_top_k
-    raw_results = pipeline.search(query, top_k=top_k)
+    # Retrieval embeds the query synchronously, so it must not run on the event
+    # loop: doing so would block every other route for the duration.
+    search_start = time.perf_counter()
+    raw_results = await run_in_threadpool(pipeline.search, query, top_k=top_k)
+    search_ms = round((time.perf_counter() - search_start) * 1000, 2)
     results = [SearchResult(**r) for r in raw_results]
+    logger.info(
+        "Search query=%r top_k=%d results=%d search_ms=%s",
+        query,
+        top_k,
+        len(results),
+        search_ms,
+    )
     return SearchResponse(results=results)

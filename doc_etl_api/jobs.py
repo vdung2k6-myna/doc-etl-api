@@ -67,5 +67,10 @@ class JobRegistry:
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
+    @property
+    def in_flight(self) -> int:
+        """Jobs that have been created but not yet completed or failed."""
+        return sum(1 for job in self._jobs.values() if job.status is JobStatus.PENDING)
+
     def update(self, job: Job) -> None:
         self._jobs[job.job_id] = job

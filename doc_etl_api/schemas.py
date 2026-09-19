@@ -42,6 +42,17 @@ class SearchResponse(BaseModel):
     results: list[SearchResult] = Field(default_factory=list)
 
 
+class HealthResponse(BaseModel):
+    status: str = Field(..., description="Service readiness: 'ready'")
+    indexed_sources: int = Field(..., description="Number of sources in the index")
+    indexed_chunks: int = Field(..., description="Number of chunks in the index")
+    jobs_in_flight: int = Field(..., description="Ingestion jobs not yet finished")
+    bootstrap: str = Field(
+        ...,
+        description="Startup corpus bootstrap state: disabled, pending, in_progress, complete, or failed",
+    )
+
+
 class JobStatusResponse(BaseModel):
     job_id: str = Field(..., description="Unique identifier for the ingestion job")
     source_id: str = Field(..., description="Unique identifier for the ingested source")

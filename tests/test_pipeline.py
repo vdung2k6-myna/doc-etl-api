@@ -1,18 +1,112 @@
+import hashlib
+import logging
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
+import requests
+import tiktoken
 from docling.datamodel.base_models import ConversionStatus
+from llama_index.core import Document as LlamaDocument
+from llama_index.core import Settings as LlamaSettings
+from llama_index.core.embeddings import MockEmbedding
 
-from doc_etl_api.config import Settings
-from doc_etl_api.pipeline import DoclingConverter, IndexPipeline
+from doc_etl_api.config import DEFAULT_USER_AGENT, Settings
+from doc_etl_api.pipeline import (
+    DoclingConverter,
+    IndexPipeline,
+    _content_token_ids,
+    _node_id,
+    _split_oversized_text,
+)
+from tests.stubs import (
+    EMBEDDING_MAX_TOKENS,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_TOKENIZER,
+    StubEmbedding,
+)
+
+# Sentence-packed document: long enough to split into several nodes at the chunk
+# sizes used below, and not paragraph-shaped, so adjacent nodes share a boundary.
+SENTENCE_DOC = " ".join(
+    f"Sentence {index} covers its own separate subject in its own separate wording."
+    for index in range(1, 61)
+)
+
+# A passage unlike anything around it, placed where the pre-change sizing left it
+# in a chunk's discarded tail. Measured: 381 tokens into its chunk against the
+# ~254-token window the model actually reads, so none of it reached the embedding.
+LATE_MARKER = " ".join(
+    [
+        "The closing remark concerns xylophones rebuilt from volcanic basalt.",
+        "Basalt xylophones require tuning against obsidian resonators.",
+        "Obsidian resonators are quarried nowhere near the administrative cases.",
+    ]
+)
+LONG_DOC = " ".join(
+    [
+        f"Paragraph {i} revisits the ordinary administrative details of case {i}."
+        for i in range(1, 30)
+    ]
+    + [LATE_MARKER]
+    + [
+        f"Paragraph {i} revisits the ordinary administrative details of case {i}."
+        for i in range(30, 81)
+    ]
+)
+
+
+def _model_tokens(text: str) -> int:
+    """Tokens the embedding model reads for text, special tokens included."""
+    return len(EMBEDDING_TOKENIZER.encode(text, add_special_tokens=True))
+
+
+def _cosine(left, right) -> float:
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    return float(left @ right / (np.linalg.norm(left) * np.linalg.norm(right)))
+
+
+def _boundary_overlap(earlier: str, later: str) -> int:
+    """Shared content tokens between two adjacent nodes, computed independently."""
+    head = EMBEDDING_TOKENIZER.encode(earlier, add_special_tokens=False)
+    tail = EMBEDDING_TOKENIZER.encode(later, add_special_tokens=False)
+    for size in range(min(len(head), len(tail)), 0, -1):
+        if head[-size:] == tail[:size]:
+            return size
+    return 0
+
+
+def _stub_pipeline(chunk_size=None, chunk_overlap=10, embedding_model=None, min_chunk_tokens=32):
+    """A pipeline paired with a double stating its own limit and tokenizer."""
+    return IndexPipeline(
+        Settings(
+            vector_store_backend="simple",
+            embedding_model=EMBEDDING_MODEL_NAME,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_chunk_tokens=min_chunk_tokens,
+            default_top_k=5,
+        ),
+        converter=MagicMock(),
+        embedding_model=embedding_model or StubEmbedding(embed_dim=8),
+    )
 
 
 @pytest.fixture
 def settings():
+    # Chunk sizes are stated explicitly here: IndexPipeline derives its default
+    # from the embedding model, so a fixture that leaves them unset would assert
+    # nothing about the sizing these tests exercise. 128 fits within the 256-token
+    # model they are paired with.
     return Settings(
         vector_store_backend="simple",
-        embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        embedding_model=EMBEDDING_MODEL_NAME,
         chunk_size=128,
         chunk_overlap=10,
         default_top_k=2,
@@ -70,6 +164,151 @@ def test_docling_converter_url(settings, tmp_path):
     assert final_url == "https://example.com/page"
 
 
+# The chrome around the main content of the page used by the extraction tests
+# below. `NAV` carries a heading, which is what defeats Docling's own
+# boilerplate heuristic, so it reaches the markdown unless it is extracted away.
+_URL_BODY = " ".join(
+    f"Sentence {index} describes the widget frame and its latch clearance."
+    for index in range(1, 26)
+)
+_URL_PAGE = (
+    "<html><body>"
+    '<nav><h2>Browse</h2><a href="/">Home</a><a href="/docs">Docs</a></nav>'
+    '<div class="promo"><h3>Buy now</h3><p>Save 20% this week.</p></div>'
+    f'<main><h1>Widget Handbook</h1><p>See <a href="/pricing">our pricing</a> first.</p>'
+    f"<h2>Assembly</h2><p>{_URL_BODY}</p></main>"
+    "<footer><p>&copy; 2026 Widget Co.</p></footer>"
+    "</body></html>"
+)
+
+
+def fetch(converter, *, url: str = "https://example.com/page", html: str = _URL_PAGE):
+    """Convert *html* through `convert_url`, standing in for the HTTP fetch."""
+    with patch("doc_etl_api.pipeline.requests.get") as mock_get:
+        mock_get.return_value = MagicMock(
+            url=url, content=html.encode(), raise_for_status=MagicMock()
+        )
+        return converter.convert_url("https://example.com/start")
+
+
+def test_convert_url_indexes_only_the_main_content() -> None:
+    markdown, final_url = fetch(DoclingConverter())
+
+    assert final_url == "https://example.com/page"
+    assert "Widget Handbook" in markdown
+    assert "Assembly" in markdown
+    assert "Sentence 1 describes" in markdown
+    assert "Browse" not in markdown, "navigation reached the markdown"
+    assert "Buy now" not in markdown, "promotional banner reached the markdown"
+    assert "Widget Co" not in markdown, "footer reached the markdown"
+
+
+def _pipeline_for_fetch(user_agent: str) -> tuple[IndexPipeline, DoclingConverter]:
+    """A pipeline with a real converter, so the outgoing request can be observed."""
+    converter = DoclingConverter()
+    pipeline = IndexPipeline(
+        Settings(
+            embedding_model=EMBEDDING_MODEL_NAME,
+            chunk_overlap=10,
+            user_agent=user_agent,
+        ),
+        converter=converter,
+        embedding_model=StubEmbedding(embed_dim=8),
+    )
+    return pipeline, converter
+
+
+def _ingest_url_observing_the_fetch(user_agent: str) -> str | None:
+    """Ingest a URL with a stubbed fetch, and report the `User-Agent` it sent."""
+    pipeline, converter = _pipeline_for_fetch(user_agent)
+    conversion = MagicMock(
+        status=ConversionStatus.SUCCESS,
+        document=MagicMock(export_to_markdown=lambda: "# Widget Handbook\n\nBody."),
+    )
+
+    with patch("doc_etl_api.pipeline.requests.get") as mock_get:
+        mock_get.return_value = MagicMock(
+            url="https://example.com/page",
+            content=_URL_PAGE.encode(),
+            raise_for_status=MagicMock(),
+        )
+        with patch.object(converter._converter, "convert", return_value=conversion):
+            pipeline.ingest_url(source_id="source-1", url="https://example.com/start")
+
+    _, kwargs = mock_get.call_args
+    return (kwargs.get("headers") or {}).get("User-Agent")
+
+
+def test_url_ingestion_fetches_with_the_configured_user_agent() -> None:
+    configured = "doc-etl-api/0.1.0 (contact: ops@example.com)"
+
+    assert _ingest_url_observing_the_fetch(configured) == configured
+
+
+def test_the_fetch_never_sends_the_http_library_default() -> None:
+    """Regression: the library's own user agent is what such hosts refuse.
+
+    A fetch that sent no header at all would be refused the same way, so the
+    absent case is asserted explicitly rather than allowed to pass by comparing
+    unequal to the library default.
+    """
+    library_default = requests.utils.default_user_agent()
+
+    for configured, expected in (
+        (DEFAULT_USER_AGENT, DEFAULT_USER_AGENT),
+        ("   ", DEFAULT_USER_AGENT),
+        (
+            "doc-etl-api/0.1.0 (contact: ops@example.com)",
+            "doc-etl-api/0.1.0 (contact: ops@example.com)",
+        ),
+    ):
+        sent = _ingest_url_observing_the_fetch(configured)
+
+        assert sent is not None, f"no user agent was sent for {configured!r}"
+        assert sent != library_default, f"the library default was sent for {configured!r}"
+        assert sent == expected
+
+
+def test_convert_url_excludes_navigation_that_carries_a_heading() -> None:
+    """Regression: a heading inside the navigation used to defeat extraction.
+
+    Docling's boilerplate heuristic labels everything before the first heading as
+    furniture, so a heading anywhere in the page chrome flips the whole document
+    to body content. Measured against the pre-change `convert_url`, this page
+    reached the markdown with its navigation and promotional banner intact; both
+    assertions below failed.
+    """
+    markdown, _ = fetch(DoclingConverter())
+
+    assert "Browse" not in markdown, "a heading in the chrome defeated extraction"
+    assert "Buy now" not in markdown, "a heading in the chrome defeated extraction"
+
+
+def test_convert_url_markdown_links_are_urls() -> None:
+    """Asserted platform-independently: the leak is `\\pricing` on Windows and
+    `/pricing` elsewhere, and only the first looks obviously wrong.
+    """
+    markdown, _ = fetch(DoclingConverter())
+
+    targets = re.findall(r"\]\(([^)]+)\)", markdown)
+    assert targets, "the fixture is supposed to carry a link"
+    for target in targets:
+        assert target.startswith(("http://", "https://")), f"link target is not a URL: {target}"
+
+
+def test_convert_url_resolves_relative_links_against_the_final_url() -> None:
+    """A root-relative href must reach the markdown as an absolute URL.
+
+    The page redirects, and the link is resolved against where it landed rather
+    than against the URL that was requested.
+    """
+    markdown, final_url = fetch(DoclingConverter(), url="https://example.com/guides/page")
+
+    assert final_url == "https://example.com/guides/page"
+    assert "https://example.com/pricing" in markdown
+    assert "\\pricing" not in markdown, "a link target was rewritten as a filesystem path"
+
+
 def test_index_pipeline_ingest_file(settings):
     pipeline = IndexPipeline(settings)
     source_id = "source-file-1"
@@ -124,3 +363,1007 @@ def test_index_pipeline_ingest_url(settings):
     assert "embed_ms" in timings
     assert "index_ms" in timings
     mock_insert.assert_called_once()
+
+
+@pytest.fixture
+def searchable_pipeline(settings):
+    """A pipeline over a real vector store with a deterministic embed model."""
+    return IndexPipeline(
+        settings,
+        converter=MagicMock(),
+        embedding_model=StubEmbedding(embed_dim=8),
+    )
+
+
+def test_concurrent_ingestion_keeps_every_source_searchable(searchable_pipeline):
+    """Concurrent indexing must not drop either source's chunks."""
+
+    def convert(file, filename):
+        label = filename.removesuffix(".txt").removeprefix("doc")
+        return f"# Document {label}\n\nUnique content for source {label}."
+
+    searchable_pipeline.converter.convert_file.side_effect = convert
+
+    def ingest(index: int) -> None:
+        searchable_pipeline.ingest_file(
+            source_id=f"source-{index}",
+            file=BytesIO(f"doc {index}".encode()),
+            filename=f"doc{index}.txt",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(ingest, [1, 2]))
+
+    results = searchable_pipeline.search("Unique content", top_k=10)
+    assert {r["source_id"] for r in results} == {"source-1", "source-2"}
+
+
+def test_search_during_ingestion_returns_well_formed_results(searchable_pipeline):
+    """A search overlapping an index write must not raise or return junk."""
+    ingest_started = threading.Event()
+    allow_ingest_to_finish = threading.Event()
+
+    def convert(file, filename):
+        ingest_started.set()
+        assert allow_ingest_to_finish.wait(timeout=5)
+        return "# Doc\n\nSome content."
+
+    searchable_pipeline.converter.convert_file.side_effect = convert
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            searchable_pipeline.ingest_file,
+            source_id="source-1",
+            file=BytesIO(b"content"),
+            filename="doc.txt",
+        )
+        assert ingest_started.wait(timeout=5)
+        results = searchable_pipeline.search("Some content", top_k=5)
+        allow_ingest_to_finish.set()
+        future.result(timeout=5)
+
+    assert isinstance(results, list)
+    for result in results:
+        assert set(result) == {"text", "score", "source_id", "source_type", "source_name"}
+
+
+def test_index_counters_track_sources_and_chunks(searchable_pipeline):
+    """The readiness counters must match what was actually indexed."""
+    searchable_pipeline.converter.convert_file.side_effect = lambda file, filename: (
+        "# Doc\n\nSome content."
+    )
+
+    assert searchable_pipeline.indexed_sources == 0
+    assert searchable_pipeline.indexed_chunks == 0
+
+    for index in (1, 2):
+        searchable_pipeline.ingest_file(
+            source_id=f"source-{index}",
+            file=BytesIO(b"content"),
+            filename=f"doc{index}.txt",
+        )
+
+    assert searchable_pipeline.indexed_sources == 2
+    # Each source is a single short paragraph, well under the 128-token
+    # chunk size, so one node per source.
+    assert searchable_pipeline.indexed_chunks == 2
+
+
+def test_default_chunk_size_follows_the_embedding_model_limit():
+    """An unset CHUNK_SIZE must track the model, not a constant that can go stale."""
+    model = StubEmbedding(embed_dim=8)
+
+    pipeline = _stub_pipeline(chunk_size=None, embedding_model=model)
+
+    assert pipeline.chunk_size == model.max_length
+
+
+def test_chunk_size_above_the_model_limit_is_rejected():
+    """Oversized chunks are refused at startup rather than truncated at ingestion."""
+    with pytest.raises(ValueError) as error:
+        _stub_pipeline(chunk_size=EMBEDDING_MAX_TOKENS + 1)
+
+    message = str(error.value)
+    assert str(EMBEDDING_MAX_TOKENS) in message, "the error must name the limit"
+    assert EMBEDDING_MODEL_NAME in message, "the error must name the model"
+
+
+def test_embedding_model_without_a_stated_limit_is_rejected():
+    """ "No limit" is a startup error, not a licence to guess a chunk size."""
+    with pytest.raises(ValueError, match="no maximum input length"):
+        _stub_pipeline(chunk_size=None, embedding_model=MockEmbedding(embed_dim=8))
+
+
+def test_embedding_model_without_a_tokenizer_is_rejected():
+    """Chunk size cannot be measured in a vocabulary the pipeline cannot reach."""
+
+    class LimitOnly(MockEmbedding):
+        max_length: int = EMBEDDING_MAX_TOKENS
+
+    with pytest.raises(ValueError, match="exposes no tokenizer"):
+        _stub_pipeline(chunk_size=None, embedding_model=LimitOnly(embed_dim=8))
+
+
+def test_splitter_counts_tokens_the_way_the_embedding_model_does():
+    """Chunk size must be counted in the vocabulary the embedder actually reads."""
+    _stub_pipeline(chunk_size=None)
+    sample = "The quick brown fox jumps over the lazy dog."
+    count = LlamaSettings.node_parser._tokenizer
+
+    # The model adds its own special tokens, and its window covers them, so the
+    # count the splitter budgets with has to include them.
+    assert len(count(sample)) == _model_tokens(sample)
+    # ...which is not the count the pipeline used before: tiktoken measured a
+    # different, unrelated vocabulary against a window that belongs to this one.
+    tiktoken_count = len(tiktoken.encoding_for_model("gpt-3.5-turbo").encode(sample))
+    assert len(count(sample)) != tiktoken_count
+
+
+def test_ingestion_reports_the_chunking_it_achieved():
+    """The reported outcome must describe the nodes actually produced."""
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    with patch.object(pipeline._index, "insert_nodes") as mock_insert:
+        result, _ = pipeline.ingest_file(
+            source_id="source-1", file=BytesIO(b"content"), filename="doc.txt"
+        )
+
+    nodes = mock_insert.call_args.args[0]
+    assert len(nodes) > 1, "the document must split for this test to mean anything"
+
+    chunking = result["chunking"]
+    assert chunking["nodes"] == len(nodes)
+    assert chunking["max_node_tokens"] == max(_model_tokens(n.get_content()) for n in nodes)
+    assert chunking["overlap_tokens"] == min(
+        _boundary_overlap(earlier.get_content(), later.get_content())
+        for earlier, later in zip(nodes, nodes[1:], strict=False)
+    )
+    assert chunking["overlap_tokens"] > 0, "packed sentences must overlap"
+
+
+def test_overlap_is_reported_as_achieved_not_as_configured():
+    """Overlap is quantized to whole sentences, so a configured overlap can deliver
+    none at all. The report must describe what happened, not what was asked for."""
+    # 8 tokens of overlap cannot hold a whole sentence, which is ~14 tokens, so the
+    # splitter repeats none of the previous node. The chunk size is 128 rather than
+    # 64 so that the node floor stays out of the way: at 64 the splitter emits
+    # ~30-token nodes, every one of them below the floor, so the nodes this asserts
+    # on would be merged blobs instead of the splitter's own output.
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=8)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    result, _ = pipeline.ingest_file(
+        source_id="source-1", file=BytesIO(b"content"), filename="doc.txt"
+    )
+
+    assert result["chunking"]["nodes"] > 1
+    assert result["chunking"]["floor_merges"] == 0, "the floor changed the nodes under test"
+    assert result["chunking"]["overlap_tokens"] == 0
+
+
+def test_overlap_is_reported_as_unset_when_there_is_no_boundary():
+    """A single-node source has no adjacent pair, so it reports no overlap."""
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=10)
+    pipeline.converter.convert_file.return_value = "One short paragraph."
+
+    result, _ = pipeline.ingest_file(
+        source_id="source-1", file=BytesIO(b"content"), filename="doc.txt"
+    )
+
+    assert result["chunking"]["nodes"] == 1
+    assert result["chunking"]["overlap_tokens"] is None
+
+
+def test_per_source_log_line_carries_the_chunking_outcome(caplog):
+    """A sizing mismatch must be visible in the logs without polling the API."""
+    pipeline = _stub_pipeline(chunk_size=64, chunk_overlap=8)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.converter.convert_url.return_value = (SENTENCE_DOC, "https://example.com/final")
+
+    with caplog.at_level(logging.INFO):
+        file_result, _ = pipeline.ingest_file(
+            source_id="source-1", file=BytesIO(b"content"), filename="doc.txt"
+        )
+        url_result, _ = pipeline.ingest_url(source_id="source-2", url="https://example.com/page")
+
+    messages = [record.getMessage() for record in caplog.records]
+    file_line = next(m for m in messages if m.startswith("Indexed file"))
+    url_line = next(m for m in messages if m.startswith("Indexed URL"))
+
+    for line, result in ((file_line, file_result), (url_line, url_result)):
+        chunking = result["chunking"]
+        assert "chunking=" in line
+        assert f"'nodes': {chunking['nodes']}" in line
+        assert f"'max_node_tokens': {chunking['max_node_tokens']}" in line
+
+
+def test_no_node_exceeds_the_embedding_model_input_limit():
+    """Regression: chunks were measured in tiktoken against a 512 default while the
+    embedder stops at 256, so the tail of every chunk was discarded unembedded."""
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=50)
+    pipeline.converter.convert_file.return_value = LONG_DOC
+
+    with patch.object(pipeline._index, "insert_nodes") as mock_insert:
+        result, _ = pipeline.ingest_file(
+            source_id="source-1", file=BytesIO(b"content"), filename="doc.txt"
+        )
+
+    nodes = mock_insert.call_args.args[0]
+    assert len(nodes) > 1
+
+    sizes = [_model_tokens(node.get_content()) for node in nodes]
+    assert max(sizes) <= EMBEDDING_MAX_TOKENS
+    assert result["chunking"]["max_node_tokens"] == max(sizes)
+
+
+def test_content_deep_inside_a_document_reaches_its_embedding():
+    """Regression: the passage sat past the end of the model's window, so it reached
+    a node whose text carried it but whose embedding did not represent it -- stored,
+    returned by search for its neighbours, and findable by nothing."""
+    pipeline = IndexPipeline(
+        Settings(
+            vector_store_backend="simple",
+            embedding_model=EMBEDDING_MODEL_NAME,
+            chunk_size=None,
+            chunk_overlap=50,
+            default_top_k=5,
+        ),
+        converter=MagicMock(),
+    )
+    pipeline.converter.convert_file.return_value = LONG_DOC
+
+    # `wraps` lets the insert run for real -- so the search below runs against what
+    # was stored -- while still handing back the nodes as they were embedded.
+    with patch.object(
+        pipeline._index, "insert_nodes", wraps=pipeline._index.insert_nodes
+    ) as mock_insert:
+        result, _ = pipeline.ingest_file(
+            source_id="source-1", file=BytesIO(b"content"), filename="doc.txt"
+        )
+    assert result["chunking"]["nodes"] > 1
+
+    nodes = mock_insert.call_args.args[0]
+    carrying = next(node for node in nodes if LATE_MARKER in node.get_content())
+    content = carrying.get_content()
+
+    # Nothing of the node was discarded: what was stored is the embedding of the
+    # node's whole text, not of the first window's worth of it.
+    whole = pipeline._embedding_model.get_text_embedding(content)
+    assert _cosine(carrying.embedding, whole) > 0.999999
+
+    # ...which is what makes the passage findable: it lies inside the part of the
+    # node the model actually read.
+    offset = _model_tokens(content[: content.index(LATE_MARKER)])
+    assert offset + _model_tokens(LATE_MARKER) <= EMBEDDING_MAX_TOKENS
+
+    results = pipeline.search(LATE_MARKER, top_k=10)
+    assert any(LATE_MARKER in item["text"] for item in results)
+
+
+# --- Ingestion identity: re-ingesting a source replaces it rather than duplicating ---
+
+# A paragraph both documents carry verbatim. The sentences are distinct from one
+# another on purpose: the splitter repeats whole trailing sentences across a node
+# boundary, so a paragraph built from one repeated sentence would have its opening
+# present in every node that follows -- there would be no way to tell a source
+# that had lost its first node from one that had not.
+SHARED_SENTENCES = (
+    "Shared opening material carried by two different documents in this test.",
+    "Second shared sentence that both of the documents keep in common here.",
+    "Third shared sentence present in each of the two documents under test.",
+    "Fourth shared sentence that the two documents hold identically as well.",
+    "Fifth shared sentence closing the paragraph both documents carry along.",
+)
+SHARED_PARAGRAPH = " ".join(SHARED_SENTENCES)
+SHARED_OPENING = SHARED_SENTENCES[0]
+ALPHA_PARAGRAPH = "Alpha-specific material that appears in no other document here. " * 3
+BETA_PARAGRAPH = "Beta-specific material that appears in no other document here. " * 3
+# The splitter's own paragraph break, so the shared paragraph is never packed
+# together with the source-specific paragraph that follows it.
+PARAGRAPH_GAP = "\n\n\n"
+
+
+def _stored_nodes(pipeline) -> list:
+    """The nodes the index currently holds, read through the docstore.
+
+    `SimpleVectorStore` keeps only embeddings -- `get_nodes` on it raises -- so
+    the node text lives in the index's docstore.
+    """
+    return list(pipeline.index.storage_context.docstore.docs.values())
+
+
+def _ingest_text(pipeline, filename: str, text: str) -> None:
+    pipeline.converter.convert_file.return_value = text
+    pipeline.ingest_file(
+        source_id=f"source-{filename}", file=BytesIO(b"content"), filename=filename
+    )
+
+
+def test_re_ingesting_a_file_reuses_its_document_identity(searchable_pipeline):
+    """A file's identity is derived from its name, not minted per ingestion."""
+    _ingest_text(searchable_pipeline, "doc.txt", "# Doc\n\nSome content.")
+    first = set(searchable_pipeline.index.ref_doc_info)
+
+    _ingest_text(searchable_pipeline, "doc.txt", "# Doc\n\nSome content.")
+
+    assert first == {"doc.txt"}
+    assert set(searchable_pipeline.index.ref_doc_info) == first
+
+
+def test_urls_landing_on_one_page_share_a_document_identity(searchable_pipeline):
+    """A page's identity is where it finally landed, not what was requested.
+
+    Two different request URLs that redirect to one page are one source.
+    """
+    searchable_pipeline.converter.convert_url.return_value = (
+        "# Page\n\nSome content.",
+        "https://example.com/final",
+    )
+
+    for submitted in ("https://example.com/a", "https://example.com/b"):
+        searchable_pipeline.ingest_url(source_id=submitted, url=submitted)
+
+    assert set(searchable_pipeline.index.ref_doc_info) == {"https://example.com/final"}
+
+
+def test_every_stored_node_carries_its_sources_identity(searchable_pipeline):
+    """Nothing is stored that cannot later be located and replaced."""
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    identities = set(searchable_pipeline.index.ref_doc_info)
+    nodes = _stored_nodes(searchable_pipeline)
+
+    assert nodes
+    assert {node.ref_doc_id for node in nodes} == identities
+
+
+def test_node_ids_are_stable_across_re_ingestion(searchable_pipeline):
+    """Re-parsing the same source must produce the same node identities.
+
+    LlamaIndex mints a random id per node, so without a derived one every
+    ingestion is made of nodes the index has never seen.
+    """
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+    first = {node.node_id for node in _stored_nodes(searchable_pipeline)}
+    assert len(first) > 1, "the document must split for this test to mean anything"
+
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    assert {node.node_id for node in _stored_nodes(searchable_pipeline)} == first
+
+
+def test_two_sources_sharing_text_keep_their_own_copies(searchable_pipeline):
+    """Sharing a paragraph must not make two sources share a node."""
+    _ingest_text(
+        searchable_pipeline, "alpha.txt", SHARED_PARAGRAPH + PARAGRAPH_GAP + ALPHA_PARAGRAPH
+    )
+    _ingest_text(searchable_pipeline, "beta.txt", SHARED_PARAGRAPH + PARAGRAPH_GAP + BETA_PARAGRAPH)
+
+    by_source: dict[str, list] = {}
+    for node in _stored_nodes(searchable_pipeline):
+        if SHARED_OPENING in node.get_content():
+            by_source.setdefault(node.ref_doc_id, []).append(node)
+
+    # Both sources kept their own nodes rather than sharing one entry between
+    # them, and the nodes carrying the shared paragraph hold the same text --
+    # which is what a node id derived from text would have collapsed into a
+    # single entry the two of them claim.
+    assert set(by_source) == {"alpha.txt", "beta.txt"}
+    alpha_texts = [node.get_content() for node in by_source["alpha.txt"]]
+    beta_texts = [node.get_content() for node in by_source["beta.txt"]]
+    assert alpha_texts == beta_texts
+
+
+def test_re_ingesting_an_edited_source_removes_the_previous_version(searchable_pipeline):
+    """A corrected document must not leave the version it replaced in the index."""
+    _ingest_text(searchable_pipeline, "doc.txt", ALPHA_PARAGRAPH)
+    _ingest_text(searchable_pipeline, "doc.txt", BETA_PARAGRAPH)
+
+    stored = [node.get_content() for node in _stored_nodes(searchable_pipeline)]
+
+    assert stored
+    assert any("Beta-specific" in text for text in stored)
+    assert not any("Alpha-specific" in text for text in stored), "the superseded version survived"
+
+
+def test_a_source_that_was_never_indexed_ingests_normally(searchable_pipeline):
+    """Replacement removes what is there; on a first ingestion there is nothing
+    to remove, which must be a no-op rather than an error."""
+    assert searchable_pipeline.index.ref_doc_info == {}
+
+    _ingest_text(searchable_pipeline, "doc.txt", ALPHA_PARAGRAPH)
+
+    assert searchable_pipeline.indexed_sources == 1
+    assert _stored_nodes(searchable_pipeline)
+
+
+def test_editing_one_source_does_not_disturb_another_sharing_its_text(searchable_pipeline):
+    """The reason node identity is scoped to its source rather than its text.
+
+    With text-addressed node ids the shared opening is an entry both sources
+    claim, so the deletion below removes it on behalf of the source that no
+    longer carries it -- taking it away from the source that still does. The
+    check is on the shared paragraph's opening rather than on the paragraph
+    appearing somewhere: a source can lose its first node and still have the
+    shared text in the node that follows, which is exactly how this failure
+    hides.
+    """
+    _ingest_text(
+        searchable_pipeline, "alpha.txt", SHARED_PARAGRAPH + PARAGRAPH_GAP + ALPHA_PARAGRAPH
+    )
+    _ingest_text(searchable_pipeline, "beta.txt", SHARED_PARAGRAPH + PARAGRAPH_GAP + BETA_PARAGRAPH)
+
+    # Beta is corrected so that it no longer carries the shared paragraph.
+    _ingest_text(searchable_pipeline, "beta.txt", BETA_PARAGRAPH)
+
+    alpha_holds_opening = any(
+        node.ref_doc_id == "alpha.txt" and SHARED_OPENING in node.get_content()
+        for node in _stored_nodes(searchable_pipeline)
+    )
+
+    assert alpha_holds_opening, "beta's edit deleted alpha's copy of the shared text"
+
+
+def test_counters_describe_stored_content_not_submitted_content(searchable_pipeline):
+    """Re-ingesting unchanged content must not inflate the readiness counts."""
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+    sources, chunks = searchable_pipeline.indexed_sources, searchable_pipeline.indexed_chunks
+    assert (sources, chunks) == (1, len(_stored_nodes(searchable_pipeline)))
+
+    for _ in range(2):
+        _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    assert searchable_pipeline.indexed_sources == sources
+    assert searchable_pipeline.indexed_chunks == chunks
+    assert len(_stored_nodes(searchable_pipeline)) == chunks
+
+
+def test_ingesting_one_source_repeatedly_stores_one_copy(searchable_pipeline):
+    """Regression: every ingestion used to index a fresh set of chunks.
+
+    Measured against the pre-change pipeline, ingesting this document three
+    times stored three times its chunks and the assertion below failed.
+    """
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+    once = len(_stored_nodes(searchable_pipeline))
+    assert once > 1, "the document must split for this test to mean anything"
+
+    for _ in range(2):
+        _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    assert len(_stored_nodes(searchable_pipeline)) == once
+
+
+class _ContentEmbedding(StubEmbedding):
+    """Embeds identical text identically, as a real model does.
+
+    `MockEmbedding` embeds at random, so two copies of one chunk would receive
+    different vectors and would not rank alike -- which is what hides a
+    duplicated ingestion from a retrieval test.
+    """
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return [byte / 255.0 for byte in hashlib.sha256(text.encode()).digest()[:8]]
+
+
+def test_duplicate_ingestion_does_not_consume_search_result_slots(settings):
+    """Duplicates crowd out distinct results, because copies of one chunk score alike."""
+    pipeline = IndexPipeline(
+        settings,
+        converter=MagicMock(),
+        embedding_model=_ContentEmbedding(embed_dim=8),
+    )
+    for _ in range(3):
+        _ingest_text(pipeline, "doc.txt", SENTENCE_DOC)
+
+    results = pipeline.search("Sentence 5 covers its own separate subject", top_k=5)
+    texts = [result["text"] for result in results]
+
+    assert len(texts) > 1
+    assert len(texts) == len(set(texts)), "a duplicated chunk consumed a result slot"
+
+
+# --- Chunk coherence: tables as blocks, the node floor, repeated text ---
+
+# An infobox shaped like the ones on the corpus this change was measured against:
+# a short header, a separator, and rows whose values say nothing without the
+# column they belong to. Measured at 64 tokens, so it fits one node at the chunk
+# sizes used below.
+INFOBOX_HEADER = "| | Thư tịch | Không rõ |"
+INFOBOX = "\n".join(
+    [
+        INFOBOX_HEADER,
+        "| --- | --- | --- |",
+        "| Loại hình | Kiếm pháp |",
+        "| Người sáng tạo | Độc Cô Cầu Bại |",
+        "| Xuất hiện | Thần điêu hiệp lữ |",
+    ]
+)
+INFOBOX_VALUE = "Độc Cô Cầu Bại"
+TABLE_SEPARATOR = "| --- | --- | --- |"
+# 28 tokens: below the 32-token floor, which is what makes it a fragment.
+SMALL_TABLE_HEADER = "| Ghi chú | Ngắn |"
+SMALL_TABLE = "\n".join([SMALL_TABLE_HEADER, "| --- | --- |", "| Xem thêm | Phụ lục |"])
+# 992 tokens, so it cannot fit one node at any chunk size used here.
+WIDE_TABLE_HEADER = "| Tên | Mô tả |"
+WIDE_TABLE_SEPARATOR = "| --- | --- |"
+WIDE_TABLE = "\n".join(
+    [WIDE_TABLE_HEADER, WIDE_TABLE_SEPARATOR]
+    + [
+        f"| Chiêu thức {index} | Mô tả chi tiết về chiêu thức số {index} trong bộ võ học |"
+        for index in range(1, 40)
+    ]
+)
+# 266 tokens, so it splits into more than one node and none of them is a fragment.
+PROSE = " ".join(
+    f"Sentence {index} records the ordinary course of matter {index} here."
+    for index in range(1, 25)
+)
+# Docling pads a table out to the width of its widest cell, and a dash run costs
+# the tokenizer about a token per dash. Measured on the corpus: a fourteen-row
+# table's separator row was a 1169-character dash run, 1171 tokens against a
+# 256-token window. This fixture reproduces that shape.
+PADDED_TABLE_HEADER = "| Tên | Mô tả |"
+PADDED_SEPARATOR = f"| {'-' * 350} | {'-' * 350} |"
+PADDED_TABLE = "\n".join(
+    [PADDED_TABLE_HEADER, PADDED_SEPARATOR]
+    + [
+        f"| Chiêu thức {index} | Mô tả chi tiết về chiêu thức số {index} trong bộ võ học |"
+        for index in range(1, 40)
+    ]
+)
+# One row wider than the window on its own, so the table cannot be split at row
+# boundaries alone: the row itself has to be cut, beside the repeated header.
+LONG_ROW_TABLE = "\n".join(
+    [
+        PADDED_TABLE_HEADER,
+        PADDED_SEPARATOR,
+        "| Chiêu thức dài | "
+        + " ".join(f"mô tả thứ {index} của chiêu thức" for index in range(1, 60))
+        + " |",
+    ]
+)
+# Short enough to be a single node at the chunk sizes below and above the floor,
+# so a repeat of it is exactly two byte-identical nodes.
+REPEATED_PARAGRAPH = " ".join(
+    f"Clause {index} keeps its own separate wording about matter {index} alone."
+    for index in range(1, 6)
+)
+
+
+def _ingest_markdown(pipeline, markdown: str, filename: str = "page.txt") -> dict:
+    """Ingest *markdown* as *filename* and return the reported chunking outcome."""
+    pipeline.converter.convert_file.return_value = markdown
+    result, _ = pipeline.ingest_file(
+        source_id=f"source-{filename}", file=BytesIO(b"content"), filename=filename
+    )
+    return result["chunking"]
+
+
+def test_a_table_is_chunked_as_a_block_not_as_a_run_of_sentences():
+    """A table has no sentences, so the sentence packer cut it mid-row.
+
+    Measured against the pre-change chunking, a document shaped like this one
+    reached the index as rows detached from their header and cut mid-cell -- one
+    stored node began ``thức 17 | Mô tả chi tiết...``, with the row's own label
+    left behind in the node before it.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    _ingest_markdown(pipeline, PROSE + PARAGRAPH_GAP + INFOBOX + PARAGRAPH_GAP + PROSE)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+
+    assert any(text.strip() == INFOBOX for text in stored), "the table was not stored as a block"
+    fragments = [text for text in stored if "|" in text and INFOBOX_HEADER not in text]
+    assert not fragments, f"table text was stored without its header: {fragments[0][:60]!r}"
+
+
+def test_a_table_that_fits_becomes_one_node_beginning_with_its_header():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(pipeline, INFOBOX)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert chunking["nodes"] == 1
+    assert len(stored) == 1
+    assert stored[0].startswith(INFOBOX_HEADER), "the node does not begin with the header row"
+    assert stored[0].splitlines()[1] == TABLE_SEPARATOR, "the separator row is missing"
+    assert INFOBOX_VALUE in stored[0]
+
+
+def test_a_table_larger_than_the_chunk_size_keeps_its_header_in_every_part():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(pipeline, WIDE_TABLE)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the table must split for this test to mean anything"
+    assert len(stored) == chunking["nodes"]
+    for text in stored:
+        lines = text.splitlines()
+        assert lines[0] == WIDE_TABLE_HEADER, "a part lost the header row"
+        assert lines[1] == WIDE_TABLE_SEPARATOR, "a part lost the separator row"
+        # Cut at row boundaries: no row is divided, so no cell is orphaned from
+        # the row it belongs to.
+        for line in lines:
+            assert line.startswith("|") and line.endswith("|"), f"a row was cut mid-cell: {line!r}"
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS
+
+
+def test_a_table_padded_out_to_its_widest_cell_stays_within_the_model_window():
+    """Regression: a repeated padded separator row pushed every part past the window.
+
+    The header row of a table is small, but the separator row underneath it is as
+    wide as the table's widest cell, and a dash run is not cheap to tokenize.
+    Repeating that head at the top of every part therefore put each part past the
+    window on its own, before a single row was added to it -- measured end to end
+    against the corpus this change was tuned on, the pre-fix chunking stored
+    nodes of up to 1277 tokens against a 256-token window, so the model never read
+    the end of any of them.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    assert _model_tokens(PADDED_SEPARATOR) > EMBEDDING_MAX_TOKENS, (
+        "the fixture's separator row must breach the window on its own for this test to bite"
+    )
+
+    chunking = _ingest_markdown(pipeline, PADDED_TABLE)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the table must split for this test to mean anything"
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS, "a node exceeded the model window"
+    for text in stored:
+        lines = text.splitlines()
+        assert lines[0] == PADDED_TABLE_HEADER, "a part lost the header row"
+        assert lines[1] == WIDE_TABLE_SEPARATOR, "the repeated separator was not shortened"
+        assert _model_tokens(text) <= EMBEDDING_MAX_TOKENS, (
+            "a stored node exceeded the model window"
+        )
+
+
+def test_a_row_cut_to_fit_keeps_the_characters_the_page_wrote():
+    """Regression: the cut that bounded a wide row rewrote the text it kept.
+
+    The cut decoded the token ids it kept and joined them back up, and a BERT
+    tokenizer's decode does not run its encode backwards: measured on the corpus,
+    a row's ``*Bích huyết kiếm (1956)*`` came back as ``* bich huyet kiem``, its
+    accents stripped and its case lowered. Nothing is dropped by a slice, so the
+    pieces are cut out of the row's own characters.
+    """
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=0)
+    row = LONG_ROW_TABLE.splitlines()[2]
+
+    pieces = _split_oversized_text(row, 40, pipeline._tokenizer)
+
+    assert len(pieces) > 1, "the row must be cut for this test to mean anything"
+    assert all(len(_content_token_ids(pipeline._tokenizer, piece)) <= 40 for piece in pieces), (
+        "a piece exceeded the budget it was cut to"
+    )
+    assert "".join("".join(piece.split()) for piece in pieces) == "".join(row.split()), (
+        "the cut dropped or reordered the row's characters"
+    )
+    assert "mô tả" in " ".join(pieces), "the cut lost the accents the page wrote"
+    assert "mo ta" not in " ".join(pieces), "the cut stored text the page never had"
+
+
+def test_a_cut_row_reaches_the_index_in_the_pages_own_spelling():
+    """The row's own wording is what a query has to be able to find."""
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=0)
+
+    _ingest_markdown(pipeline, LONG_ROW_TABLE)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert any("mô tả thứ" in text for text in stored), "the row's own wording is not indexed"
+    assert not any("mo ta thu" in text for text in stored), "a node holds text the page never had"
+
+
+def test_no_node_reaches_past_the_window_when_the_chunk_size_is_the_window():
+    """The service's own configuration: CHUNK_SIZE unset, so it is the model's limit.
+
+    The last cut a table part can need is the one that bounds a single row wider
+    than the window, and it is made in content tokens while the limit counts the
+    tokens the model adds to whatever it reads. Measured end to end, a part cut to
+    that budget came back at 257 tokens against a 256-token window -- one token of
+    it past what the model reads, which is to say truncated.
+    """
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=0)
+    assert pipeline.chunk_size == EMBEDDING_MAX_TOKENS, "the fixture must chunk at the window"
+    assert _model_tokens(LONG_ROW_TABLE.splitlines()[2]) > EMBEDDING_MAX_TOKENS, (
+        "the fixture's row must be wider than the window for this test to bite"
+    )
+
+    chunking = _ingest_markdown(pipeline, LONG_ROW_TABLE)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the row must be cut for this test to mean anything"
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS, "a node exceeded the model window"
+    for text in stored:
+        assert text.splitlines()[0] == PADDED_TABLE_HEADER, "a part lost the header row"
+        assert _model_tokens(text) <= EMBEDDING_MAX_TOKENS, (
+            "a stored node exceeded the model window"
+        )
+
+
+def test_the_node_floor_defaults_to_32_and_honours_a_configured_value():
+    assert Settings().min_chunk_tokens == 32
+
+    def outcome(floor: int) -> dict:
+        pipeline = _stub_pipeline(chunk_size=64, chunk_overlap=0, min_chunk_tokens=floor)
+        return _ingest_markdown(pipeline, SENTENCE_DOC, filename="doc.txt")
+
+    # At this chunk size the splitter emits ~30-token nodes, so a floor of 0
+    # leaves every one of them alone while a higher floor folds them together.
+    # The count is the only way to see that the configured value was applied.
+    unfloored = outcome(0)
+    floored = outcome(96)
+
+    assert unfloored["floor_merges"] == 0
+    assert unfloored["overlap_tokens"] is not None
+    assert floored["floor_merges"] > 0
+    assert floored["nodes"] < unfloored["nodes"]
+
+
+def test_a_fragment_below_the_floor_is_merged_into_a_neighbour():
+    """A node too small to answer anything is folded into the text beside it."""
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    alone = _ingest_markdown(pipeline, PROSE, filename="prose.txt")
+    together = _ingest_markdown(pipeline, PROSE + PARAGRAPH_GAP + SMALL_TABLE, filename="both.txt")
+
+    assert _model_tokens(SMALL_TABLE) < 32, "the fixture must be below the floor"
+    assert together["floor_merges"] == 1
+    # The fragment's content joined a node rather than becoming one of its own.
+    assert together["nodes"] == alone["nodes"]
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert not any(text.strip() == SMALL_TABLE for text in stored), "the fragment stood alone"
+    assert any(SMALL_TABLE in text for text in stored), "the fragment's text was dropped"
+
+
+def test_a_document_below_the_floor_is_stored_with_its_content_intact():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(pipeline, "Ngắn.", filename="doc.txt")
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert chunking["nodes"] == 1
+    assert len(stored) == 1
+    assert "Ngắn." in stored[0], "content was discarded to satisfy the floor"
+    assert chunking["floor_merges"] == 0
+
+
+def test_a_merge_that_would_breach_the_model_window_is_refused():
+    """The floor must not be satisfied by producing a node the model truncates.
+
+    Measured before this guard existed, the floor folded a whole document into a
+    single 842-token node against this 256-token window, discarding the tail of
+    every chunk the model was handed -- the loss `doc-etl-api-chunk-sizing`
+    exists to prevent.
+    """
+    pipeline = _stub_pipeline(chunk_size=64, chunk_overlap=0)
+
+    chunking = _ingest_markdown(pipeline, SENTENCE_DOC, filename="doc.txt")
+
+    assert chunking["floor_merges"] > 0, "the fixture must exercise the floor"
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS, "a node exceeded the model window"
+
+    # A fragment at the head of a document whose only neighbour is already at the
+    # ceiling: neither merge is legal, so it is stored as it is rather than at
+    # the cost of a node whose tail the model would silently truncate.
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=0)
+
+    chunking = _ingest_markdown(
+        pipeline, SMALL_TABLE + PARAGRAPH_GAP + WIDE_TABLE, filename="doc.txt"
+    )
+
+    assert chunking["floor_refusals"] == 1
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert any(text.strip() == SMALL_TABLE for text in stored), "the fragment's text was dropped"
+    assert any(_model_tokens(text) < 32 for text in stored), "a refusal is what leaves it there"
+
+
+def test_text_repeated_within_one_source_is_stored_once():
+    """A paragraph carried twice occupies one node, not one per occurrence.
+
+    The infobox between the two copies keeps the splitter from packing them into
+    one node, so the repetition here really is two byte-identical nodes.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(
+        pipeline,
+        PARAGRAPH_GAP.join([REPEATED_PARAGRAPH, INFOBOX, REPEATED_PARAGRAPH]),
+    )
+
+    assert chunking["duplicate_nodes"] == 1, "the repeated paragraph was stored twice"
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) == chunking["nodes"]
+    assert sum(1 for text in stored if text.strip() == REPEATED_PARAGRAPH) == 1
+
+    # Positions stay contiguous after the collapse, so identity is still source
+    # and position rather than source and position with a gap in it.
+    assert {node.node_id for node in _stored_nodes(pipeline)} == {
+        _node_id("page.txt", position) for position in range(len(stored))
+    }
+
+
+def test_identical_text_in_two_sources_is_stored_once_per_source():
+    """The boundary that keeps collapsing repeats safe.
+
+    Both sources hold the same infobox, so their nodes for it are byte-identical
+    -- exactly what a collapse applied across sources would fold into one entry
+    that both of them claim.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    pipeline.converter.convert_file.return_value = INFOBOX
+
+    for name in ("alpha.txt", "beta.txt"):
+        pipeline.ingest_file(source_id=name, file=BytesIO(b"content"), filename=name)
+
+    holders = {
+        node.ref_doc_id for node in _stored_nodes(pipeline) if INFOBOX_HEADER in node.get_content()
+    }
+    assert holders == {"alpha.txt", "beta.txt"}, "a source lost its own copy of the shared text"
+    assert pipeline.indexed_sources == 2
+    assert pipeline.indexed_chunks == 2
+
+
+def test_collapsing_repeats_across_sources_would_take_a_source_s_copy(monkeypatch):
+    """Evidence for the boundary above rather than an assertion about it.
+
+    The same ingestion with the collapse hoisted above the source: the second
+    source stores nothing of text the first already holds, which is the deletion
+    hazard `doc-etl-api-ingestion-identity` measured.
+    """
+    seen: set[str] = set()
+
+    def across_sources(texts):
+        distinct, duplicates = [], 0
+        for text in texts:
+            if text in seen:
+                duplicates += 1
+                continue
+            seen.add(text)
+            distinct.append(text)
+        return distinct, duplicates
+
+    monkeypatch.setattr("doc_etl_api.pipeline._dedupe_texts", across_sources)
+
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    pipeline.converter.convert_file.return_value = INFOBOX
+    for name in ("alpha.txt", "beta.txt"):
+        pipeline.ingest_file(source_id=name, file=BytesIO(b"content"), filename=name)
+
+    holders = {
+        node.ref_doc_id for node in _stored_nodes(pipeline) if INFOBOX_HEADER in node.get_content()
+    }
+    assert holders == {"alpha.txt"}, "the fixture does not exercise a cross-source collapse"
+
+
+def test_readme_documents_the_node_floor():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert "| `MIN_CHUNK_TOKENS` |" in readme, "the setting is missing from the configuration table"
+    assert "restores the previous behaviour" in readme, "the escape hatch is not documented"
+    assert Settings().min_chunk_tokens == 32
+
+
+def test_readme_documents_the_user_agent():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert "| `USER_AGENT` |" in readme, "the setting is missing from the configuration table"
+    assert "contact details" in readme, "the reason to set it is not documented"
+    assert Settings().resolved_user_agent == "doc-etl-api/0.1.0"
+
+
+def test_the_chunking_outcome_reports_what_the_floor_and_the_collapse_did():
+    """An ingestion that both merges a fragment and drops a repeat."""
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(
+        pipeline,
+        PARAGRAPH_GAP.join(
+            [
+                REPEATED_PARAGRAPH,  # kept, and carried again below
+                INFOBOX,  # kept: a table block of its own
+                REPEATED_PARAGRAPH,  # a repeat of the first
+                SMALL_TABLE,  # below the floor: folded into the repeat above it
+                REPEATED_PARAGRAPH,  # a repeat of the first again
+            ]
+        ),
+    )
+
+    assert chunking["floor_merges"] == 1, "the below-floor fragment was not merged"
+    assert chunking["duplicate_nodes"] == 1, "the repeated paragraph was not collapsed"
+    assert chunking["nodes"] == len(_stored_nodes(pipeline))
+
+
+def test_a_source_needing_no_merging_reports_none():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(pipeline, SENTENCE_DOC, filename="doc.txt")
+
+    assert chunking["nodes"] > 1, "the document must split for this test to mean anything"
+    assert chunking["floor_merges"] == 0
+    assert chunking["floor_refusals"] == 0
+    assert chunking["duplicate_nodes"] == 0
+
+
+def test_the_measured_corpus_shape_no_longer_produces_scraps():
+    """Regression for the measured failure: 27% of stored chunks under 32 tokens
+    and 26% table rows detached from the header naming their columns.
+
+    The comparison at the end runs the same document through the splitter alone
+    -- the pre-change chunking -- so the failure being guarded against is shown
+    rather than assumed.
+    """
+    document = PARAGRAPH_GAP.join([PROSE, INFOBOX, WIDE_TABLE, PADDED_TABLE])
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    _ingest_markdown(pipeline, document)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert min(_model_tokens(text) for text in stored) >= 32, "a node below the floor was stored"
+    assert max(_model_tokens(text) for text in stored) <= EMBEDDING_MAX_TOKENS, (
+        "a node the model cannot read whole was stored"
+    )
+
+    table_nodes = [text for text in stored if text.strip().startswith("|")]
+    assert table_nodes, "the fixture is supposed to carry tables"
+    for text in table_nodes:
+        assert text.splitlines()[0] in (INFOBOX_HEADER, WIDE_TABLE_HEADER, PADDED_TABLE_HEADER), (
+            f"a table node lost its header: {text[:60]!r}"
+        )
+
+    legacy = LlamaSettings.node_parser.get_nodes_from_documents(
+        [
+            LlamaDocument(
+                text=document,
+                id_="legacy.txt",
+                metadata={
+                    "source_id": "source-page.txt",
+                    "source_type": "file",
+                    "source_name": "legacy.txt",
+                    "mime_type": None,
+                },
+            )
+        ]
+    )
+    legacy_texts = [node.get_content() for node in legacy]
+    assert any(_model_tokens(text) < 32 for text in legacy_texts), (
+        "the pre-change chunking is supposed to store fragments"
+    )
+    assert any(
+        text.strip().startswith("|")
+        and INFOBOX_HEADER not in text
+        and WIDE_TABLE_HEADER not in text
+        for text in legacy_texts
+    ), "the pre-change chunking is supposed to leave rows without a header"
+
+
+def test_a_query_for_an_infobox_value_returns_a_node_carrying_its_header():
+    """A row is answerable only if the node holding it also names its column.
+
+    Uses the real embedding model -- a stub embeds at random, so it could not
+    show that the value is what brings the node back -- and a chunk size small
+    enough that the infobox cannot fit beside the prose around it, which is the
+    shape the pre-change chunking cut in half.
+    """
+    pipeline = IndexPipeline(
+        Settings(
+            vector_store_backend="simple",
+            embedding_model=EMBEDDING_MODEL_NAME,
+            chunk_size=64,
+            chunk_overlap=0,
+            default_top_k=5,
+        ),
+        converter=MagicMock(),
+    )
+    _ingest_markdown(pipeline, PARAGRAPH_GAP.join([PROSE, INFOBOX, PROSE]))
+
+    results = pipeline.search(INFOBOX_VALUE, top_k=5)
+
+    assert results
+    assert any(
+        INFOBOX_VALUE in item["text"] and INFOBOX_HEADER in item["text"] for item in results
+    ), "the infobox value came back without the header naming its column"
