@@ -1,4 +1,5 @@
 import logging
+import os
 from enum import Enum
 from pathlib import Path
 
@@ -22,9 +23,18 @@ class VectorStoreBackend(str, Enum):
     SIMPLE = "simple"
 
 
+# The file settings are read from. A test session sets ``DOC_ETL_API_ENV_FILE``
+# to an empty value to disable it, so a ``Settings()`` built without explicit
+# arguments falls back to the code defaults instead of picking up whatever the
+# developer's ``.env`` happens to hold -- which is how the suite came to assert a
+# real corpus as the unconfigured default. Environment variables and explicit
+# arguments both outrank this file, so a test can still override any one setting.
+ENV_FILE = os.environ.get("DOC_ETL_API_ENV_FILE", ".env") or None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )

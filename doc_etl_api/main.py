@@ -108,12 +108,16 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
-
-
+# The application is built by `create_app` on demand rather than at import.
+# Constructing it loads the Docling and embedding models and starts the corpus
+# bootstrap, so a module-level `app = create_app()` made importing this module
+# pay a full model load -- and, with a corpus configured, a round of network
+# fetches -- before any caller had asked for an application. Uvicorn calls the
+# factory at startup, which is where that work belongs; see `startup-model-preload`.
 def run() -> None:
     uvicorn.run(
-        "doc_etl_api.main:app",
+        "doc_etl_api.main:create_app",
+        factory=True,
         host=settings.app_host,
         port=settings.app_port,
         reload=settings.app_reload,
