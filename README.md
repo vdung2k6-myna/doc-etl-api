@@ -297,6 +297,7 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `KNOWLEDGE_CORPUS_DIR` | *(empty)* | Local directory whose supported files are ingested at startup, so a restart does not leave the index empty. Empty disables startup ingestion for local files. |
 | `KNOWLEDGE_CORPUS_URLS` | *(empty)* | Comma-separated URLs ingested at startup. Empty contributes nothing. |
 | `LOG_LEVEL` | `INFO` | Level for application logs. Search timings and bootstrap progress are logged at `INFO`, so raising this to `WARNING` hides them. |
+| `DOC_ETL_API_ENV_FILE` | `.env` | Which environment file to read — not a setting, and it cannot be set inside one. It is taken from the process environment before any setting is read, because it decides whether a file is read at all, so a value written into `.env` would never be seen. An empty value disables the file entirely: a `Settings()` built with no arguments then falls back to the code defaults instead of the developer's `.env`. That is what `tests/conftest.py` does, so a test session asserts the defaults rather than whatever corpus the developer has configured. Leave it unset to run the service. |
 
 ## Performance notes
 
