@@ -88,8 +88,14 @@ leaves both unchanged unless that source's content actually changed.
 ```bash
 curl -X POST "http://localhost:8000/sources/files" \
   -F "files=@example.pdf" \
-  -F "files=@notes.docx"
+  -F "files=@notes.docx" \
+  -F "collections=handbook"
 ```
+
+Repeat `collections` to put a request's uploads in several of them (see
+[Collections](#collections)). Every upload in one request is tagged with the same
+set, so a request that needs different tags per file is submitted as several
+requests.
 
 Response (HTTP 202 Accepted):
 
@@ -157,7 +163,7 @@ Repeats across different sources are never dropped.
 ```bash
 curl -X POST "http://localhost:8000/sources/urls" \
   -H "Content-Type: application/json" \
-  -d '{"urls": ["https://docling.ai/"]}'
+  -d '{"urls": ["https://docling.ai/"], "collections": ["handbook"]}'
 ```
 
 Response (HTTP 202 Accepted):
@@ -254,6 +260,84 @@ The counts reported by `GET /health` describe what the index holds rather than
 what has been submitted, so they do not grow when unchanged content is ingested
 again.
 
+### Collections
+
+A collection is a label a source is filed under, so a search can be scoped to the
+material meant for it instead of the whole index:
+
+```bash
+curl -X POST "http://localhost:8000/sources/urls" \
+  -H "Content-Type: application/json" \
+  -d '{"urls": ["https://example.com/csharp-12"], "collections": ["csharp", "handbook"]}'
+```
+
+```bash
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "nullable reference types", "top_k": 5, "collections": ["csharp"]}'
+```
+
+A source can belong to several collections, and a search naming several matches a
+source in any of them. Re-ingesting a source replaces its collections along with
+its content, so a source always belongs to what its most recent ingestion named.
+
+- **A name is a slug.** Lowercase letters, digits and single hyphens or
+  underscores, at most 64 characters — `csharp-12`, `dotnet_8`. Surrounding
+  whitespace is trimmed; anything else is rejected with `400`, naming the value
+  that was refused. Names are never rewritten, so the name you send is the name
+  stored and the name to filter on.
+- **A request may name at most 16 collections.** Each name is validated and the
+  list de-duplicated before any work is queued, so a request with a malformed
+  name costs a `400` rather than a job that fails later.
+- **An empty filter is rejected.** Supplying `"collections": []` returns `400`:
+  "search nothing" and "search everything" are both readings of an empty list, and
+  the second silently answers a scoped question from unrelated content. Omit the
+  field to search every indexed source.
+- **A filter naming an unknown collection returns no results**, not an error, so a
+  mistyped collection reads as "nothing matched" rather than widening the search.
+- **Tagging does not change what is retrieved.** A collection is filtering
+  metadata, never text the embedding model reads, so a source's chunks are
+  chunked and embedded identically whether it is tagged or not — a caller who
+  never filters sees the same results either way.
+
+The startup corpus can be tagged from configuration so it is reachable by a
+filtered search; see `KNOWLEDGE_CORPUS_COLLECTIONS` below. A source in no
+collection matches no filter, so it is only findable by an unfiltered search —
+which is what `GET /sources` is for.
+
+### List indexed sources
+
+```bash
+curl "http://localhost:8000/sources"
+```
+
+Response:
+
+```json
+{
+  "sources": [
+    {
+      "name": "example.pdf",
+      "source_type": "file",
+      "collections": ["handbook"],
+      "chunk_count": 12
+    },
+    {
+      "name": "https://example.com/archive",
+      "source_type": "url",
+      "collections": [],
+      "chunk_count": 4
+    }
+  ]
+}
+```
+
+One entry per indexed source, including sources in no collection — an empty
+`collections` list is reported rather than the source being left out, so this is
+how you find what a filter will never reach. `GET /sources` performs no retrieval
+and no embedding, like `/health`, so it stays responsive regardless of index size
+or search load.
+
 ### Search
 
 ```bash
@@ -261,6 +345,10 @@ curl -X POST "http://localhost:8000/search" \
   -H "Content-Type: application/json" \
   -d '{"query": "document conversion", "top_k": 3}'
 ```
+
+Add `"collections": ["handbook"]` to scope the search to sources filed under any
+of those collections; omit it to search every indexed source. See
+[Collections](#collections) for the name grammar and how a filter behaves.
 
 Response:
 
@@ -277,6 +365,9 @@ Response:
   ]
 }
 ```
+
+`top_k` applies within the scope rather than being padded from outside it: a
+collection holding fewer chunks than `top_k` returns fewer results.
 
 ## Configuration
 
@@ -296,6 +387,7 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `USER_AGENT` | `doc-etl-api/0.1.0` | Sent on every page fetch. It names this service rather than the HTTP library, because hosts with a client-identity policy refuse the library's default — Wikipedia answers `403` to `python-requests/*` and `200` to this. Set it to include the contact details such a policy asks for. A blank value falls back to this default rather than sending an empty header, which those hosts refuse as well. |
 | `KNOWLEDGE_CORPUS_DIR` | *(empty)* | Local directory whose supported files are ingested at startup, so a restart does not leave the index empty. Empty disables startup ingestion for local files. |
 | `KNOWLEDGE_CORPUS_URLS` | *(empty)* | Comma-separated URLs ingested at startup. Empty contributes nothing. |
+| `KNOWLEDGE_CORPUS_COLLECTIONS` | *(empty)* | Comma-separated collections every startup corpus source is tagged with, so a corpus is reachable by a filtered search. Empty leaves corpus sources untagged; a malformed name is rejected as the settings are built, which stops the service from starting rather than failing each corpus source in turn and leaving the index empty. |
 | `LOG_LEVEL` | `INFO` | Level for application logs. Search timings and bootstrap progress are logged at `INFO`, so raising this to `WARNING` hides them. |
 | `DOC_ETL_API_ENV_FILE` | `.env` | Which environment file to read — not a setting, and it cannot be set inside one. It is taken from the process environment before any setting is read, because it decides whether a file is read at all, so a value written into `.env` would never be seen. An empty value disables the file entirely: a `Settings()` built with no arguments then falls back to the code defaults instead of the developer's `.env`. That is what `tests/conftest.py` does, so a test session asserts the defaults rather than whatever corpus the developer has configured. Leave it unset to run the service. |
 

@@ -15,6 +15,7 @@ from docling.datamodel.base_models import ConversionStatus
 from llama_index.core import Document as LlamaDocument
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core.embeddings import MockEmbedding
+from llama_index.core.schema import MetadataMode
 
 from doc_etl_api.config import DEFAULT_USER_AGENT, Settings
 from doc_etl_api.pipeline import (
@@ -1256,6 +1257,25 @@ def test_readme_documents_the_user_agent():
     assert Settings().resolved_user_agent == "doc-etl-api/0.1.0"
 
 
+def test_readme_documents_collections():
+    """A caller cannot use a scope the README does not describe.
+
+    Named settings, the endpoints that take a collection, and the two rules a
+    caller would otherwise discover by being refused: the cap on how many one
+    request may name, and the rejection of an empty filter.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert "| `KNOWLEDGE_CORPUS_COLLECTIONS` |" in readme, (
+        "the setting is missing from the configuration table"
+    )
+    assert "[Collections](#collections)" in readme, "the collections section is missing"
+    assert "localhost:8000/sources" in readme, "the source catalog endpoint is not documented"
+    assert "at most 16 collections" in readme, "the cap per request is not documented"
+    assert '"collections": []' in readme, "the rejection of an empty filter is not documented"
+    assert Settings().knowledge_corpus_collection_list == []
+
+
 def test_the_chunking_outcome_reports_what_the_floor_and_the_collapse_did():
     """An ingestion that both merges a fragment and drops a repeat."""
     pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
@@ -1367,3 +1387,293 @@ def test_a_query_for_an_infobox_value_returns_a_node_carrying_its_header():
     assert any(
         INFOBOX_VALUE in item["text"] and INFOBOX_HEADER in item["text"] for item in results
     ), "the infobox value came back without the header naming its column"
+
+
+# --- Collections: a filter key that is never content ------------------------
+
+
+def _collections_pipeline(settings) -> IndexPipeline:
+    """A pipeline whose embedder depends on the text it is given.
+
+    The vectors are what this section compares, and `MockEmbedding` returns one
+    vector for every text, so a comparison against it would hold whatever the
+    text was. `_ContentEmbedding` embeds text as a function of itself, so equal
+    vectors mean equal embedded text.
+    """
+    return IndexPipeline(
+        settings, converter=MagicMock(), embedding_model=_ContentEmbedding(embed_dim=8)
+    )
+
+
+def _stored_vectors(pipeline) -> dict[str, list[float]]:
+    """The vectors the store holds, keyed by node id.
+
+    The store is the only place they exist: the docstore strips a node's
+    embedding as it stores it, and `SimpleVectorStore.get_nodes` raises.
+    """
+    return dict(pipeline.index.storage_context.vector_store._data.embedding_dict)
+
+
+def test_a_collection_is_filterable_metadata_that_the_model_never_reads(settings):
+    """The prefilter must see the collections; nothing else may.
+
+    Both halves matter: the metadata carrying the key is what the filter tests,
+    and the key being excluded from the embedded rendering is what keeps tagging
+    from becoming part of the content a query is matched against.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(
+        source_id="source",
+        file=BytesIO(b"x"),
+        filename="doc.txt",
+        collections=["csharp", "dotnet"],
+    )
+
+    nodes = _stored_nodes(pipeline)
+    assert len(nodes) > 1, "the document must split for this test to mean anything"
+    for node in nodes:
+        assert node.metadata["collections"] == ["csharp", "dotnet"]
+        embedded = node.get_content(metadata_mode=MetadataMode.EMBED)
+        assert "collections" not in embedded
+        assert "csharp" not in embedded, "a collection name reached the embedded text"
+
+    # The store keeps the same metadata for the prefilter to read, so the key is
+    # present exactly where filtering looks for it.
+    stored = next(iter(pipeline.index.storage_context.vector_store._data.metadata_dict.values()))
+    assert stored["collections"] == ["csharp", "dotnet"]
+
+
+def test_tagging_a_source_does_not_move_its_vectors(settings):
+    """Collections are a predicate, not content.
+
+    Metadata is otherwise charged against the chunk-size budget before splitting
+    -- the splitter renders a node for the embedder and for an LLM and budgets
+    for whichever is longer -- so without the exclusion a collection name changes
+    where a document splits, and therefore every vector it produces. This is the
+    test that fails when only one of the two renderings is excluded.
+    """
+    untagged = _collections_pipeline(settings)
+    tagged = _collections_pipeline(settings)
+    for pipeline in (untagged, tagged):
+        pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    untagged.ingest_file(source_id="plain", file=BytesIO(b"x"), filename="doc.txt")
+    tagged.ingest_file(
+        source_id="tagged",
+        file=BytesIO(b"x"),
+        filename="doc.txt",
+        collections=["csharp", "dotnet-retrieval"],
+    )
+
+    plain_nodes = _stored_nodes(untagged)
+    assert len(plain_nodes) > 1, "the document must split for this test to mean anything"
+    assert [node.get_content() for node in plain_nodes] == [
+        node.get_content() for node in _stored_nodes(tagged)
+    ], "tagging changed how the document was chunked"
+    assert _stored_vectors(untagged) == _stored_vectors(tagged)
+
+    # Which is the point of the property: a caller who never filters cannot tell
+    # the tagged source from the untagged one.
+    query = "Sentence 5 covers its own separate subject"
+    assert [item["score"] for item in untagged.search(query, top_k=5)] == [
+        item["score"] for item in tagged.search(query, top_k=5)
+    ]
+
+
+def test_re_uploading_a_document_replaces_its_collections(settings):
+    """A source belongs to what its most recent upload named, and nothing else."""
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+    pipeline.ingest_file(
+        source_id="second", file=BytesIO(b"x"), filename="doc.txt", collections=["dotnet"]
+    )
+
+    assert len(pipeline.source_catalog) == 1, "the re-upload was indexed as a second source"
+    assert pipeline.source_catalog[0].collections == ("dotnet",)
+    assert _stored_nodes(pipeline)[0].metadata["collections"] == ["dotnet"]
+    assert pipeline.search("Sentence 5", top_k=5, collections=["csharp"]) == []
+
+
+def test_collections_reach_a_source_whose_url_redirected(settings):
+    """A page is identified by where it landed; its collections follow it there."""
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_url.return_value = (SENTENCE_DOC, "https://example.com/final")
+
+    result, _ = pipeline.ingest_url(
+        source_id="source", url="https://example.com/start", collections=["csharp"]
+    )
+
+    record = pipeline.source_catalog[0]
+    assert record.name == "https://example.com/start"
+    assert record.collections == ("csharp",)
+    assert result["collections"] == ["csharp"]
+    assert pipeline.search("Sentence 5", top_k=5, collections=["csharp"])
+
+
+# --- Search scoping ---------------------------------------------------------
+
+
+# Unlike SENTENCE_DOC, so a result can be attributed to the source it came from
+# by its text alone.
+PLAIN_DOC = " ".join(
+    f"Item {index} documents an unrelated administrative procedure in its own wording."
+    for index in range(1, 61)
+)
+
+
+def _scoped_pipeline(settings) -> IndexPipeline:
+    """One source in a collection, one in another, and one in none.
+
+    Deliberately more content outside any single scope than inside it, so a
+    search that padded its result count from outside the scope would show up.
+    """
+    pipeline = _collections_pipeline(settings)
+    contents = {
+        "csharp.txt": "# C#\n\n" + SENTENCE_DOC,
+        "dotnet.txt": "# .NET\n\n" + SENTENCE_DOC.replace("Sentence", "Clause"),
+        "plain.txt": "# Plain\n\n" + PLAIN_DOC,
+    }
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: contents[filename]
+    pipeline.ingest_file(
+        source_id="csharp", file=BytesIO(b"x"), filename="csharp.txt", collections=["csharp"]
+    )
+    pipeline.ingest_file(
+        source_id="dotnet", file=BytesIO(b"x"), filename="dotnet.txt", collections=["dotnet"]
+    )
+    pipeline.ingest_file(source_id="plain", file=BytesIO(b"x"), filename="plain.txt")
+    return pipeline
+
+
+def _chunk_count(pipeline: IndexPipeline, name: str) -> int:
+    return next(record.chunk_count for record in pipeline.source_catalog if record.name == name)
+
+
+def test_a_filtered_search_returns_only_in_scope_chunks(settings):
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50, collections=["csharp"])
+
+    assert results
+    assert {item["source_id"] for item in results} == {"csharp"}
+
+
+def test_several_requested_collections_match_any_of_them(settings):
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50, collections=["csharp", "dotnet"])
+
+    assert {item["source_id"] for item in results} == {"csharp", "dotnet"}
+
+
+def test_the_result_count_applies_within_the_scope(settings):
+    """A requested count is drawn from the scope, not padded from outside it.
+
+    The store prefilters before the similarity scan, so a scope holding fewer
+    chunks than were asked for returns fewer -- rather than spending the rest of
+    the budget on sources the caller excluded.
+    """
+    pipeline = _scoped_pipeline(settings)
+    in_scope = _chunk_count(pipeline, "csharp.txt")
+    out_of_scope = sum(
+        record.chunk_count for record in pipeline.source_catalog if record.name != "csharp.txt"
+    )
+    assert in_scope < 50, "the fixture must hold fewer chunks in scope than will be asked for"
+    assert out_of_scope > in_scope, "the fixture must hold enough outside the scope to pad with"
+
+    results = pipeline.search("content", top_k=50, collections=["csharp"])
+
+    assert len(results) == in_scope
+    assert {item["source_id"] for item in results} == {"csharp"}
+
+
+def test_a_filter_naming_an_unknown_collection_is_an_empty_result(settings):
+    """A mistyped collection returns nothing rather than erroring or widening."""
+    pipeline = _scoped_pipeline(settings)
+
+    assert pipeline.search("content", top_k=5, collections=["cshrap"]) == []
+
+
+def test_an_unfiltered_search_still_reaches_an_untagged_source(settings):
+    """The change is additive: search without a filter behaves as it always has."""
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50)
+
+    assert {item["source_id"] for item in results} == {"csharp", "dotnet", "plain"}
+
+
+# --- The catalog's per-source record ----------------------------------------
+
+
+def test_the_source_record_describes_what_was_ingested(settings):
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.converter.convert_url.return_value = (PLAIN_DOC, "https://example.com/final")
+
+    pipeline.ingest_file(
+        source_id="file-source",
+        file=BytesIO(b"x"),
+        filename="report.txt",
+        collections=["csharp", "dotnet"],
+    )
+    pipeline.ingest_url(source_id="url-source", url="https://example.com/start")
+
+    records = {(record.name, record.source_type): record for record in pipeline.source_catalog}
+    filed = records[("report.txt", "file")]
+    untagged = records[("https://example.com/start", "url")]
+
+    assert filed.collections == ("csharp", "dotnet")
+    # A source ingested without collections is described, not omitted, so the
+    # catalog is what makes an untagged source visible.
+    assert untagged.collections == ()
+    # Every stored node belongs to one of the two records, and each counts its own.
+    assert len(_stored_nodes(pipeline)) == pipeline.indexed_chunks
+    assert filed.chunk_count + untagged.chunk_count == pipeline.indexed_chunks
+    assert pipeline.indexed_sources == 2
+
+
+def test_the_source_record_is_replaced_rather_than_duplicated(settings):
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+    first_chunks = _chunk_count(pipeline, "doc.txt")
+
+    pipeline.ingest_file(
+        source_id="second", file=BytesIO(b"x"), filename="doc.txt", collections=["dotnet"]
+    )
+
+    assert pipeline.indexed_sources == 1
+    assert _chunk_count(pipeline, "doc.txt") == first_chunks
+    assert pipeline.indexed_chunks == first_chunks
+
+
+def test_the_catalog_a_reader_holds_cannot_change_underneath_it(settings):
+    """The catalog is published as an immutable snapshot, not a live view.
+
+    A reader iterating the mapping while an ingestion replaced a source would
+    see half a replacement, or fail outright, so each write publishes a tuple
+    that describes the state it produced.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+
+    before = pipeline.source_catalog
+    pipeline.ingest_file(
+        source_id="second", file=BytesIO(b"x"), filename="doc.txt", collections=["dotnet"]
+    )
+
+    assert isinstance(before, tuple)
+    assert before[0].collections == ("csharp",)
+    assert pipeline.source_catalog[0].collections == ("dotnet",)

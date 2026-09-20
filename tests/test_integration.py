@@ -235,3 +235,48 @@ def test_a_host_that_refuses_unidentified_clients_is_ingested_anyway(monkeypatch
     assert job["status"] == "completed", f"the ingestion did not survive the fetch: {job}"
     assert sent_agents == [DEFAULT_USER_AGENT], "the request did not identify itself"
     assert client.get("/health").json()["indexed_sources"] == 1
+
+
+def test_collections_scope_the_whole_path_from_upload_to_search():
+    """The whole path, through the routes: two uploads land in different
+    collections, the catalog reports both, and a filtered search returns only the
+    source in the collection that was asked for.
+
+    Run end to end because the parts are only useful joined: a collection that a
+    filter cannot act on, or that the catalog does not report, would leave a
+    caller with no way to find what the filter is meant to select.
+    """
+    contents = {
+        "guide.txt": "# Guide\n\nThe STAR method structures behavioural answers.",
+        "notes.txt": "# Notes\n\nThe XYZZY convention records unrelated remarks.",
+    }
+    converter = _stub_converter(lambda file, filename: contents[filename])
+    client = TestClient(_build_app(converter))
+
+    for name, collection in (("guide.txt", "interviews"), ("notes.txt", "conventions")):
+        response = client.post(
+            "/sources/files",
+            files={"files": (name, BytesIO(b"x"), "text/plain")},
+            data={"collections": [collection]},
+        )
+        assert response.status_code == 202, response.text
+
+    catalog = client.get("/sources").json()["sources"]
+    assert {source["name"]: source["collections"] for source in catalog} == {
+        "guide.txt": ["interviews"],
+        "notes.txt": ["conventions"],
+    }
+    assert all(source["chunk_count"] >= 1 for source in catalog)
+
+    scoped = client.post(
+        "/search", json={"query": "method", "top_k": 10, "collections": ["interviews"]}
+    )
+    assert scoped.status_code == 200
+    results = scoped.json()["results"]
+    assert results
+    assert {result["source_name"] for result in results} == {"guide.txt"}
+
+    # The other source is still reachable without a filter, so the scope narrowed
+    # one search rather than the index.
+    unscoped = client.post("/search", json={"query": "method", "top_k": 10}).json()["results"]
+    assert {result["source_name"] for result in unscoped} == {"guide.txt", "notes.txt"}

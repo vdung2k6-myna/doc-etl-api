@@ -23,11 +23,19 @@ class IngestUrlResponse(BaseModel):
 
 class UrlIngestRequest(BaseModel):
     urls: list[str] = Field(..., min_length=1, description="URLs to ingest")
+    collections: list[str] | None = Field(
+        None, description="Collections the ingested sources belong to"
+    )
 
 
 class SearchRequest(BaseModel):
     query: str = Field(..., description="Search query string")
     top_k: int | None = Field(None, ge=1, le=100, description="Number of results to return")
+    collections: list[str] | None = Field(
+        None,
+        description="Only return chunks from sources in any of these collections. "
+        "Omit to search every indexed source. An empty list is rejected.",
+    )
 
 
 class SearchResult(BaseModel):
@@ -40,6 +48,19 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     results: list[SearchResult] = Field(default_factory=list)
+
+
+class SourceCatalogEntry(BaseModel):
+    name: str = Field(..., description="Original filename or submitted URL")
+    source_type: Literal["file", "url"] = Field(..., description="Source type")
+    collections: list[str] = Field(
+        default_factory=list, description="Collections the source belongs to, if any"
+    )
+    chunk_count: int = Field(..., description="Number of chunks indexed for this source")
+
+
+class SourceCatalogResponse(BaseModel):
+    sources: list[SourceCatalogEntry] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):

@@ -69,6 +69,10 @@ def ingest_corpus(
     """
     corpus_path = app_settings.knowledge_corpus_path
     corpus_urls = app_settings.knowledge_corpus_url_list
+    # The whole corpus is tagged from one setting. Without it the corpus -- the
+    # content that exists specifically to ground answers -- would be the one set
+    # of sources invisible to every filtered search.
+    collections = app_settings.knowledge_corpus_collection_list
 
     if corpus_path is None and not corpus_urls:
         state.status = BootstrapStatus.DISABLED
@@ -77,10 +81,11 @@ def ingest_corpus(
     state.status = BootstrapStatus.IN_PROGRESS
     files = corpus_files(corpus_path, pipeline.converter.SUPPORTED_FILE_EXTENSIONS)
     logger.info(
-        "Knowledge bootstrap started dir=%s files=%d urls=%d",
+        "Knowledge bootstrap started dir=%s files=%d urls=%d collections=%s",
         corpus_path,
         len(files),
         len(corpus_urls),
+        collections,
     )
 
     for path in files:
@@ -91,6 +96,7 @@ def ingest_corpus(
                     source_id=str(uuid.uuid4()),
                     file=handle,
                     filename=target.name,
+                    collections=collections,
                 )
 
         _ingest_one(state, str(path), ingest_file)
@@ -99,7 +105,9 @@ def ingest_corpus(
         _ingest_one(
             state,
             url,
-            lambda target=url: pipeline.ingest_url(source_id=str(uuid.uuid4()), url=target),
+            lambda target=url: pipeline.ingest_url(
+                source_id=str(uuid.uuid4()), url=target, collections=collections
+            ),
         )
 
     state.status = BootstrapStatus.FAILED if state.failures else BootstrapStatus.COMPLETE

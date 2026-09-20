@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import BinaryIO
@@ -18,12 +19,38 @@ from llama_index.core import Settings as LlamaSettings
 from llama_index.core import VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import BaseNode, NodeRelationship, RelatedNodeInfo, TextNode
+from llama_index.core.vector_stores import FilterOperator, MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from doc_etl_api.config import DEFAULT_USER_AGENT, Settings, VectorStoreBackend, settings
 from doc_etl_api.extraction import select_main_content
 
 logger = logging.getLogger(__name__)
+
+# The metadata key carrying the collections a source belongs to.
+COLLECTIONS_KEY = "collections"
+
+# Metadata that is written for filtering but never read by a model. Both the
+# embed and the LLM rendering are excluded, and that is not belt-and-braces:
+# metadata is charged against the chunk-size budget before splitting, and
+# `MetadataAwareTextSplitter._get_metadata_str` renders a node both ways and
+# keeps the longer of the two, so excluding one mode alone would still let a
+# collection name shrink the text each chunk can hold. That changes where a
+# source splits and therefore its vectors -- measured, tagging one document with
+# two collections took it from 14 nodes to 20. Excluding the key from both
+# readings is what makes tagging metadata-only: the prefilter still sees the
+# collections, no model ever does.
+_MODEL_EXCLUDED_KEYS = [COLLECTIONS_KEY]
+
+
+@dataclass(frozen=True)
+class SourceRecord:
+    """What a source is, as the catalog reports it."""
+
+    name: str
+    source_type: str
+    collections: tuple[str, ...]
+    chunk_count: int
 
 
 def _elapsed_ms(start: float) -> float:
@@ -576,12 +603,13 @@ class IndexPipeline:
         # threadpool while search runs on the event loop, so both the write in
         # the ingest methods and the read in `search` must hold this lock.
         self._index_lock = threading.Lock()
-        # Counters for the readiness endpoint. They are recomputed inside the
-        # same critical section as the insert, so they cannot drift from the
-        # index. The mapping they are derived from is only ever touched under the
-        # lock; the totals published to readers are plain integers, so reading
-        # them costs no retrieval, no embedding work, and no lock.
-        self._source_chunk_counts: dict[str, int] = {}
+        # What is indexed, for the readiness endpoint and the source catalog.
+        # `_source_records` is only ever touched under the lock, and each write
+        # publishes `_source_catalog` as an immutable snapshot, so a reader costs
+        # no retrieval, no embedding work, and no lock. Publishing is what keeps a
+        # reader from iterating a dict another thread is mutating.
+        self._source_records: dict[str, SourceRecord] = {}
+        self._source_catalog: tuple[SourceRecord, ...] = ()
         self._indexed_sources = 0
         self._indexed_chunks = 0
 
@@ -600,6 +628,16 @@ class IndexPipeline:
     @property
     def indexed_chunks(self) -> int:
         return self._indexed_chunks
+
+    @property
+    def source_catalog(self) -> tuple[SourceRecord, ...]:
+        """Every indexed source, in a stable order, safe to read without the lock.
+
+        An immutable snapshot published by the write that produced it, so a
+        caller cannot observe a source part-way through being replaced and does
+        not wait on ingestion to read it.
+        """
+        return self._source_catalog
 
     @property
     def chunk_size(self) -> int:
@@ -631,7 +669,14 @@ class IndexPipeline:
 
     def _build_node(self, text: str, source_key: str, metadata: dict) -> BaseNode:
         """A node carrying its text, its source's identity, and its metadata."""
-        node = TextNode(text=text, metadata=dict(metadata))
+        node = TextNode(
+            text=text,
+            metadata=dict(metadata),
+            # Collections are a filter key, not content: the prefilter reads them
+            # off the node and the model never does. See `_MODEL_EXCLUDED_KEYS`.
+            excluded_embed_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+            excluded_llm_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+        )
         # Set as a relationship rather than a field, because `ref_doc_id` is a
         # read-only property derived from the source relation -- and it is what
         # `delete_ref_doc` locates a source's earlier content by.
@@ -661,7 +706,20 @@ class IndexPipeline:
             texts.extend(
                 node.get_content()
                 for node in LlamaSettings.node_parser.get_nodes_from_documents(
-                    [LlamaDocument(text=block, id_=source_key, metadata=metadata)]
+                    [
+                        LlamaDocument(
+                            text=block,
+                            id_=source_key,
+                            metadata=metadata,
+                            # The splitter reads this document's metadata only to
+                            # charge the chunk-size budget -- the nodes it returns
+                            # are discarded and rebuilt by `_build_node` -- so the
+                            # exclusion has to be stated here as well, or tagging a
+                            # source would change how it splits.
+                            excluded_embed_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+                            excluded_llm_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+                        )
+                    ]
                 )
             )
 
@@ -681,7 +739,15 @@ class IndexPipeline:
         )
         return nodes, chunking
 
-    def _replace_source(self, source_key: str, nodes: Sequence[BaseNode]) -> None:
+    def _replace_source(
+        self,
+        source_key: str,
+        nodes: Sequence[BaseNode],
+        *,
+        name: str,
+        source_type: str,
+        collections: Sequence[str] = (),
+    ) -> None:
         """Store *nodes* as the whole of *source_key*, replacing its earlier content.
 
         Deletion is by document identity, so a source that has never been
@@ -690,13 +756,25 @@ class IndexPipeline:
         concurrent search cannot observe a source half-replaced. The counters are
         recomputed from what each source currently holds, which is what keeps
         them describing stored content rather than submitted content.
+
+        The source's collections are replaced by the same write that replaces its
+        nodes, so what a source belongs to cannot drift from what it holds: a
+        re-ingestion is always the whole of what that source is.
         """
         with self._index_lock:
             self._index.delete_ref_doc(source_key, delete_from_docstore=True)
             self._index.insert_nodes(nodes)
-            self._source_chunk_counts[source_key] = len(nodes)
-            self._indexed_sources = len(self._source_chunk_counts)
-            self._indexed_chunks = sum(self._source_chunk_counts.values())
+            self._source_records[source_key] = SourceRecord(
+                name=name,
+                source_type=source_type,
+                collections=tuple(collections),
+                chunk_count=len(nodes),
+            )
+            self._source_catalog = tuple(
+                self._source_records[key] for key in sorted(self._source_records)
+            )
+            self._indexed_sources = len(self._source_records)
+            self._indexed_chunks = sum(item.chunk_count for item in self._source_records.values())
 
     def ingest_file(
         self,
@@ -704,6 +782,7 @@ class IndexPipeline:
         file: BinaryIO,
         filename: str,
         mime_type: str | None = None,
+        collections: Sequence[str] = (),
     ) -> tuple[dict, dict[str, float]]:
         timings: dict[str, float] = {}
 
@@ -716,11 +795,13 @@ class IndexPipeline:
         # beside it. Setting it as the document's id is what lets the index
         # locate that earlier content without a registry.
         source_key = filename
+        collections = list(collections)
         metadata = {
             "source_id": source_id,
             "source_type": "file",
             "source_name": filename,
             "mime_type": mime_type,
+            COLLECTIONS_KEY: collections,
         }
 
         chunk_start = time.perf_counter()
@@ -733,7 +814,9 @@ class IndexPipeline:
         timings["embed_ms"] = _elapsed_ms(embed_start)
 
         index_start = time.perf_counter()
-        self._replace_source(source_key, nodes)
+        self._replace_source(
+            source_key, nodes, name=filename, source_type="file", collections=collections
+        )
         timings["index_ms"] = _elapsed_ms(index_start)
 
         result = {
@@ -741,6 +824,7 @@ class IndexPipeline:
             "source_type": "file",
             "name": filename,
             "mime_type": mime_type,
+            "collections": collections,
             "status": "indexed",
             "chunking": chunking,
         }
@@ -754,7 +838,11 @@ class IndexPipeline:
         return result, timings
 
     def ingest_url(
-        self, source_id: str, url: str, timeout: int | None = None
+        self,
+        source_id: str,
+        url: str,
+        timeout: int | None = None,
+        collections: Sequence[str] = (),
     ) -> tuple[dict, dict[str, float]]:
         timings: dict[str, float] = {}
         timeout = timeout or self._settings.url_fetch_timeout_seconds
@@ -769,11 +857,13 @@ class IndexPipeline:
         # pointed. Two URLs redirecting to one page are one source, and a page
         # is replaced when it is re-submitted rather than indexed twice.
         source_key = final_url
+        collections = list(collections)
         metadata = {
             "source_id": source_id,
             "source_type": "url",
             "source_name": url,
             "final_url": final_url,
+            COLLECTIONS_KEY: collections,
         }
 
         chunk_start = time.perf_counter()
@@ -786,7 +876,9 @@ class IndexPipeline:
         timings["embed_ms"] = _elapsed_ms(embed_start)
 
         index_start = time.perf_counter()
-        self._replace_source(source_key, nodes)
+        self._replace_source(
+            source_key, nodes, name=url, source_type="url", collections=collections
+        )
         timings["index_ms"] = _elapsed_ms(index_start)
 
         result = {
@@ -794,6 +886,7 @@ class IndexPipeline:
             "source_type": "url",
             "name": url,
             "final_url": final_url,
+            "collections": collections,
             "status": "indexed",
             "chunking": chunking,
         }
@@ -806,8 +899,33 @@ class IndexPipeline:
         )
         return result, timings
 
-    def search(self, query: str, top_k: int) -> list[dict]:
-        retriever = self._index.as_retriever(similarity_top_k=top_k)
+    def search(
+        self, query: str, top_k: int, collections: Sequence[str] | None = None
+    ) -> list[dict]:
+        """Rank chunks against *query*, optionally scoped to *collections*.
+
+        The scope is expressed as a single ``ANY`` entry over the collections
+        list, which the store applies as a prefilter before the similarity scan.
+        That is what makes the requested count a count *within* the scope: the
+        top_k is drawn from the filtered set, so a scope holding fewer chunks
+        returns fewer results rather than being padded from outside it.
+
+        A source carrying no collections matches neither operator -- a list
+        value is tested by membership, and an empty list contains nothing -- so
+        an untagged source falls out of every filter with no special case.
+        """
+        filters = None
+        if collections:
+            filters = MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key=COLLECTIONS_KEY,
+                        value=list(collections),
+                        operator=FilterOperator.ANY,
+                    )
+                ]
+            )
+        retriever = self._index.as_retriever(similarity_top_k=top_k, filters=filters)
         with self._index_lock:
             nodes = retriever.retrieve(query)
         results = []

@@ -1,5 +1,7 @@
 import logging
 import os
+import re
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 
@@ -10,6 +12,58 @@ _LOG_LEVELS = tuple(
     logging.getLevelName(level)
     for level in (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL)
 )
+
+# Collection names are validated rather than normalized, so the name a caller
+# sends is the name that is stored and can be filtered on. Rewriting whatever
+# arrives would leave the caller guessing which spelling was kept -- `C# 12` and
+# `c-12` would become one collection with two spellings and no way to tell which
+# one to search for. Surrounding whitespace is the exception: it is unavoidable
+# in a form field and does not change the name that was typed, so it is trimmed
+# before the grammar is applied. Keeping the grammar this narrow also keeps
+# filter values free of characters that would change how a filter reads them.
+COLLECTION_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+MAX_COLLECTION_NAME_LENGTH = 64
+# How many collections one request may name. The filter stays a single entry
+# however many are named, so this is not about cost: it bounds the size of a
+# request and of the metadata written for every node it ingests.
+MAX_COLLECTIONS_PER_REQUEST = 16
+
+
+def validate_collection_name(value: str) -> str:
+    """The collection name to store for *value*, or a ValueError naming it.
+
+    Trimming happens first, so ``" csharp "`` is the same collection as
+    ``"csharp"``; everything else must match the grammar exactly.
+    """
+    name = value.strip()
+    if not COLLECTION_NAME_PATTERN.match(name) or len(name) > MAX_COLLECTION_NAME_LENGTH:
+        raise ValueError(
+            f"Invalid collection name: {value!r}. A collection name is at most "
+            f"{MAX_COLLECTION_NAME_LENGTH} characters long and uses lowercase letters, "
+            "digits and single hyphens or underscores, for example 'csharp-12'."
+        )
+    return name
+
+
+def validate_collections(values: Sequence[str]) -> list[str]:
+    """The collections to store for a request, validated and de-duplicated.
+
+    A name given twice is one collection, so it is recorded once -- the same way
+    the file and URL routes collapse a filename or URL repeated within a single
+    request.
+    """
+    names: list[str] = []
+    for value in values:
+        name = validate_collection_name(value)
+        if name not in names:
+            names.append(name)
+    if len(names) > MAX_COLLECTIONS_PER_REQUEST:
+        raise ValueError(
+            f"Too many collections: {len(names)} requested, at most "
+            f"{MAX_COLLECTIONS_PER_REQUEST} are accepted."
+        )
+    return names
+
 
 # Sent on every page fetch. It names the service rather than the HTTP library,
 # because a host with a client-identity policy refuses the library's default.
@@ -62,6 +116,10 @@ class Settings(BaseSettings):
 
     knowledge_corpus_dir: str = Field(default="")
     knowledge_corpus_urls: str = Field(default="")
+    # The collections every corpus source is tagged with. Without this the corpus
+    # -- the content that exists specifically to ground answers -- would be the
+    # one set of sources invisible to every filtered search.
+    knowledge_corpus_collections: str = Field(default="")
 
     log_level: str = Field(default="INFO")
 
@@ -74,6 +132,16 @@ class Settings(BaseSettings):
     def knowledge_corpus_url_list(self) -> list[str]:
         """The configured corpus URLs, parsed from the comma-separated setting."""
         return [url.strip() for url in self.knowledge_corpus_urls.split(",") if url.strip()]
+
+    @property
+    def knowledge_corpus_collection_list(self) -> list[str]:
+        """The configured corpus collections, parsed from the comma-separated setting.
+
+        Already validated when these settings were built, so this only splits.
+        """
+        return [
+            name.strip() for name in self.knowledge_corpus_collections.split(",") if name.strip()
+        ]
 
     @property
     def resolved_user_agent(self) -> str:
@@ -105,6 +173,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"Unsupported vector store backend: {value!r}. Supported backends: {supported}"
             ) from exc
+
+    @field_validator("knowledge_corpus_collections")
+    @classmethod
+    def _validate_corpus_collections(cls, value: str) -> str:
+        """Reject a malformed corpus collection as the settings are built.
+
+        Checked here rather than only where the corpus is ingested: a typo in a
+        deployment's configuration should stop the service from starting, not
+        fail every source of the bootstrap one at a time and leave the index
+        empty. Each name is validated without being rewritten, so the value the
+        operator reads back is the value they wrote.
+        """
+        for name in value.split(","):
+            if name.strip():
+                validate_collection_name(name)
+        return value
 
 
 settings = Settings()
