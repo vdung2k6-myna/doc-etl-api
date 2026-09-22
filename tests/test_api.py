@@ -2,16 +2,19 @@ import asyncio
 import logging
 import threading
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from doc_etl_api.config import MAX_COLLECTIONS_PER_REQUEST
+from doc_etl_api.config import MAX_COLLECTIONS_PER_REQUEST, Settings
 from doc_etl_api.jobs import JobRegistry, JobStatus
 from doc_etl_api.main import create_app
-from doc_etl_api.pipeline import SourceRecord
+from doc_etl_api.pipeline import IndexPipeline, SourceRecord
+from doc_etl_api.schemas import SearchRequest, SearchResult
+from tests.stubs import EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL_NAME, StubEmbedding
 
 
 @pytest.fixture
@@ -303,6 +306,9 @@ def test_search_success(client):
             "source_id": "s1",
             "source_type": "file",
             "source_name": "report.pdf",
+            "position": 3,
+            "neighbours_before": 3,
+            "neighbours_after": 2,
         },
         {
             "text": "chunk two",
@@ -310,6 +316,9 @@ def test_search_success(client):
             "source_id": "s2",
             "source_type": "url",
             "source_name": "https://example.com",
+            "position": 0,
+            "neighbours_before": 0,
+            "neighbours_after": 0,
         },
     ]
 
@@ -319,6 +328,12 @@ def test_search_success(client):
     body = response.json()
     assert len(body["results"]) == 2
     assert body["results"][0]["text"] == "chunk one"
+    assert body["results"][0]["position"] == 3
+    assert body["results"][0]["neighbours_before"] == 3
+    assert body["results"][0]["neighbours_after"] == 2
+    assert body["results"][1]["position"] == 0
+    assert body["results"][1]["neighbours_before"] == 0
+    assert body["results"][1]["neighbours_after"] == 0
     client.app.state.pipeline.search.assert_called_once_with("test", top_k=2)
 
 
@@ -347,6 +362,80 @@ def test_openapi_file_upload_schema_is_binary(client):
     assert files_items["format"] == "binary"
 
 
+def test_a_search_that_does_not_ask_for_neighbours_passes_no_count(client):
+    """A caller that wants ranked hits only is given the call this route always made.
+
+    The default is not sent to the pipeline, so "asking for no neighbours behaves
+    as it always has" is structural rather than a promise about the callee.
+    """
+    client.app.state.pipeline.search.return_value = []
+
+    response = client.post("/search", json={"query": "test", "top_k": 2})
+
+    assert response.status_code == 200
+    client.app.state.pipeline.search.assert_called_once_with("test", top_k=2)
+
+
+def test_the_neighbour_count_reaches_the_pipeline_when_asked_for(client):
+    client.app.state.pipeline.search.return_value = []
+
+    response = client.post("/search", json={"query": "test", "top_k": 2, "neighbours": 2})
+
+    assert response.status_code == 200
+    client.app.state.pipeline.search.assert_called_once_with("test", top_k=2, neighbours=2)
+
+
+def test_the_requested_neighbours_reach_the_response_inside_the_hit(client):
+    """A neighbour is returned attached to its hit, not as a result of its own."""
+    client.app.state.pipeline.search.return_value = [
+        {
+            "text": "chunk two",
+            "score": 0.9,
+            "source_id": "s1",
+            "source_type": "file",
+            "source_name": "report.pdf",
+            "position": 2,
+            "neighbours_before": 2,
+            "neighbours_after": 1,
+            "neighbours": [
+                {"text": "chunk one", "position": 1},
+                {"text": "chunk three", "position": 3},
+            ],
+        }
+    ]
+
+    response = client.post("/search", json={"query": "test", "top_k": 1, "neighbours": 1})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["results"]) == 1
+    assert body["results"][0]["neighbours"] == [
+        {"text": "chunk one", "position": 1},
+        {"text": "chunk three", "position": 3},
+    ]
+
+
+def test_the_neighbour_count_is_bounded(client):
+    """The count is small and non-negative: it widens context, it does not fetch a document."""
+    for count in (-1, 6):
+        response = client.post("/search", json={"query": "test", "neighbours": count})
+        assert response.status_code == 422, count
+
+
+def test_the_search_documentation_names_every_field_the_route_serves():
+    """The documented surface is the served one.
+
+    A field added to the request or the response without a line in the README's
+    search section is one a caller cannot discover, so the two are checked
+    against each other rather than trusted to stay in step.
+    """
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    section = readme.split("### Search", 1)[1].split("## Configuration", 1)[0]
+
+    for name in [*SearchRequest.model_fields, *SearchResult.model_fields]:
+        assert name in section, f"{name} is served by /search but not documented"
+
+
 def test_search_logs_elapsed_time(client, caplog):
     client.app.state.pipeline.search.return_value = [
         {
@@ -355,6 +444,9 @@ def test_search_logs_elapsed_time(client, caplog):
             "source_id": "s1",
             "source_type": "file",
             "source_name": "report.pdf",
+            "position": 0,
+            "neighbours_before": 0,
+            "neighbours_after": 4,
         }
     ]
 
@@ -364,6 +456,18 @@ def test_search_logs_elapsed_time(client, caplog):
     assert response.status_code == 200
     assert "search_ms=" in caplog.text
     assert "results=1" in caplog.text
+
+
+def test_search_logs_the_neighbour_count(client, caplog):
+    """Widening a response is a cost, so the log says how wide it was asked to be."""
+    client.app.state.pipeline.search.return_value = []
+
+    with caplog.at_level(logging.INFO, logger="doc_etl_api.routes"):
+        response = client.post("/search", json={"query": "hello", "top_k": 1, "neighbours": 3})
+
+    assert response.status_code == 200
+    assert "neighbours=3" in caplog.text
+    assert "search_ms=" in caplog.text
 
 
 def test_search_logs_elapsed_time_for_empty_results(client, caplog):
@@ -414,6 +518,52 @@ def test_get_job_status(client):
     if body["status"] == JobStatus.COMPLETED.value:
         assert body["result"]["source_id"] == source_id
         assert "parse_ms" in body["timings"]
+
+
+# --- The chunking outcome reaching the job result ----------------------------
+
+
+def _structural_pipeline() -> IndexPipeline:
+    """A real pipeline over the stub embedder, so the outcome reported is real.
+
+    The route's job result is what is under test, so the pipeline behind it is
+    the real one: a double returning a hand-written outcome would prove only that
+    the route copies a dict, not that the fields the chunker reports arrive.
+    """
+    pipeline = IndexPipeline(
+        Settings(
+            vector_store_backend="simple",
+            embedding_model=EMBEDDING_MODEL_NAME,
+            chunk_overlap=0,
+            # The floor off, so each paragraph is stored as the node it is and
+            # the counts below describe the boundaries rather than a merge.
+            min_chunk_tokens=0,
+        ),
+        converter=MagicMock(),
+        embedding_model=StubEmbedding(embed_dim=8),
+    )
+    pipeline.converter.is_supported_file.return_value = True
+    pipeline.converter.convert_file.return_value = (
+        "Under alpha, remark one stands entirely on its own.\n\n"
+        "Under bravo, remark two stands entirely on its own."
+    )
+    return pipeline
+
+
+def test_a_completed_job_reports_the_boundaries_that_produced_its_nodes(client):
+    client.app.state.pipeline = _structural_pipeline()
+
+    response = client.post(
+        "/sources/files",
+        files={"files": ("page.md", BytesIO(b"markdown"), "text/markdown")},
+    )
+
+    chunking = _job_result(client, response)["chunking"]
+    assert chunking["nodes"] == 2, "the report does not describe the nodes that were stored"
+    assert chunking["structural_nodes"] == 2, "the paragraphs were not reported as structural"
+    assert chunking["divided_nodes"] == 0
+    assert chunking["overlap_tokens"] == 0, "a structural boundary was reported as overlapped"
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS
 
 
 def test_get_job_not_found(client):

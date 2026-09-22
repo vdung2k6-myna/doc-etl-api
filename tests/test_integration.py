@@ -96,7 +96,18 @@ def test_search_while_indexing_is_well_formed_and_excludes_the_new_source():
     assert results, "the already-indexed source should still be searchable"
     assert "incoming" not in {r["source_id"] for r in results}
     for result in results:
-        assert set(result) == {"text", "score", "source_id", "source_type", "source_name"}
+        assert set(result) == {
+            "text",
+            "score",
+            "source_id",
+            "source_type",
+            "source_name",
+            "position",
+            "neighbours_before",
+            "neighbours_after",
+            "neighbours",
+        }
+        assert result["neighbours"] == [], "the request asked for no neighbours"
 
     gate.set()
     ingesting.join(timeout=10)

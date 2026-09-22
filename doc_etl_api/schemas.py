@@ -36,6 +36,22 @@ class SearchRequest(BaseModel):
         description="Only return chunks from sources in any of these collections. "
         "Omit to search every indexed source. An empty list is rejected.",
     )
+    neighbours: int = Field(
+        0,
+        ge=0,
+        le=5,
+        description="How many adjacent chunks to return on each side of every result. "
+        "The default, 0, returns none. Neighbours are the chunks stored before and "
+        "after a result within its own source, not the paragraphs around it, and they "
+        "carry no score because they were not ranked against the query.",
+    )
+
+
+class NeighbourChunk(BaseModel):
+    text: str = Field(..., description="Chunk text")
+    position: int = Field(
+        ..., description="Zero-based position this chunk holds in its source, in reading order"
+    )
 
 
 class SearchResult(BaseModel):
@@ -43,6 +59,27 @@ class SearchResult(BaseModel):
     score: float = Field(..., description="Relevance score")
     source_id: str = Field(..., description="Source identifier")
     source_type: str = Field(..., description="Source type: file or url")
+    source_name: str = Field(..., description="Source filename or URL")
+    position: int = Field(
+        ...,
+        description="Zero-based position this chunk holds in its source, in reading order",
+    )
+    neighbours_before: int = Field(
+        ...,
+        description="Chunks this chunk has before it in its source, whether or not they "
+        "were requested. Zero for the source's first chunk.",
+    )
+    neighbours_after: int = Field(
+        ...,
+        description="Chunks this chunk has after it in its source, whether or not they "
+        "were requested. Zero for the source's last chunk.",
+    )
+    neighbours: list[NeighbourChunk] = Field(
+        default_factory=list,
+        description="The chunks stored immediately before and after this one in its source, "
+        "in reading order, up to the neighbour count the request asked for. Empty when it "
+        "asked for none. They carry no score because they were not ranked against the query.",
+    )
     source_name: str = Field(..., description="Original filename or URL")
 
 

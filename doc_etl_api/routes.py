@@ -334,18 +334,24 @@ async def search(
     search_start = time.perf_counter()
     # An unfiltered search calls the pipeline exactly as it did before
     # collections existed, rather than passing a filter that happens to match
-    # everything, so "no filter behaves as it always has" is structural.
+    # everything, so "no filter behaves as it always has" is structural. A search
+    # that asks for no neighbours is passed the same way: the default is not sent,
+    # so a caller that does not ask for adjacency reaches the ranked results and
+    # nothing more.
     search_kwargs: dict = {"top_k": top_k}
     if collections is not None:
         search_kwargs["collections"] = collections
+    if request.neighbours:
+        search_kwargs["neighbours"] = request.neighbours
     raw_results = await run_in_threadpool(pipeline.search, query, **search_kwargs)
     search_ms = round((time.perf_counter() - search_start) * 1000, 2)
     results = [SearchResult(**r) for r in raw_results]
     logger.info(
-        "Search query=%r top_k=%d collections=%s results=%d search_ms=%s",
+        "Search query=%r top_k=%d collections=%s neighbours=%d results=%d search_ms=%s",
         query,
         top_k,
         collections,
+        request.neighbours,
         len(results),
         search_ms,
     )
