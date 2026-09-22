@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import BinaryIO
@@ -18,12 +19,52 @@ from llama_index.core import Settings as LlamaSettings
 from llama_index.core import VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import BaseNode, NodeRelationship, RelatedNodeInfo, TextNode
+from llama_index.core.vector_stores import FilterOperator, MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from doc_etl_api.config import DEFAULT_USER_AGENT, Settings, VectorStoreBackend, settings
 from doc_etl_api.extraction import select_main_content
 
 logger = logging.getLogger(__name__)
+
+# The metadata key carrying the collections a source belongs to.
+COLLECTIONS_KEY = "collections"
+
+# Metadata that is written for filtering but never read by a model. Both the
+# embed and the LLM rendering are excluded, and that is not belt-and-braces:
+# metadata is charged against the chunk-size budget before splitting, and
+# `MetadataAwareTextSplitter._get_metadata_str` renders a node both ways and
+# keeps the longer of the two, so excluding one mode alone would still let a
+# collection name shrink the text each chunk can hold. That changes where a
+# source splits and therefore its vectors -- measured, tagging one document with
+# two collections took it from 14 nodes to 20. Excluding the key from both
+# readings is what makes tagging metadata-only: the prefilter still sees the
+# collections, no model ever does.
+_MODEL_EXCLUDED_KEYS = [COLLECTIONS_KEY]
+
+
+@dataclass(frozen=True)
+class SourceRecord:
+    """What a source is, as the catalog reports it."""
+
+    name: str
+    source_type: str
+    collections: tuple[str, ...]
+    chunk_count: int
+
+
+@dataclass(frozen=True)
+class _Adjacency:
+    """Where a hit sits inside its source, and what context surrounds it.
+
+    ``before`` and ``after`` describe the context the source holds, whether or
+    not it was asked for; ``neighbours`` carries the part of it that was.
+    """
+
+    position: int
+    before: int
+    after: int
+    neighbours: list[dict]
 
 
 def _elapsed_ms(start: float) -> float:
@@ -130,35 +171,124 @@ def _is_separator_row(line: str) -> bool:
     return bool(cells) and all(_SEPARATOR_CELL.match(cell) for cell in cells)
 
 
-def _split_blocks(markdown: str) -> list[tuple[str, str]]:
-    """Split markdown into ``("table" | "prose", text)`` blocks, in document order.
+# A markdown heading as Docling writes one: one to six hashes, then the heading's
+# own text. A line that only looks like a heading -- a hash comment inside a fenced
+# code block -- is excluded by the fence tracking in `_split_sections`.
+_HEADING_LINE = re.compile(r"^#{1,6}\s+\S")
 
-    The splitter packs sentences, and a table row is not a sentence: it carries
-    no sentence punctuation, so the packer sees a table as one undifferentiated
-    run of tokens and cuts it at whatever count it happens to reach. Measured on
-    the corpus this was built for, a ten-row infobox became a dozen 9-14 token
-    scraps such as ``| | Thư tịch | Không rõ``, each detached from the header
-    naming its columns.
 
-    A table block is a run of consecutive table rows; everything else is prose.
-    A blank line ends a run, which is how Docling writes tables.
+@dataclass(frozen=True)
+class _Unit:
+    """One unit of a document: a paragraph of prose, or a run of table rows."""
+
+    kind: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _Section:
+    """A document's content under one heading, or the content before its first."""
+
+    heading: str | None
+    units: tuple[_Unit, ...]
+
+
+def _is_heading_line(line: str) -> bool:
+    """Whether a line opens one of the document's own sections."""
+    return _HEADING_LINE.match(line.strip()) is not None
+
+
+def _split_sections(markdown: str) -> list[_Section]:
+    """Split markdown into the document's own sections, each with its units.
+
+    A heading line opens a section and nothing crosses one: that is the document
+    stating where one topic ends and the next begins, which is a better boundary
+    than any the pipeline could infer. Within a section a blank line ends a unit,
+    which is the author's own paragraph break -- and it is the structure a source
+    whose headings were dropped upstream still has left.
+
+    A run of consecutive table rows is a unit of its own, so a table reaches
+    `_table_parts` whole; a blank line ends that run, which is how Docling writes
+    tables. Consecutive non-blank prose lines are one unit, so a paragraph written
+    across several lines stays whole, and only a blank line ends it.
+
+    A heading counts only outside a fenced code block, because a ``# comment``
+    inside one is a line of the sample rather than a section opening, and cutting
+    there would store half a code block. Table detection is deliberately left
+    unguarded by the fence: the table path is not what this split changes, and a
+    fenced run of pipes reaching `_table_parts` is the behaviour it has always had.
     """
-    blocks: list[tuple[str, str]] = []
-    kind: str | None = None
+    sections: list[_Section] = []
+    heading: str | None = None
+    units: list[_Unit] = []
     lines: list[str] = []
+    kind: str | None = None
+    fenced = False
 
-    def flush() -> None:
+    def flush_unit() -> None:
         if kind is not None and lines:
-            blocks.append((kind, "\n".join(lines)))
+            units.append(_Unit(kind, "\n".join(lines)))
+        lines.clear()
+
+    def flush_section() -> None:
+        nonlocal kind
+        flush_unit()
+        if heading is not None or units:
+            sections.append(_Section(heading, tuple(units)))
+        units.clear()
+        kind = None
 
     for line in markdown.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            fenced = not fenced
+        elif not fenced and _is_heading_line(stripped):
+            flush_section()
+            heading = stripped
+            continue
+        if not stripped:
+            flush_unit()
+            kind = None
+            continue
         line_kind = "table" if _is_table_line(line) else "prose"
         if line_kind != kind:
-            flush()
-            kind, lines = line_kind, []
+            flush_unit()
+            kind = line_kind
         lines.append(line)
-    flush()
-    return blocks
+    flush_section()
+    return sections
+
+
+def _heading_cost(heading: str | None, count: Callable[[str], int]) -> int:
+    """What carrying *heading* costs the budget of every node that carries it.
+
+    Measured rather than assumed: the model reads a node as one sequence, so the
+    heading's cost is the difference between counting a text with the heading and
+    the blank line above it prepended and counting that text alone. A node packed
+    to the chunk size and then given its heading would otherwise sit over the cap
+    by exactly this.
+    """
+    if not heading:
+        return 0
+    return count(f"{heading}\n\nx") - count("x")
+
+
+def _splitter_document(text: str, source_key: str, metadata: dict) -> LlamaDocument:
+    """A document holding one unit, for the sentence splitter to divide.
+
+    The metadata exclusion has to be stated here too, and not only on the node
+    built from the split: the splitter reads this document's metadata for no
+    reason but to charge the chunk-size budget before it splits, and the nodes it
+    returns are discarded, so without the exclusion tagging a source would change
+    where it splits.
+    """
+    return LlamaDocument(
+        text=text,
+        id_=source_key,
+        metadata=metadata,
+        excluded_embed_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+        excluded_llm_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+    )
 
 
 def _token_spans(tokenizer, text: str) -> list[tuple[int, int]] | None:
@@ -336,12 +466,40 @@ def _table_parts(text: str, chunk_size: int, tokenizer) -> list[str]:
 
 
 def _join_text(earlier: str, later: str) -> str:
-    """Concatenate two nodes' text without dropping either."""
-    return f"{earlier}{_MERGE_SEPARATOR}{later}"
+    """Concatenate two nodes' text, keeping one copy of a heading they share.
+
+    A heading the two texts both lead with names the node once, not once per text
+    joined into it: the merged node already opens with it, so the second copy says
+    nothing the first did not. Measured on one source, merges stored its heading 86
+    times over and those copies were 15% of everything the source indexed, with a
+    single node carrying 15 of them. A heading only one of the texts carries is
+    kept, because it is where the section it opens begins inside the merged node.
+    """
+    return f"{earlier}{_MERGE_SEPARATOR}{_without_repeated_heading(earlier, later)}"
+
+
+def _without_repeated_heading(earlier: str, later: str) -> str:
+    """*later* without the leading heading line it repeats from *earlier*.
+
+    Only the leading line is compared, and only when it is a heading, so two nodes
+    opening with the same ordinary line are left alone -- two nodes holding the
+    same text is `_dedupe_texts`'s business, not this function's.
+    """
+    first_earlier = earlier.split("\n", 1)[0]
+    first_later, separator, rest = later.partition("\n")
+    if not separator or not rest or first_later != first_earlier:
+        return later
+    if not _is_heading_line(first_later):
+        return later
+    return rest.lstrip("\n")
 
 
 def _merge_below_floor(
-    texts: Sequence[str], floor: int, ceiling: int, count: Callable[[str], int]
+    texts: Sequence[str],
+    floor: int,
+    ceiling: int,
+    count: Callable[[str], int],
+    origins: Sequence[int] | None = None,
 ) -> tuple[list[str], int, int]:
     """Fold nodes too small to carry information into a neighbour.
 
@@ -349,7 +507,9 @@ def _merge_below_floor(
     document has no predecessor, so it is offered to the one after it instead.
     Merging concatenates text, so nothing is dropped to satisfy the floor --
     which is the point: a fragment is usually real content that lost the context
-    naming it.
+    naming it. The one thing not repeated is a heading both nodes already carry,
+    which names the merged node once rather than once per text folded into it;
+    see `_join_text`.
 
     A merge that would push the node past *ceiling*, the embedding model's input
     length, is refused and the fragment is offered to its other neighbour. An
@@ -358,6 +518,13 @@ def _merge_below_floor(
     node count. A fragment neither neighbour can legally take is stored on its
     own: small, and honestly so.
 
+    When *origins* is given -- one section index per text, in the same order -- a
+    fragment is offered the neighbours inside its own section before the ones a
+    heading separates it from, so reaching the minimum does not join two of the
+    document's sections into one node. Preference rather than prohibition,
+    because the floor is a requirement: a fragment whose only legal merge lies
+    across a heading is still merged rather than left to stand alone.
+
     A document whose entire content is below the floor is left as the single node
     it is rather than merged away.
 
@@ -365,6 +532,9 @@ def _merge_below_floor(
     fragments no merge was legal for.
     """
     surviving = list(texts)
+    # The section each text came from, carried alongside it and shrunk in the same
+    # places, so a merge cannot leave a boundary pointing at text that has moved.
+    sections = list(origins) if origins is not None else None
     merges = 0
     refusals = 0
     index = 0
@@ -377,12 +547,20 @@ def _merge_below_floor(
         # The preceding node keeps reading order; the first node of a document
         # has none and is offered forward instead.
         neighbours = [n for n in (index - 1, index + 1) if 0 <= n < len(surviving)]
+        if sections is not None:
+            # Same-section neighbours first, then the ones beyond a heading. The
+            # sort is stable, so neighbours of one section keep reading order.
+            neighbours.sort(key=lambda other: sections[other] != sections[index])
         for other in neighbours:
             joined = _join_text(surviving[min(index, other)], surviving[max(index, other)])
             if count(joined) > ceiling:
                 continue
             surviving[max(index, other)] = joined
             del surviving[min(index, other)]
+            if sections is not None:
+                # The merged node sits where the earlier of the two did, and
+                # keeps that one's section: it is the section it opens in.
+                del sections[max(index, other)]
             merges += 1
             # Re-examine the node just grown: it may itself still be below the
             # floor, which keeps the floor a fixpoint rather than a single pass.
@@ -416,6 +594,21 @@ def _dedupe_texts(texts: Sequence[str]) -> tuple[list[str], int]:
     return distinct, duplicates
 
 
+def _content_below_heading(text: str) -> str:
+    """A node's text without the heading line it leads with, if it leads with one.
+
+    Every node divided out of a section carries that section's heading, so two
+    adjacent nodes of one section open with the same line -- and that line is not
+    overlap. It is the same heading because both nodes belong to the section it
+    names, so comparing the texts as written would score the sentences the
+    splitter did repeat, sitting right below the heading, as no overlap at all:
+    measured, a section divided into sentence-bounded nodes reported an overlap
+    of 0 while every adjacent pair shared its trailing sentence.
+    """
+    first, separator, rest = text.partition("\n")
+    return rest if separator and rest and _is_heading_line(first) else text
+
+
 def _boundary_overlap(earlier: Sequence[int], later: Sequence[int]) -> int:
     """Tokens the earlier node ends with that the later node also begins with.
 
@@ -438,6 +631,8 @@ def _chunking_outcome(
     floor_merges: int = 0,
     floor_refusals: int = 0,
     duplicate_nodes: int = 0,
+    structural_nodes: int = 0,
+    divided_nodes: int = 0,
 ) -> dict[str, int | None]:
     """What the chunking actually achieved, in the embedding model's tokens.
 
@@ -446,16 +641,27 @@ def _chunking_outcome(
     value above it means content is being truncated. ``overlap_tokens`` is the
     smallest overlap across adjacent nodes -- the conservative answer to whether
     the configured overlap was delivered -- and ``None`` when a source produced
-    too few nodes to have a boundary at all. The three counts that follow say
-    what the minimum node size and the collapse of repeated text changed, so
-    their effect is visible rather than inferred from the node count.
+    too few nodes to have a boundary at all. It is measured below the heading a
+    node leads with, because adjacent nodes of one section share that heading by
+    construction and it is not themselves repeated. The counts that follow say what the
+    minimum node size and the collapse of repeated text changed, so their effect
+    is visible rather than inferred from the node count.
+
+    ``structural_nodes`` and ``divided_nodes`` say where the boundaries came from:
+    nodes stored under a boundary the document itself provided, and nodes that
+    had to be divided further because one of the document's units exceeded the
+    chunk size. They are counted as the boundaries are chosen, before the floor
+    and the collapse change what survives, so they describe how the nodes were
+    produced rather than how many are stored -- which is what makes a source whose
+    structure was too coarse to bound its nodes visible rather than merely
+    unusual.
     """
     count = _token_count(tokenizer)
     sizes = [count(node.get_content()) for node in nodes]
     overlaps = [
         _boundary_overlap(
-            _content_token_ids(tokenizer, earlier.get_content()),
-            _content_token_ids(tokenizer, later.get_content()),
+            _content_token_ids(tokenizer, _content_below_heading(earlier.get_content())),
+            _content_token_ids(tokenizer, _content_below_heading(later.get_content())),
         )
         for earlier, later in zip(nodes, nodes[1:], strict=False)
     ]
@@ -466,6 +672,8 @@ def _chunking_outcome(
         "floor_merges": floor_merges,
         "floor_refusals": floor_refusals,
         "duplicate_nodes": duplicate_nodes,
+        "structural_nodes": structural_nodes,
+        "divided_nodes": divided_nodes,
     }
 
 
@@ -576,12 +784,22 @@ class IndexPipeline:
         # threadpool while search runs on the event loop, so both the write in
         # the ingest methods and the read in `search` must hold this lock.
         self._index_lock = threading.Lock()
-        # Counters for the readiness endpoint. They are recomputed inside the
-        # same critical section as the insert, so they cannot drift from the
-        # index. The mapping they are derived from is only ever touched under the
-        # lock; the totals published to readers are plain integers, so reading
-        # them costs no retrieval, no embedding work, and no lock.
-        self._source_chunk_counts: dict[str, int] = {}
+        # What is indexed, for the readiness endpoint and the source catalog.
+        # `_source_records` is only ever touched under the lock, and each write
+        # publishes `_source_catalog` as an immutable snapshot, so a reader costs
+        # no retrieval, no embedding work, and no lock. Publishing is what keeps a
+        # reader from iterating a dict another thread is mutating.
+        self._source_records: dict[str, SourceRecord] = {}
+        self._source_catalog: tuple[SourceRecord, ...] = ()
+        # Each source's node ids mapped to the position each holds within it,
+        # written with the source's record so the two cannot disagree. The
+        # position is what makes a hit's neighbours findable: it is computed when
+        # the ids are assigned and then hashed into the id, so a hit cannot be
+        # placed in its source from the hit alone. It is kept here rather than in
+        # the node's metadata because metadata not listed as excluded is embedded
+        # with the text, and this number would then be part of every stored
+        # vector instead of bookkeeping beside the store.
+        self._source_positions: dict[str, dict[str, int]] = {}
         self._indexed_sources = 0
         self._indexed_chunks = 0
 
@@ -600,6 +818,16 @@ class IndexPipeline:
     @property
     def indexed_chunks(self) -> int:
         return self._indexed_chunks
+
+    @property
+    def source_catalog(self) -> tuple[SourceRecord, ...]:
+        """Every indexed source, in a stable order, safe to read without the lock.
+
+        An immutable snapshot published by the write that produced it, so a
+        caller cannot observe a source part-way through being replaced and does
+        not wait on ingestion to read it.
+        """
+        return self._source_catalog
 
     @property
     def chunk_size(self) -> int:
@@ -631,7 +859,14 @@ class IndexPipeline:
 
     def _build_node(self, text: str, source_key: str, metadata: dict) -> BaseNode:
         """A node carrying its text, its source's identity, and its metadata."""
-        node = TextNode(text=text, metadata=dict(metadata))
+        node = TextNode(
+            text=text,
+            metadata=dict(metadata),
+            # Collections are a filter key, not content: the prefilter reads them
+            # off the node and the model never does. See `_MODEL_EXCLUDED_KEYS`.
+            excluded_embed_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+            excluded_llm_metadata_keys=list(_MODEL_EXCLUDED_KEYS),
+        )
         # Set as a relationship rather than a field, because `ref_doc_id` is a
         # read-only property derived from the source relation -- and it is what
         # `delete_ref_doc` locates a source's earlier content by.
@@ -643,30 +878,38 @@ class IndexPipeline:
     ) -> tuple[list[BaseNode], dict[str, int | None]]:
         """Split markdown into the nodes this source will store.
 
-        Blocks are chunked first (a table by rows, prose by sentence), then the
-        floor folds away what is too small to carry information -- never past the
-        embedding model's input length, since an oversized node is the truncation
-        this pipeline exists to prevent -- then text repeated inside this one
-        source collapses to a single node. All three run before any embedding is
-        computed, so what is reported and what is embedded describe the same
-        nodes. Positions are numbered after both, so the surviving nodes stay
-        contiguous and identity remains source and position.
+        The document's own structure decides the boundaries: a heading opens a
+        section, a blank line ends a unit within it, and a unit that fits the chunk
+        size is stored as the node it is -- the size bounds a node rather than
+        joining two of the document's units into one, and no node crosses a
+        heading. Only a unit that still exceeds the chunk size on its own is
+        divided further. The floor then folds away what is too small to carry
+        information -- preferring a neighbour inside the fragment's own section,
+        and never past the embedding model's input length, since an oversized node
+        is the truncation this pipeline exists to prevent -- and text repeated
+        inside this one source collapses to a single node. All of it runs before
+        any embedding is computed, so what is reported and what is embedded
+        describe the same nodes. Positions are numbered after all three, so the
+        surviving nodes stay contiguous and identity remains source and position.
         """
         count = _token_count(self._tokenizer)
         texts: list[str] = []
-        for kind, block in _split_blocks(markdown):
-            if kind == "table":
-                texts.extend(_table_parts(block, self._chunk_size, self._tokenizer))
-                continue
-            texts.extend(
-                node.get_content()
-                for node in LlamaSettings.node_parser.get_nodes_from_documents(
-                    [LlamaDocument(text=block, id_=source_key, metadata=metadata)]
-                )
+        # Which section each node came from, in the same order, so the floor can
+        # prefer a neighbour it does not have to cross a heading to reach.
+        origins: list[int] = []
+        structural = 0
+        divided = 0
+        for origin, section in enumerate(_split_sections(markdown)):
+            section_texts, section_structural, section_divided = self._section_nodes(
+                section, source_key, metadata, count
             )
+            texts.extend(section_texts)
+            origins.extend([origin] * len(section_texts))
+            structural += section_structural
+            divided += section_divided
 
         texts, floor_merges, floor_refusals = _merge_below_floor(
-            texts, self._min_chunk_tokens, self._max_input_tokens, count
+            texts, self._min_chunk_tokens, self._max_input_tokens, count, origins
         )
         texts, duplicate_nodes = _dedupe_texts(texts)
 
@@ -678,10 +921,98 @@ class IndexPipeline:
             floor_merges=floor_merges,
             floor_refusals=floor_refusals,
             duplicate_nodes=duplicate_nodes,
+            structural_nodes=structural,
+            divided_nodes=divided,
         )
         return nodes, chunking
 
-    def _replace_source(self, source_key: str, nodes: Sequence[BaseNode]) -> None:
+    def _section_nodes(
+        self, section: _Section, source_key: str, metadata: dict, count: Callable[[str], int]
+    ) -> tuple[list[str], int, int]:
+        """The nodes one section produces, and how their boundaries were chosen.
+
+        A unit the document offers is stored as the node it is: a paragraph the
+        document separated from its neighbours is a thought of its own, so units
+        that fit are never packed together to fill the chunk size. The heading
+        that opened the section leads every node the section produces -- the
+        argument `_table_parts` already makes for repeating a table's header,
+        since a node holding one part of a section without the heading naming it
+        states no topic of its own.
+
+        Only a unit that still exceeds the chunk size on its own is divided
+        further: a paragraph with no paragraph break left in it, or a table too
+        wide to fit, offers the document's own boundaries no more than that, and a
+        sentence boundary is the last resort rather than the first tool.
+
+        Returns the node texts, how many nodes were bounded by the document's own
+        structure, and how many had to be divided because one unit exceeded it.
+        """
+        heading = section.heading
+        cap = self._chunk_size
+        # A heading is spent from the budget of every node that carries it rather
+        # than added on top, or a node packed to the cap and then given its
+        # heading would sit over the cap by exactly the heading's own cost.
+        budget = max(cap - _heading_cost(heading, count), 1)
+
+        def node_text(units: Sequence[str]) -> str:
+            return "\n\n".join(([heading] if heading else []) + list(units))
+
+        texts: list[str] = []
+        structural = 0
+        divided = 0
+        splitter: SentenceSplitter | None = None
+
+        for unit in section.units:
+            if unit.kind == "table":
+                parts = _table_parts(unit.text, budget, self._tokenizer)
+                if len(parts) == 1:
+                    # A table is a unit of the document's own making, stored
+                    # whole, so it is structurally bounded like any paragraph.
+                    texts.append(node_text(parts))
+                    structural += 1
+                else:
+                    # Too wide to fit: its rows are the only boundary it has left.
+                    texts.extend(node_text([part]) for part in parts)
+                    divided += len(parts)
+                continue
+            if count(node_text([unit.text])) <= cap:
+                # It fits as it stands, so the document's own boundary is the
+                # node's boundary and the cap has no boundary to add: joining it
+                # to its neighbour would make one node of two thoughts.
+                texts.append(node_text([unit.text]))
+                structural += 1
+                continue
+            # A single unit wider than the cap with no paragraph break left inside
+            # it, so it is divided where the splitter can: at sentence boundaries,
+            # which is the only place the configured overlap still applies.
+            if splitter is None:
+                splitter = (
+                    LlamaSettings.node_parser
+                    if budget == cap
+                    else SentenceSplitter(
+                        chunk_size=budget, chunk_overlap=self._settings.chunk_overlap
+                    )
+                )
+            pieces: list[str] = []
+            for node in splitter.get_nodes_from_documents(
+                [_splitter_document(unit.text, source_key, metadata)]
+            ):
+                # A backstop for a single sentence wider than the budget, which is
+                # no sentence boundary at all: it is cut by tokens to fit.
+                pieces.extend(_bounded_parts(node.get_content(), budget, count, self._tokenizer))
+            texts.extend(node_text([piece]) for piece in pieces)
+            divided += len(pieces)
+        return texts, structural, divided
+
+    def _replace_source(
+        self,
+        source_key: str,
+        nodes: Sequence[BaseNode],
+        *,
+        name: str,
+        source_type: str,
+        collections: Sequence[str] = (),
+    ) -> None:
         """Store *nodes* as the whole of *source_key*, replacing its earlier content.
 
         Deletion is by document identity, so a source that has never been
@@ -690,13 +1021,31 @@ class IndexPipeline:
         concurrent search cannot observe a source half-replaced. The counters are
         recomputed from what each source currently holds, which is what keeps
         them describing stored content rather than submitted content.
+
+        The source's collections are replaced by the same write that replaces its
+        nodes, so what a source belongs to cannot drift from what it holds: a
+        re-ingestion is always the whole of what that source is.
         """
         with self._index_lock:
             self._index.delete_ref_doc(source_key, delete_from_docstore=True)
             self._index.insert_nodes(nodes)
-            self._source_chunk_counts[source_key] = len(nodes)
-            self._indexed_sources = len(self._source_chunk_counts)
-            self._indexed_chunks = sum(self._source_chunk_counts.values())
+            self._source_records[source_key] = SourceRecord(
+                name=name,
+                source_type=source_type,
+                collections=tuple(collections),
+                chunk_count=len(nodes),
+            )
+            # Written from the same nodes the line above counts, so a source's
+            # recorded order describes what the store holds and a re-ingestion
+            # replaces it rather than leaving positions from the content before.
+            self._source_positions[source_key] = {
+                node.node_id: position for position, node in enumerate(nodes)
+            }
+            self._source_catalog = tuple(
+                self._source_records[key] for key in sorted(self._source_records)
+            )
+            self._indexed_sources = len(self._source_records)
+            self._indexed_chunks = sum(item.chunk_count for item in self._source_records.values())
 
     def ingest_file(
         self,
@@ -704,6 +1053,7 @@ class IndexPipeline:
         file: BinaryIO,
         filename: str,
         mime_type: str | None = None,
+        collections: Sequence[str] = (),
     ) -> tuple[dict, dict[str, float]]:
         timings: dict[str, float] = {}
 
@@ -716,11 +1066,13 @@ class IndexPipeline:
         # beside it. Setting it as the document's id is what lets the index
         # locate that earlier content without a registry.
         source_key = filename
+        collections = list(collections)
         metadata = {
             "source_id": source_id,
             "source_type": "file",
             "source_name": filename,
             "mime_type": mime_type,
+            COLLECTIONS_KEY: collections,
         }
 
         chunk_start = time.perf_counter()
@@ -733,7 +1085,9 @@ class IndexPipeline:
         timings["embed_ms"] = _elapsed_ms(embed_start)
 
         index_start = time.perf_counter()
-        self._replace_source(source_key, nodes)
+        self._replace_source(
+            source_key, nodes, name=filename, source_type="file", collections=collections
+        )
         timings["index_ms"] = _elapsed_ms(index_start)
 
         result = {
@@ -741,6 +1095,7 @@ class IndexPipeline:
             "source_type": "file",
             "name": filename,
             "mime_type": mime_type,
+            "collections": collections,
             "status": "indexed",
             "chunking": chunking,
         }
@@ -754,7 +1109,11 @@ class IndexPipeline:
         return result, timings
 
     def ingest_url(
-        self, source_id: str, url: str, timeout: int | None = None
+        self,
+        source_id: str,
+        url: str,
+        timeout: int | None = None,
+        collections: Sequence[str] = (),
     ) -> tuple[dict, dict[str, float]]:
         timings: dict[str, float] = {}
         timeout = timeout or self._settings.url_fetch_timeout_seconds
@@ -769,11 +1128,13 @@ class IndexPipeline:
         # pointed. Two URLs redirecting to one page are one source, and a page
         # is replaced when it is re-submitted rather than indexed twice.
         source_key = final_url
+        collections = list(collections)
         metadata = {
             "source_id": source_id,
             "source_type": "url",
             "source_name": url,
             "final_url": final_url,
+            COLLECTIONS_KEY: collections,
         }
 
         chunk_start = time.perf_counter()
@@ -786,7 +1147,9 @@ class IndexPipeline:
         timings["embed_ms"] = _elapsed_ms(embed_start)
 
         index_start = time.perf_counter()
-        self._replace_source(source_key, nodes)
+        self._replace_source(
+            source_key, nodes, name=url, source_type="url", collections=collections
+        )
         timings["index_ms"] = _elapsed_ms(index_start)
 
         result = {
@@ -794,6 +1157,7 @@ class IndexPipeline:
             "source_type": "url",
             "name": url,
             "final_url": final_url,
+            "collections": collections,
             "status": "indexed",
             "chunking": chunking,
         }
@@ -806,22 +1170,100 @@ class IndexPipeline:
         )
         return result, timings
 
-    def search(self, query: str, top_k: int) -> list[dict]:
-        retriever = self._index.as_retriever(similarity_top_k=top_k)
+    def search(
+        self,
+        query: str,
+        top_k: int,
+        collections: Sequence[str] | None = None,
+        neighbours: int = 0,
+    ) -> list[dict]:
+        """Rank chunks against *query*, optionally scoped to *collections*.
+
+        The scope is expressed as a single ``ANY`` entry over the collections
+        list, which the store applies as a prefilter before the similarity scan.
+        That is what makes the requested count a count *within* the scope: the
+        top_k is drawn from the filtered set, so a scope holding fewer chunks
+        returns fewer results rather than being padded from outside it.
+
+        A source carrying no collections matches neither operator -- a list
+        value is tested by membership, and an empty list contains nothing -- so
+        an untagged source falls out of every filter with no special case.
+
+        *neighbours* is how many adjacent chunks to attach on each side of every
+        result. It is a count, not a flag: no single number expresses "the
+        passage around this hit" for every caller. Zero attaches nothing, which
+        is what a caller that has not asked for adjacency receives.
+        """
+        filters = None
+        if collections:
+            filters = MetadataFilters(
+                filters=[
+                    MetadataFilter(
+                        key=COLLECTIONS_KEY,
+                        value=list(collections),
+                        operator=FilterOperator.ANY,
+                    )
+                ]
+            )
+        retriever = self._index.as_retriever(similarity_top_k=top_k, filters=filters)
         with self._index_lock:
             nodes = retriever.retrieve(query)
-        results = []
-        for node in nodes:
-            results.append(
-                {
-                    "text": node.node.get_content(),
-                    "score": float(node.score) if node.score is not None else 0.0,
-                    "source_id": node.node.metadata.get("source_id", ""),
-                    "source_type": node.node.metadata.get("source_type", ""),
-                    "source_name": node.node.metadata.get("source_name", ""),
-                }
-            )
+            results = []
+            for hit in nodes:
+                chunk = hit.node
+                adjacency = self._adjacency(chunk, neighbours)
+                results.append(
+                    {
+                        "text": chunk.get_content(),
+                        "score": float(hit.score) if hit.score is not None else 0.0,
+                        "source_id": chunk.metadata.get("source_id", ""),
+                        "source_type": chunk.metadata.get("source_type", ""),
+                        "source_name": chunk.metadata.get("source_name", ""),
+                        "position": adjacency.position,
+                        "neighbours_before": adjacency.before,
+                        "neighbours_after": adjacency.after,
+                        "neighbours": adjacency.neighbours,
+                    }
+                )
         return results
+
+    def _adjacency(self, chunk: BaseNode, count: int) -> _Adjacency:
+        """Place *chunk* in its source and collect the neighbours *count* asks for.
+
+        A chunk whose placement cannot be established reports no adjacency rather
+        than a guessed one, so an unknown is never shown as a neighbour that
+        exists.
+
+        The caller holds ``_index_lock``: this reads the records an ingest writes,
+        so outside it a replacement could be observed half-applied.
+        """
+        source_key = chunk.ref_doc_id
+        record = self._source_records.get(source_key)
+        position = self._source_positions.get(source_key, {}).get(chunk.node_id)
+        if position is None or record is None:
+            return _Adjacency(0, 0, 0, [])
+        # A neighbour is the node the same id function names at an adjacent
+        # position, which is what makes it the source's own next chunk rather than
+        # whatever else the store holds: nothing outside this source is reachable
+        # from the hit's position, and the count bounds both sides.
+        stored = self._index.docstore.docs
+        neighbours = []
+        for offset in range(1, count + 1):
+            for place in (position - offset, position + offset):
+                if 0 <= place < record.chunk_count:
+                    adjacent = stored.get(_node_id(source_key, place))
+                    if adjacent is not None:
+                        neighbours.append({"text": adjacent.get_content(), "position": place})
+        # Walking outwards is what fills the side that has room when the other is
+        # short; sorting restores the document's order, which is the order a
+        # caller splicing a passage reads in.
+        neighbours.sort(key=lambda item: item["position"])
+        return _Adjacency(
+            position,
+            position,
+            max(record.chunk_count - position - 1, 0),
+            neighbours,
+        )
 
 
 def create_pipeline(

@@ -10,6 +10,7 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     File,
+    Form,
     HTTPException,
     Request,
     UploadFile,
@@ -18,7 +19,7 @@ from fastapi import (
 from starlette.concurrency import run_in_threadpool
 
 from doc_etl_api.bootstrap import BootstrapState
-from doc_etl_api.config import Settings, settings
+from doc_etl_api.config import Settings, settings, validate_collections
 from doc_etl_api.jobs import JobRegistry
 from doc_etl_api.pipeline import IndexPipeline
 from doc_etl_api.schemas import (
@@ -29,6 +30,8 @@ from doc_etl_api.schemas import (
     SearchRequest,
     SearchResponse,
     SearchResult,
+    SourceCatalogEntry,
+    SourceCatalogResponse,
     UrlIngestRequest,
 )
 
@@ -36,6 +39,20 @@ from doc_etl_api.schemas import (
 def _is_valid_http_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _requested_collections(values: list[str] | None) -> list[str]:
+    """The collections a request named, or a 400 naming the one that is malformed.
+
+    Every route validates at the boundary and before it queues any work: a name
+    outside the grammar is a caller's mistake, so it costs a 400 rather than a
+    job that fails later, and the message names the value rather than leaving the
+    caller to guess which of several was refused.
+    """
+    try:
+        return validate_collections(values or [])
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 router = APIRouter()
@@ -65,6 +82,7 @@ def _run_file_ingestion(
     file_bytes: bytes,
     filename: str,
     mime_type: str | None,
+    collections: list[str],
 ) -> None:
     job = jobs.get(job_id)
     if job is None:
@@ -75,6 +93,7 @@ def _run_file_ingestion(
             file=BytesIO(file_bytes),
             filename=filename,
             mime_type=mime_type,
+            collections=collections,
         )
         job.complete(result, timings)
     except Exception as exc:
@@ -88,12 +107,15 @@ def _run_url_ingestion(
     source_id: str,
     url: str,
     timeout: int,
+    collections: list[str],
 ) -> None:
     job = jobs.get(job_id)
     if job is None:
         return
     try:
-        result, timings = pipeline.ingest_url(source_id=source_id, url=url, timeout=timeout)
+        result, timings = pipeline.ingest_url(
+            source_id=source_id, url=url, timeout=timeout, collections=collections
+        )
         job.complete(result, timings)
     except Exception as exc:
         job.fail(str(exc))
@@ -129,6 +151,7 @@ async def health(
     summary="Upload documents for ingestion",
     description="Upload one or more supported document files. Each file is parsed with Docling, "
     "chunked, embedded, and indexed into the vector store in the background. "
+    "Repeat the `collections` form field to put the uploads in collections. "
     "Use `GET /jobs/{job_id}` to poll for completion.",
 )
 async def ingest_files(
@@ -136,7 +159,10 @@ async def ingest_files(
     jobs: JobsDep,
     background_tasks: BackgroundTasks,
     files: Annotated[list[UploadFile], File(...)],
+    collections: Annotated[list[str] | None, Form()] = None,
 ) -> list[IngestFileResponse]:
+    requested_collections = _requested_collections(collections)
+
     if not files:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -180,6 +206,7 @@ async def ingest_files(
             file_bytes,
             name,
             upload.content_type,
+            requested_collections,
         )
         results.append(
             IngestFileResponse(
@@ -208,6 +235,8 @@ async def ingest_urls(
     request: UrlIngestRequest,
     app_settings: Annotated[Settings, Depends(lambda: settings)],
 ) -> list[IngestUrlResponse]:
+    requested_collections = _requested_collections(request.collections)
+
     for url in request.urls:
         if not _is_valid_http_url(url):
             raise HTTPException(
@@ -235,6 +264,7 @@ async def ingest_urls(
             source_id,
             url,
             app_settings.url_fetch_timeout_seconds,
+            requested_collections,
         )
         results.append(
             IngestUrlResponse(
@@ -269,7 +299,9 @@ async def get_job(
     "/search",
     response_model=SearchResponse,
     summary="Search indexed content",
-    description="Query the vector index and return ranked chunks with source metadata.",
+    description="Query the vector index and return ranked chunks with source metadata. "
+    "Supplying `collections` restricts the search to sources in any of them; "
+    "omitting it searches every indexed source.",
 )
 async def search(
     pipeline: PipelineDep,
@@ -282,18 +314,67 @@ async def search(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Query must contain non-whitespace characters.",
         )
+    collections = request.collections
+    if collections is not None and not collections:
+        # "Search nothing" and "search everything" are both readings of an empty
+        # list, and the second silently answers a scoped question with unrelated
+        # content. Refusing it makes the caller's mistake loud instead of
+        # plausible, so an empty list is never treated as no filter.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The collections filter must name at least one collection; omit it to "
+            "search every indexed source.",
+        )
+    if collections is not None:
+        collections = _requested_collections(collections)
+
     top_k = request.top_k or app_settings.default_top_k
     # Retrieval embeds the query synchronously, so it must not run on the event
     # loop: doing so would block every other route for the duration.
     search_start = time.perf_counter()
-    raw_results = await run_in_threadpool(pipeline.search, query, top_k=top_k)
+    # An unfiltered search calls the pipeline exactly as it did before
+    # collections existed, rather than passing a filter that happens to match
+    # everything, so "no filter behaves as it always has" is structural. A search
+    # that asks for no neighbours is passed the same way: the default is not sent,
+    # so a caller that does not ask for adjacency reaches the ranked results and
+    # nothing more.
+    search_kwargs: dict = {"top_k": top_k}
+    if collections is not None:
+        search_kwargs["collections"] = collections
+    if request.neighbours:
+        search_kwargs["neighbours"] = request.neighbours
+    raw_results = await run_in_threadpool(pipeline.search, query, **search_kwargs)
     search_ms = round((time.perf_counter() - search_start) * 1000, 2)
     results = [SearchResult(**r) for r in raw_results]
     logger.info(
-        "Search query=%r top_k=%d results=%d search_ms=%s",
+        "Search query=%r top_k=%d collections=%s neighbours=%d results=%d search_ms=%s",
         query,
         top_k,
+        collections,
+        request.neighbours,
         len(results),
         search_ms,
     )
     return SearchResponse(results=results)
+
+
+@router.get(
+    "/sources",
+    response_model=SourceCatalogResponse,
+    summary="List indexed sources",
+    description="Report every source currently in the index with its name, type, collections, "
+    "and chunk count. Served from state maintained as sources are ingested, so it "
+    "performs no retrieval and no embedding.",
+)
+async def list_sources(pipeline: PipelineDep) -> SourceCatalogResponse:
+    return SourceCatalogResponse(
+        sources=[
+            SourceCatalogEntry(
+                name=record.name,
+                source_type=record.source_type,
+                collections=list(record.collections),
+                chunk_count=record.chunk_count,
+            )
+            for record in pipeline.source_catalog
+        ]
+    )

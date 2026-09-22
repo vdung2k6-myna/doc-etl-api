@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from docling.datamodel.base_models import ConversionStatus
 from llama_index.core import Document as LlamaDocument
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core.embeddings import MockEmbedding
+from llama_index.core.schema import MetadataMode
 
 from doc_etl_api.config import DEFAULT_USER_AGENT, Settings
 from doc_etl_api.pipeline import (
@@ -23,6 +25,7 @@ from doc_etl_api.pipeline import (
     _content_token_ids,
     _node_id,
     _split_oversized_text,
+    _split_sections,
 )
 from tests.stubs import (
     EMBEDDING_MAX_TOKENS,
@@ -1244,7 +1247,10 @@ def test_readme_documents_the_node_floor():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
 
     assert "| `MIN_CHUNK_TOKENS` |" in readme, "the setting is missing from the configuration table"
-    assert "restores the previous behaviour" in readme, "the escape hatch is not documented"
+    # The escape hatch is what the setting to zero does under the boundaries this
+    # change introduced: every unit of the document stored as its own node. It no
+    # longer restores sentence packing, because nothing packs sentences any more.
+    assert "merging nothing" in readme, "the escape hatch is not documented"
     assert Settings().min_chunk_tokens == 32
 
 
@@ -1254,6 +1260,25 @@ def test_readme_documents_the_user_agent():
     assert "| `USER_AGENT` |" in readme, "the setting is missing from the configuration table"
     assert "contact details" in readme, "the reason to set it is not documented"
     assert Settings().resolved_user_agent == "doc-etl-api/0.1.0"
+
+
+def test_readme_documents_collections():
+    """A caller cannot use a scope the README does not describe.
+
+    Named settings, the endpoints that take a collection, and the two rules a
+    caller would otherwise discover by being refused: the cap on how many one
+    request may name, and the rejection of an empty filter.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert "| `KNOWLEDGE_CORPUS_COLLECTIONS` |" in readme, (
+        "the setting is missing from the configuration table"
+    )
+    assert "[Collections](#collections)" in readme, "the collections section is missing"
+    assert "localhost:8000/sources" in readme, "the source catalog endpoint is not documented"
+    assert "at most 16 collections" in readme, "the cap per request is not documented"
+    assert '"collections": []' in readme, "the rejection of an empty filter is not documented"
+    assert Settings().knowledge_corpus_collection_list == []
 
 
 def test_the_chunking_outcome_reports_what_the_floor_and_the_collapse_did():
@@ -1367,3 +1392,962 @@ def test_a_query_for_an_infobox_value_returns_a_node_carrying_its_header():
     assert any(
         INFOBOX_VALUE in item["text"] and INFOBOX_HEADER in item["text"] for item in results
     ), "the infobox value came back without the header naming its column"
+
+
+# --- Structural boundaries: the document's own sections and paragraphs --------
+#
+# A document of heading, section and paragraph, so the boundaries a node is
+# allowed to have can be told apart from the ones a token count would place.
+
+
+def _paragraph(label: str, sentences: int = 5) -> str:
+    """A paragraph of *sentences* distinct sentences, labelled so it is findable.
+
+    Measured against the stub model's tokenizer: one is 55 tokens, two pack into
+    a 128-token node with room to spare and a third does not, so packing and the
+    paragraph boundary can each be observed on their own.
+    """
+    return " ".join(
+        f"Under {label}, remark {index} stands entirely on its own."
+        for index in range(1, sentences + 1)
+    )
+
+
+HEADING_ONE = "## Niên biểu"
+HEADING_TWO = "## Thư tịch"
+# Below the 32-token floor however it is stored, so the floor has to act on it.
+FRAGMENT = "Phụ lục."
+# Also below the floor, but wide enough that folding it into a table part already
+# at the model's window would breach the window: measured at 17 tokens against a
+# part of 248, the merge reaches 266 against a 256-token window and is refused,
+# leaving the merge across the heading as the only legal one. A five-token
+# fragment does not do this: it fits beside the part, so the fragment's own
+# section can take it and the crossing is never reached.
+FRAGMENT_WIDE = " ".join(f"Phụ lục {index}." for index in range(1, 4))
+
+PARA_ALPHA = _paragraph("Alpha")
+PARA_BRAVO = _paragraph("Bravo")
+PARA_CHARLIE = _paragraph("Charlie")
+PARA_DELTA = _paragraph("Delta")
+PARAGRAPHS = [PARA_ALPHA, PARA_BRAVO, PARA_CHARLIE, PARA_DELTA]
+# Six paragraphs, so a 128-token cap divides one section into three nodes: the
+# smallest shape in which a shared heading is carried by more than two of them.
+PARAGRAPHS_SIX = [*PARAGRAPHS, _paragraph("Echo"), _paragraph("Foxtrot")]
+
+# The paragraphs as the body of one section, and those sections under their heading.
+PARAGRAPHS_JOINED = "\n\n".join(PARAGRAPHS)
+PARAGRAPHS_SIX_JOINED = "\n\n".join(PARAGRAPHS_SIX)
+SECTION_OF_PARAGRAPHS = f"{HEADING_ONE}\n\n{PARAGRAPHS_JOINED}"
+SECTION_OF_SIX = f"{HEADING_ONE}\n\n{PARAGRAPHS_SIX_JOINED}"
+
+
+def _paragraph_runs(paragraphs: Sequence[str]) -> set[str]:
+    """Every node body a run of whole paragraphs could produce, in document order."""
+    return {
+        "\n\n".join(paragraphs[start:stop])
+        for start in range(len(paragraphs))
+        for stop in range(start + 1, len(paragraphs) + 1)
+    }
+
+
+def test_a_heading_opens_a_section_that_the_next_heading_closes():
+    markdown = PARAGRAPH_GAP.join(
+        [HEADING_ONE, PARA_ALPHA, PARA_BRAVO, HEADING_TWO, PARA_CHARLIE]
+    )
+
+    sections = _split_sections(markdown)
+
+    assert [section.heading for section in sections] == [HEADING_ONE, HEADING_TWO]
+    # Paragraphs inside one section are units of their own rather than one run.
+    assert [unit.text for unit in sections[0].units] == [PARA_ALPHA, PARA_BRAVO]
+    assert PARA_CHARLIE not in [unit.text for unit in sections[0].units], (
+        "a unit of one section carried text from the section after it"
+    )
+
+
+def test_content_before_the_first_heading_is_a_section_of_its_own():
+    sections = _split_sections(PARAGRAPH_GAP.join([PARA_ALPHA, HEADING_ONE, PARA_BRAVO]))
+
+    assert [section.heading for section in sections] == [None, HEADING_ONE]
+    assert [unit.text for unit in sections[0].units] == [PARA_ALPHA]
+    assert [unit.text for unit in sections[1].units] == [PARA_BRAVO]
+
+
+def test_a_document_with_no_headings_is_one_headingless_section():
+    sections = _split_sections(PARAGRAPH_GAP.join([PARA_ALPHA, PARA_BRAVO]))
+
+    assert len(sections) == 1
+    assert sections[0].heading is None
+    assert [unit.text for unit in sections[0].units] == [PARA_ALPHA, PARA_BRAVO]
+
+
+def test_a_heading_with_no_content_after_it_is_a_section_with_no_units():
+    sections = _split_sections(PARAGRAPH_GAP.join([HEADING_ONE, PARA_ALPHA, HEADING_TWO]))
+
+    assert [(section.heading, len(section.units)) for section in sections] == [
+        (HEADING_ONE, 1),
+        (HEADING_TWO, 0),
+    ]
+
+
+def test_a_table_between_two_headings_is_a_unit_of_the_section_above_it():
+    markdown = PARAGRAPH_GAP.join([HEADING_ONE, PARA_ALPHA, INFOBOX, HEADING_TWO, PARA_BRAVO])
+
+    sections = _split_sections(markdown)
+
+    assert [unit.kind for unit in sections[0].units] == ["prose", "table"]
+    assert sections[0].units[1].text == INFOBOX, "the table run was not kept whole"
+    assert [section.heading for section in sections] == [HEADING_ONE, HEADING_TWO]
+    assert [unit.text for unit in sections[1].units] == [PARA_BRAVO]
+
+
+def test_a_comment_inside_a_fenced_code_block_does_not_open_a_section():
+    """A hash at the start of a line is only a heading outside a code block.
+
+    A fenced sample whose line begins with a hash is content, and cutting there
+    would store half a code block under a heading it never had.
+    """
+    markdown = "\n".join(
+        [HEADING_ONE, "", "```python", "# not a heading", "value = 1", "```", "", PARA_ALPHA]
+    )
+
+    sections = _split_sections(markdown)
+
+    assert [section.heading for section in sections] == [HEADING_ONE]
+    assert [unit.text.splitlines()[0] for unit in sections[0].units] == ["```python", PARA_ALPHA]
+
+
+def test_each_paragraph_of_a_fitting_section_becomes_its_own_node():
+    """The document's boundaries are the nodes', however much smaller than the cap.
+
+    Two paragraphs the author separated are two thoughts, so the cap does not
+    join them into one node merely because both would fit inside it.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    section = "\n\n".join([PARA_ALPHA, PARA_BRAVO])
+    assert _model_tokens(section) < 128, "the section must fit the cap for this test to mean anything"
+
+    chunking = _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{section}")
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert chunking["nodes"] == 2, "a section that fits was packed rather than stored as it stands"
+    assert stored == [f"{HEADING_ONE}\n\n{PARA_ALPHA}", f"{HEADING_ONE}\n\n{PARA_BRAVO}"]
+
+
+def test_a_section_over_the_cap_is_divided_at_its_own_paragraph_boundaries():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    section = "\n\n".join(PARAGRAPHS)
+    assert _model_tokens(section) > 128, "the section must exceed the cap for this test to bite"
+
+    chunking = _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{section}")
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the section must be divided for this test to mean anything"
+    assert len(stored) == chunking["nodes"]
+    for text in stored:
+        assert text.removeprefix(f"{HEADING_ONE}\n\n") in _paragraph_runs(PARAGRAPHS), (
+            "a node's boundaries are not the section's own paragraph boundaries"
+        )
+    for paragraph in PARAGRAPHS:
+        holders = [text for text in stored if paragraph in text]
+        assert len(holders) == 1, "a paragraph was divided between nodes or stored twice"
+
+
+def test_every_node_of_a_long_section_carries_its_heading():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{PARAGRAPHS_JOINED}")
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the section must be divided for this test to mean anything"
+    for text in stored:
+        assert text.startswith(f"{HEADING_ONE}\n\n"), "a node divided out of a section lost its heading"
+
+
+def test_a_section_that_is_one_node_carries_its_heading_once():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{PARA_ALPHA}")
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) == 1, "the paragraph must fit one node for this test to mean anything"
+    assert stored[0].count(HEADING_ONE) == 1, "the heading was repeated inside one node"
+
+
+def test_a_paragraph_wider_than_the_cap_is_divided_at_sentence_boundaries():
+    """The last resort: a single unit with no paragraph break left inside it.
+
+    It is the only place the configured overlap still applies, so its nodes are
+    the ones that repeat the sentence at their boundary.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32)
+    assert _model_tokens(SENTENCE_DOC) > 128, "the fixture must exceed the cap for this test to bite"
+
+    chunking = _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{SENTENCE_DOC}")
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the paragraph must be divided for this test to mean anything"
+    assert chunking["max_node_tokens"] <= 128, "a node exceeded the cap it was divided to"
+    assert all(text.startswith(f"{HEADING_ONE}\n\n") for text in stored)
+    assert "Sentence 1 " in stored[0], "the paragraph's own opening was not stored"
+    body = stored[0].removeprefix(f"{HEADING_ONE}\n\n")
+    trailing = f"Sentence {body.rstrip().rsplit('Sentence ', 1)[-1]}"
+    assert trailing in stored[1], "the trailing sentence of one node was not repeated into the next"
+    assert chunking["overlap_tokens"] > 0, "the configured overlap was not reported between them"
+
+
+def _document_shapes() -> dict[str, str]:
+    """One document per way a node can be bounded: section, paragraph, neither."""
+    return {
+        "section-fits": f"{HEADING_ONE}\n\n{PARA_ALPHA}\n\n{PARA_BRAVO}",
+        "section-paragraphs": SECTION_OF_PARAGRAPHS,
+        "paragraph-divided": f"{HEADING_ONE}\n\n{SENTENCE_DOC}",
+        "table-under-a-heading": f"{HEADING_ONE}\n\n{PARA_ALPHA}\n\n{INFOBOX}",
+        "wide-table": f"{HEADING_ONE}\n\n{WIDE_TABLE}",
+        "padded-table": f"{HEADING_ONE}\n\n{PADDED_TABLE}",
+        "row-wider-than-the-window": f"{HEADING_ONE}\n\n{LONG_ROW_TABLE}",
+        "no-structure": SENTENCE_DOC,
+    }
+
+
+def test_no_node_exceeds_the_cap_on_any_shape_of_document():
+    """The floor is switched off so the cap is the only thing sizing a node.
+
+    A merge is allowed past the cap, up to the model's window, which is the
+    separate bound the test after this one covers.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32, min_chunk_tokens=0)
+
+    for name, markdown in _document_shapes().items():
+        chunking = _ingest_markdown(pipeline, markdown, filename=f"{name}.txt")
+        assert chunking["max_node_tokens"] <= 128, f"{name} produced a node past the cap"
+        assert chunking["floor_merges"] == 0, f"{name} merged a node with the floor switched off"
+
+
+def test_no_node_exceeds_the_model_window_on_any_shape_of_document():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32)
+
+    for name, markdown in _document_shapes().items():
+        chunking = _ingest_markdown(pipeline, markdown, filename=f"{name}.txt")
+        assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS, (
+            f"{name} produced a node the model cannot read whole"
+        )
+
+
+def test_overlap_is_not_repeated_between_the_nodes_of_a_section():
+    """A structural seam is where the source changed subject, not a cut to hide."""
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32)
+
+    chunking = _ingest_markdown(pipeline, SECTION_OF_PARAGRAPHS)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) > 1, "the section must be divided for this test to mean anything"
+    assert chunking["overlap_tokens"] == 0, "text was repeated across a paragraph boundary"
+    for paragraph in PARAGRAPHS:
+        assert sum(1 for text in stored if paragraph in text) == 1, "a paragraph was repeated"
+
+
+def test_a_fragment_is_merged_inside_its_own_section_before_reaching_across_a_heading():
+    """Both merges would be legal; the one that keeps the sections apart is taken.
+
+    The fragment opens the second section, so the neighbour before it lies beyond
+    the heading and the neighbour after it does not.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    # The infobox keeps the fragment from being packed with the paragraph after
+    # it: a table is a node of its own, so the fragment is left standing alone at
+    # a size the floor has to act on.
+    markdown = PARAGRAPH_GAP.join(
+        [f"{HEADING_ONE}\n\n{PARA_ALPHA}", f"{HEADING_TWO}\n\n{FRAGMENT}\n\n{INFOBOX}"]
+    )
+
+    chunking = _ingest_markdown(pipeline, markdown)
+
+    assert chunking["floor_merges"] == 1, "the fragment was not merged"
+    carriers = [text for text in (n.get_content() for n in _stored_nodes(pipeline)) if FRAGMENT in text]
+    assert len(carriers) == 1, "the fragment was dropped or stored twice"
+    assert INFOBOX_HEADER in carriers[0], "the fragment was merged beyond its own section"
+    assert "Alpha" not in carriers[0], "the merge joined two of the document's sections"
+
+
+def test_a_fragment_whose_only_legal_merge_lies_across_a_heading_is_still_merged():
+    """The preference is an ordering of candidates, not a prohibition.
+
+    The fragment's own section offers a neighbour that is already at the model's
+    window, so the only merge left is the one across the heading -- and a floor
+    that refused it would leave the fragment stored alone, which is the state the
+    floor exists to prevent. FRAGMENT_WIDE carries the width this needs: a fragment
+    narrow enough to fit beside that neighbour is taken by its own section instead,
+    which the neighbouring test asserts.
+    """
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=0)
+    markdown = PARAGRAPH_GAP.join(
+        [f"{HEADING_ONE}\n\n{PARA_ALPHA}", f"{HEADING_TWO}\n\n{FRAGMENT_WIDE}\n\n{WIDE_TABLE}"]
+    )
+
+    chunking = _ingest_markdown(pipeline, markdown)
+
+    assert chunking["floor_merges"] == 1, "the fragment was left stored on its own"
+    assert chunking["floor_refusals"] == 0, "a legal merge across the heading was refused"
+    carriers = [text for text in (n.get_content() for n in _stored_nodes(pipeline)) if FRAGMENT_WIDE in text]
+    assert len(carriers) == 1
+    assert "Alpha" in carriers[0], "the only legal merge available was not the one taken"
+    assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS
+
+
+def test_a_heading_carried_by_every_node_of_its_section_is_not_a_repeat():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    chunking = _ingest_markdown(pipeline, SECTION_OF_SIX)
+
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) >= 3, "the fixture must produce several nodes of one section"
+    assert all(text.startswith(HEADING_ONE) for text in stored)
+    assert chunking["duplicate_nodes"] == 0, "the heading they share was collapsed as repeated text"
+    assert len(stored) == chunking["nodes"]
+
+
+def test_a_merge_stores_the_heading_its_nodes_share_only_once():
+    """A merged node names its section once, however many texts were folded into it.
+
+    Every unit of a section leads with that section's heading, so joining two of
+    them verbatim stores the heading once per text: measured on a real page, one
+    node carried 15 copies of it, and the copies were 15% of the source's stored
+    tokens -- paid for in embedding space by text that says nothing new.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    short_one = _paragraph("Echo", sentences=1)
+    short_two = _paragraph("Foxtrot", sentences=1)
+
+    chunking = _ingest_markdown(
+        pipeline, PARAGRAPH_GAP.join([HEADING_ONE, short_one, short_two]), filename="shared.txt"
+    )
+
+    assert chunking["floor_merges"] == 1, "the fixture must exercise the floor"
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) == 1, "two below-floor paragraphs did not become one node"
+    assert stored[0].count(HEADING_ONE) == 1, "the shared heading was stored once per merged node"
+    assert stored[0].startswith(HEADING_ONE), "the merged node lost the heading naming it"
+    assert short_one in stored[0] and short_two in stored[0], "content was dropped to satisfy the floor"
+
+
+def test_a_merge_across_a_heading_keeps_both_headings():
+    """A heading only one of the merged texts carries still marks where it begins.
+
+    Dropping the repeated heading must not drop a *different* one: the merged node
+    holds two of the document's sections, and each has to stay named where it
+    opens, or the second section's text reads as part of the first.
+    """
+    pipeline = _stub_pipeline(chunk_size=None, chunk_overlap=0)
+    markdown = PARAGRAPH_GAP.join(
+        [f"{HEADING_ONE}\n\n{PARA_ALPHA}", f"{HEADING_TWO}\n\n{FRAGMENT_WIDE}\n\n{WIDE_TABLE}"]
+    )
+
+    chunking = _ingest_markdown(pipeline, markdown, filename="crossing.txt")
+
+    assert chunking["floor_merges"] == 1, "the fragment was not merged across the heading"
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    carrier = [text for text in stored if FRAGMENT_WIDE in text]
+    assert len(carrier) == 1
+    assert carrier[0].count(HEADING_ONE) == 1, "the heading of the section it opens in was lost"
+    assert carrier[0].count(HEADING_TWO) == 1, "the differing heading was dropped as if it repeated"
+
+
+def test_text_repeated_inside_one_section_is_still_stored_once():
+    """The collapse still runs, and still runs last.
+
+    The infobox between the two copies keeps them from being packed into one
+    node, so the repetition really is two byte-identical nodes of one section.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    markdown = PARAGRAPH_GAP.join([HEADING_ONE, PARA_ALPHA, INFOBOX, PARA_ALPHA])
+
+    chunking = _ingest_markdown(pipeline, markdown)
+
+    assert chunking["duplicate_nodes"] == 1, "the repeated paragraph was stored twice"
+    stored = [node.get_content() for node in _stored_nodes(pipeline)]
+    assert len(stored) == chunking["nodes"]
+    assert sum(1 for text in stored if PARA_ALPHA in text) == 1
+
+
+def test_the_chunking_outcome_reports_which_boundaries_produced_the_nodes():
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32)
+
+    fits = _ingest_markdown(
+        pipeline, f"{HEADING_ONE}\n\n{PARA_ALPHA}\n\n{PARA_BRAVO}", filename="fits.txt"
+    )
+    divided = _ingest_markdown(
+        pipeline, f"{HEADING_ONE}\n\n{SENTENCE_DOC}", filename="divided.txt"
+    )
+
+    assert fits["nodes"] == 2
+    assert fits["structural_nodes"] == 2, (
+        "paragraphs stored under their own boundary were not reported as structural"
+    )
+    assert fits["divided_nodes"] == 0
+
+    assert divided["floor_merges"] == 0, "the fixture must not need the floor for this comparison"
+    assert divided["structural_nodes"] == 0, "a divided paragraph was reported as structural"
+    assert divided["divided_nodes"] == divided["nodes"], (
+        "the reported counts do not describe the nodes that were stored"
+    )
+
+
+# --- Collections: a filter key that is never content ------------------------
+
+
+def _collections_pipeline(settings) -> IndexPipeline:
+    """A pipeline whose embedder depends on the text it is given.
+
+    The vectors are what this section compares, and `MockEmbedding` returns one
+    vector for every text, so a comparison against it would hold whatever the
+    text was. `_ContentEmbedding` embeds text as a function of itself, so equal
+    vectors mean equal embedded text.
+    """
+    return IndexPipeline(
+        settings, converter=MagicMock(), embedding_model=_ContentEmbedding(embed_dim=8)
+    )
+
+
+def _stored_vectors(pipeline) -> dict[str, list[float]]:
+    """The vectors the store holds, keyed by node id.
+
+    The store is the only place they exist: the docstore strips a node's
+    embedding as it stores it, and `SimpleVectorStore.get_nodes` raises.
+    """
+    return dict(pipeline.index.storage_context.vector_store._data.embedding_dict)
+
+
+def test_a_collection_is_filterable_metadata_that_the_model_never_reads(settings):
+    """The prefilter must see the collections; nothing else may.
+
+    Both halves matter: the metadata carrying the key is what the filter tests,
+    and the key being excluded from the embedded rendering is what keeps tagging
+    from becoming part of the content a query is matched against.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(
+        source_id="source",
+        file=BytesIO(b"x"),
+        filename="doc.txt",
+        collections=["csharp", "dotnet"],
+    )
+
+    nodes = _stored_nodes(pipeline)
+    assert len(nodes) > 1, "the document must split for this test to mean anything"
+    for node in nodes:
+        assert node.metadata["collections"] == ["csharp", "dotnet"]
+        embedded = node.get_content(metadata_mode=MetadataMode.EMBED)
+        assert "collections" not in embedded
+        assert "csharp" not in embedded, "a collection name reached the embedded text"
+
+    # The store keeps the same metadata for the prefilter to read, so the key is
+    # present exactly where filtering looks for it.
+    stored = next(iter(pipeline.index.storage_context.vector_store._data.metadata_dict.values()))
+    assert stored["collections"] == ["csharp", "dotnet"]
+
+
+def test_tagging_a_source_does_not_move_its_vectors(settings):
+    """Collections are a predicate, not content.
+
+    Metadata is otherwise charged against the chunk-size budget before splitting
+    -- the splitter renders a node for the embedder and for an LLM and budgets
+    for whichever is longer -- so without the exclusion a collection name changes
+    where a document splits, and therefore every vector it produces. This is the
+    test that fails when only one of the two renderings is excluded.
+    """
+    untagged = _collections_pipeline(settings)
+    tagged = _collections_pipeline(settings)
+    for pipeline in (untagged, tagged):
+        pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    untagged.ingest_file(source_id="plain", file=BytesIO(b"x"), filename="doc.txt")
+    tagged.ingest_file(
+        source_id="tagged",
+        file=BytesIO(b"x"),
+        filename="doc.txt",
+        collections=["csharp", "dotnet-retrieval"],
+    )
+
+    plain_nodes = _stored_nodes(untagged)
+    assert len(plain_nodes) > 1, "the document must split for this test to mean anything"
+    assert [node.get_content() for node in plain_nodes] == [
+        node.get_content() for node in _stored_nodes(tagged)
+    ], "tagging changed how the document was chunked"
+    assert _stored_vectors(untagged) == _stored_vectors(tagged)
+
+    # Which is the point of the property: a caller who never filters cannot tell
+    # the tagged source from the untagged one.
+    query = "Sentence 5 covers its own separate subject"
+    assert [item["score"] for item in untagged.search(query, top_k=5)] == [
+        item["score"] for item in tagged.search(query, top_k=5)
+    ]
+
+
+def test_re_uploading_a_document_replaces_its_collections(settings):
+    """A source belongs to what its most recent upload named, and nothing else."""
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+    pipeline.ingest_file(
+        source_id="second", file=BytesIO(b"x"), filename="doc.txt", collections=["dotnet"]
+    )
+
+    assert len(pipeline.source_catalog) == 1, "the re-upload was indexed as a second source"
+    assert pipeline.source_catalog[0].collections == ("dotnet",)
+    assert _stored_nodes(pipeline)[0].metadata["collections"] == ["dotnet"]
+    assert pipeline.search("Sentence 5", top_k=5, collections=["csharp"]) == []
+
+
+def test_collections_reach_a_source_whose_url_redirected(settings):
+    """A page is identified by where it landed; its collections follow it there."""
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_url.return_value = (SENTENCE_DOC, "https://example.com/final")
+
+    result, _ = pipeline.ingest_url(
+        source_id="source", url="https://example.com/start", collections=["csharp"]
+    )
+
+    record = pipeline.source_catalog[0]
+    assert record.name == "https://example.com/start"
+    assert record.collections == ("csharp",)
+    assert result["collections"] == ["csharp"]
+    assert pipeline.search("Sentence 5", top_k=5, collections=["csharp"])
+
+
+# --- Search scoping ---------------------------------------------------------
+
+
+# Unlike SENTENCE_DOC, so a result can be attributed to the source it came from
+# by its text alone.
+PLAIN_DOC = " ".join(
+    f"Item {index} documents an unrelated administrative procedure in its own wording."
+    for index in range(1, 61)
+)
+
+
+def _scoped_pipeline(settings) -> IndexPipeline:
+    """One source in a collection, one in another, and one in none.
+
+    Deliberately more content outside any single scope than inside it, so a
+    search that padded its result count from outside the scope would show up.
+    """
+    pipeline = _collections_pipeline(settings)
+    contents = {
+        "csharp.txt": "# C#\n\n" + SENTENCE_DOC,
+        "dotnet.txt": "# .NET\n\n" + SENTENCE_DOC.replace("Sentence", "Clause"),
+        "plain.txt": "# Plain\n\n" + PLAIN_DOC,
+    }
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: contents[filename]
+    pipeline.ingest_file(
+        source_id="csharp", file=BytesIO(b"x"), filename="csharp.txt", collections=["csharp"]
+    )
+    pipeline.ingest_file(
+        source_id="dotnet", file=BytesIO(b"x"), filename="dotnet.txt", collections=["dotnet"]
+    )
+    pipeline.ingest_file(source_id="plain", file=BytesIO(b"x"), filename="plain.txt")
+    return pipeline
+
+
+def _chunk_count(pipeline: IndexPipeline, name: str) -> int:
+    return next(record.chunk_count for record in pipeline.source_catalog if record.name == name)
+
+
+def test_a_filtered_search_returns_only_in_scope_chunks(settings):
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50, collections=["csharp"])
+
+    assert results
+    assert {item["source_id"] for item in results} == {"csharp"}
+
+
+def test_several_requested_collections_match_any_of_them(settings):
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50, collections=["csharp", "dotnet"])
+
+    assert {item["source_id"] for item in results} == {"csharp", "dotnet"}
+
+
+def test_the_result_count_applies_within_the_scope(settings):
+    """A requested count is drawn from the scope, not padded from outside it.
+
+    The store prefilters before the similarity scan, so a scope holding fewer
+    chunks than were asked for returns fewer -- rather than spending the rest of
+    the budget on sources the caller excluded.
+    """
+    pipeline = _scoped_pipeline(settings)
+    in_scope = _chunk_count(pipeline, "csharp.txt")
+    out_of_scope = sum(
+        record.chunk_count for record in pipeline.source_catalog if record.name != "csharp.txt"
+    )
+    assert in_scope < 50, "the fixture must hold fewer chunks in scope than will be asked for"
+    assert out_of_scope > in_scope, "the fixture must hold enough outside the scope to pad with"
+
+    results = pipeline.search("content", top_k=50, collections=["csharp"])
+
+    assert len(results) == in_scope
+    assert {item["source_id"] for item in results} == {"csharp"}
+
+
+def test_a_filter_naming_an_unknown_collection_is_an_empty_result(settings):
+    """A mistyped collection returns nothing rather than erroring or widening."""
+    pipeline = _scoped_pipeline(settings)
+
+    assert pipeline.search("content", top_k=5, collections=["cshrap"]) == []
+
+
+def test_an_unfiltered_search_still_reaches_an_untagged_source(settings):
+    """The change is additive: search without a filter behaves as it always has."""
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50)
+
+    assert {item["source_id"] for item in results} == {"csharp", "dotnet", "plain"}
+
+
+# --- Where a hit sits, and what neighbours it ---------------------------------
+
+
+def _placed(pipeline: IndexPipeline, name: str, neighbours: int = 0) -> list[dict]:
+    """Every result a broad search returns for one source, in position order."""
+    results = [
+        item
+        for item in pipeline.search("content", top_k=50, neighbours=neighbours)
+        if item["source_name"] == name
+    ]
+    return sorted(results, key=lambda item: item["position"])
+
+
+def test_a_result_states_where_its_chunk_sits_in_its_source(settings):
+    """The reported position names the chunk the result carries.
+
+    A position that merely numbered the results would be useless for finding
+    what comes next in the document, which is what it is for.
+    """
+    pipeline = _scoped_pipeline(settings)
+
+    results = pipeline.search("content", top_k=50)
+
+    assert results
+    store = pipeline.index.storage_context.docstore.docs
+    for item in results:
+        # A file's source key is its filename, and the position is what the id
+        # was hashed from, so an id rebuilt from the reported position is the id
+        # of the only chunk this result can honestly be describing.
+        holder = store.get(_node_id(item["source_name"], item["position"]))
+        assert holder is not None, "the reported position names no stored chunk"
+        assert holder.get_content() == item["text"], "the reported position names another chunk"
+
+
+def test_a_result_reports_how_many_chunks_neighbour_it(settings):
+    """The counts say how much context exists, whether or not it is returned."""
+    pipeline = _scoped_pipeline(settings)
+    name = "plain.txt"
+    count = _chunk_count(pipeline, name)
+    assert count > 2, "the fixture must hold a middle chunk, not only edges"
+
+    placed = _placed(pipeline, name)
+
+    assert [item["position"] for item in placed] == list(range(count))
+    for item in placed:
+        assert item["neighbours_before"] == item["position"]
+        assert item["neighbours_after"] == count - item["position"] - 1
+
+
+def test_a_sources_edges_report_no_neighbour_beyond_them(settings):
+    """A neighbour count is bounded by its source, not by the corpus.
+
+    The fixture holds three sources, so chunks at one source's end have other
+    sources' chunks available to be counted as its neighbours by mistake.
+    """
+    pipeline = _scoped_pipeline(settings)
+    name = "plain.txt"
+    count = _chunk_count(pipeline, name)
+
+    placed = _placed(pipeline, name)
+    first, last = placed[0], placed[-1]
+
+    assert first["position"] == 0
+    assert first["neighbours_before"] == 0
+    assert first["neighbours_after"] == count - 1
+    assert last["position"] == count - 1
+    assert last["neighbours_before"] == count - 1
+    assert last["neighbours_after"] == 0
+
+
+def test_a_hit_carries_the_chunks_either_side_of_it(settings):
+    """Asking for neighbours returns the passage around a hit, in reading order.
+
+    The neighbours are compared against what the same search reports for those
+    positions, so what comes back is the stored chunk next to the hit rather
+    than merely some other chunk of the document.
+    """
+    pipeline = _scoped_pipeline(settings)
+    name = "plain.txt"
+    count = _chunk_count(pipeline, name)
+    assert count > 2, "the fixture must hold a hit with neighbours on both sides"
+
+    placed = _placed(pipeline, name, neighbours=1)
+    middle = placed[1]
+
+    assert [item["position"] for item in middle["neighbours"]] == [0, 2]
+    assert [item["text"] for item in middle["neighbours"]] == [
+        placed[0]["text"],
+        placed[2]["text"],
+    ]
+
+
+def test_the_requested_count_sets_how_many_neighbours_come_back(settings):
+    """One number per side, and it is the caller's: the hit need not be central."""
+    pipeline = _scoped_pipeline(settings)
+    name = "plain.txt"
+    count = _chunk_count(pipeline, name)
+    assert count > 4, "the fixture must hold a hit with two chunks on each side"
+
+    placed = _placed(pipeline, name, neighbours=2)
+    middle = placed[3]
+
+    assert [item["position"] for item in middle["neighbours"]] == [1, 2, 4, 5]
+    assert [item["text"] for item in middle["neighbours"]] == [
+        placed[1]["text"],
+        placed[2]["text"],
+        placed[4]["text"],
+        placed[5]["text"],
+    ]
+
+
+def test_the_ranked_results_are_the_list_they_were_without_neighbours(settings):
+    """Asking for context does not add results to the ranking or reorder it.
+
+    `top_k` keeps meaning ranked hits: a caller that widens one result's context
+    is not spending slots on unranked chunks.
+    """
+    pipeline = _scoped_pipeline(settings)
+
+    ranked = pipeline.search("content", top_k=5)
+    widened = pipeline.search("content", top_k=5, neighbours=2)
+
+    assert len(widened) == len(ranked)
+    assert [item["position"] for item in widened] == [item["position"] for item in ranked]
+    assert [item["text"] for item in widened] == [item["text"] for item in ranked]
+    assert [item["score"] for item in widened] == [item["score"] for item in ranked]
+
+
+def test_neighbours_stop_at_the_source_boundary(settings):
+    """A request wider than a source can fill returns what exists, and not another source's text.
+
+    The short source sits beside a longer one, so a walk past its end would reach
+    the other source's chunks rather than returning fewer.
+    """
+    pipeline = _collections_pipeline(settings)
+    contents = {"short.txt": PROSE, "long.txt": SENTENCE_DOC}
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: contents[filename]
+    pipeline.ingest_file(source_id="short", file=BytesIO(b"x"), filename="short.txt")
+    pipeline.ingest_file(source_id="long", file=BytesIO(b"x"), filename="long.txt")
+
+    count = _chunk_count(pipeline, "short.txt")
+    widest = 5  # the widest neighbour count a request may ask for
+    assert count > 1, "the fixture must hold a source with more than one chunk"
+    assert count < widest, "the fixture must hold a source too short to fill the request"
+
+    placed = _placed(pipeline, "short.txt", neighbours=widest)
+    first, last = placed[0], placed[-1]
+
+    assert len(placed) == count
+    assert [item["position"] for item in first["neighbours"]] == list(range(1, count))
+    assert [item["position"] for item in last["neighbours"]] == list(range(count - 1))
+    assert len(last["neighbours"]) == count - 1, "fewer neighbours exist than were asked for"
+    own_texts = {item["text"] for item in placed}
+    for item in (first, last):
+        assert {n["text"] for n in item["neighbours"]} <= own_texts, (
+            "a neighbour came from outside the hit's source"
+        )
+
+
+def test_a_neighbouring_chunk_reports_no_score(settings):
+    """A neighbour was not ranked against the query, so it has no relevance to report.
+
+    Inheriting the hit's score would present unranked context as equally relevant
+    to the query that found the hit.
+    """
+    pipeline = _scoped_pipeline(settings)
+
+    placed = _placed(pipeline, name := "plain.txt", neighbours=1)
+    middle = placed[1]
+
+    assert middle["neighbours"], "the fixture returned no neighbour to inspect"
+    for neighbour in middle["neighbours"]:
+        assert set(neighbour) == {"text", "position"}, neighbour
+    assert isinstance(middle["score"], float)
+    assert middle["score"] == _placed(pipeline, name)[1]["score"]
+
+
+def test_a_scoped_search_returns_neighbours_only_from_its_scope(settings):
+    """Adjacency cannot leak past a collection filter, and the first chunk has nothing before it."""
+    pipeline = _scoped_pipeline(settings)
+    name = "csharp.txt"
+    own_texts = {item["text"] for item in _placed(pipeline, name)}
+
+    results = pipeline.search("content", top_k=50, collections=["csharp"], neighbours=5)
+
+    assert results
+    for item in results:
+        assert item["source_name"] == name
+        for neighbour in item["neighbours"]:
+            assert neighbour["text"] in own_texts, "a neighbour came from outside the scope"
+
+    first = min(results, key=lambda item: item["position"])
+    assert first["position"] == 0
+    assert first["neighbours_before"] == 0
+    assert all(neighbour["position"] > 0 for neighbour in first["neighbours"])
+
+
+# --- The catalog's per-source record ----------------------------------------
+
+
+def test_the_source_record_describes_what_was_ingested(settings):
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.converter.convert_url.return_value = (PLAIN_DOC, "https://example.com/final")
+
+    pipeline.ingest_file(
+        source_id="file-source",
+        file=BytesIO(b"x"),
+        filename="report.txt",
+        collections=["csharp", "dotnet"],
+    )
+    pipeline.ingest_url(source_id="url-source", url="https://example.com/start")
+
+    records = {(record.name, record.source_type): record for record in pipeline.source_catalog}
+    filed = records[("report.txt", "file")]
+    untagged = records[("https://example.com/start", "url")]
+
+    assert filed.collections == ("csharp", "dotnet")
+    # A source ingested without collections is described, not omitted, so the
+    # catalog is what makes an untagged source visible.
+    assert untagged.collections == ()
+    # Every stored node belongs to one of the two records, and each counts its own.
+    assert len(_stored_nodes(pipeline)) == pipeline.indexed_chunks
+    assert filed.chunk_count + untagged.chunk_count == pipeline.indexed_chunks
+    assert pipeline.indexed_sources == 2
+
+
+def test_the_source_record_is_replaced_rather_than_duplicated(settings):
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+    first_chunks = _chunk_count(pipeline, "doc.txt")
+
+    pipeline.ingest_file(
+        source_id="second", file=BytesIO(b"x"), filename="doc.txt", collections=["dotnet"]
+    )
+
+    assert pipeline.indexed_sources == 1
+    assert _chunk_count(pipeline, "doc.txt") == first_chunks
+    assert pipeline.indexed_chunks == first_chunks
+
+
+def test_the_catalog_a_reader_holds_cannot_change_underneath_it(settings):
+    """The catalog is published as an immutable snapshot, not a live view.
+
+    A reader iterating the mapping while an ingestion replaced a source would
+    see half a replacement, or fail outright, so each write publishes a tuple
+    that describes the state it produced.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+
+    before = pipeline.source_catalog
+    pipeline.ingest_file(
+        source_id="second", file=BytesIO(b"x"), filename="doc.txt", collections=["dotnet"]
+    )
+
+    assert isinstance(before, tuple)
+    assert before[0].collections == ("csharp",)
+    assert pipeline.source_catalog[0].collections == ("dotnet",)
+
+
+def _recorded_positions(pipeline: IndexPipeline) -> dict[str, int]:
+    """Every node id the pipeline recorded a position for, and that position."""
+    return {
+        node_id: position
+        for positions in pipeline._source_positions.values()
+        for node_id, position in positions.items()
+    }
+
+
+def _ids_in_store(pipeline: IndexPipeline) -> set[str]:
+    return {node.node_id for node in _stored_nodes(pipeline)}
+
+
+def test_the_recorded_order_describes_what_the_source_holds(settings):
+    """A hit's position has to be recorded when the nodes are stored.
+
+    The id is that position hashed, so the position cannot be recovered from a
+    stored node and nothing else holds it. Without this mapping a hit cannot be
+    placed inside its source, so neither its position nor its neighbours can be
+    reported. A re-ingestion replaces a source wholesale, and positions recorded
+    for the content it replaced would place hits in nodes that no longer exist.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = PARAGRAPH_GAP.join([PROSE] * 3)
+    pipeline.ingest_file(source_id="first", file=BytesIO(b"x"), filename="doc.txt")
+
+    wide = _recorded_positions(pipeline)
+    assert wide, "the fixture stored nothing to place"
+    assert set(wide) == _ids_in_store(pipeline), "the recorded ids are not the stored ones"
+    assert sorted(wide.values()) == list(range(len(wide))), "positions do not run from zero"
+
+    # The position has to be the one the id was derived from, not merely some
+    # numbering: the id is what a hit arrives carrying, so a position that does
+    # not hash back to that id would name a different node as the hit.
+    for node in _stored_nodes(pipeline):
+        assert _node_id("doc.txt", wide[node.node_id]) == node.node_id, (
+            "a recorded position does not hash back to the id it is recorded against"
+        )
+
+    pipeline.converter.convert_file.return_value = "Ngắn."
+    pipeline.ingest_file(source_id="second", file=BytesIO(b"x"), filename="doc.txt")
+
+    narrow = _recorded_positions(pipeline)
+    assert len(narrow) < len(wide), "the fixture did not shrink the source it re-ingested"
+    assert set(narrow) == _ids_in_store(pipeline), (
+        "positions recorded for the replaced content survived the replacement"
+    )
+
+
+def test_recording_a_position_does_not_reach_the_stored_node(settings):
+    """The order is bookkeeping beside the store, not part of what is embedded.
+
+    Metadata that is not listed as excluded is embedded with the node's text, so
+    a position recorded on the node would enter every stored vector and move
+    retrieval. This asserts the node itself is untouched.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = PARAGRAPH_GAP.join([PROSE] * 3)
+    pipeline.ingest_file(
+        source_id="first", file=BytesIO(b"x"), filename="doc.txt", collections=["csharp"]
+    )
+
+    keys = {key for node in _stored_nodes(pipeline) for key in node.metadata}
+    assert keys == {
+        "source_id",
+        "source_type",
+        "source_name",
+        "mime_type",
+        "collections",
+    }, keys
+    assert _recorded_positions(pipeline), "the fixture recorded no positions to test against"

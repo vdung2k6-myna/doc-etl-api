@@ -16,6 +16,14 @@ scoring, which is an inference. Every step returns HTML, so Docling remains the
 only producer of markdown and a URL source keeps the output shape of a file
 source. The final fallback means extraction can only replace chrome with
 content, never replace content with nothing.
+
+Whichever of the three produces the selection, the page's declared title is then
+added to it as a heading if the selection carries no heading of its own. The
+density pass drops headings wholesale on the pages its own recovery pass handles
+-- measured, the 26 section headings inside an article's content container are
+all absent from the selection -- so without this a source whose content yields no
+heading is stored, chunked and embedded with nothing in it that names the
+document.
 """
 
 from __future__ import annotations
@@ -26,6 +34,13 @@ import trafilatura
 from bs4 import BeautifulSoup
 
 LANDMARK_SELECTORS = ("main", "article", '[role="main"]')
+
+# The document's declared title, and the heading elements that make it
+# redundant. An ``<svg>`` declares a ``<title>`` of its own for accessibility,
+# so a page inlining icons declares several and only the first non-SVG one names
+# the document.
+TITLE_TAG = "title"
+HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 
 # Chrome removed before density scoring. trafilatura removes these itself on
 # pages its main extractor succeeds on, but falls back to an uncleaned pass when
@@ -51,10 +66,12 @@ def select_main_content(html: str | bytes, url: str | None = None) -> str:
     ``url`` is the page's final URL, which trafilatura uses to resolve relative
     link, image and table targets. Returns the page unchanged when no main
     content can be identified, so an unidentifiable page is converted exactly as
-    it is today.
+    it is today. The page's declared title is added to the result as a heading
+    where the selection carries none of its own -- see ``_with_title``.
     """
     page = _as_text(html)
     selected = _select_landmark(page) or _select_by_density(page, url) or page
+    selected = _with_title(selected, _page_title(page))
     return _resolve_targets(selected, url) if url else selected
 
 
@@ -106,6 +123,54 @@ def _select_by_density(html: str, url: str | None) -> str | None:
     if selected and selected.strip():
         return selected
     return None
+
+
+def _page_title(html: str) -> str | None:
+    """Return the title the page declares for itself, or None if it declares none.
+
+    Read from ``<title>`` and never from the page's first heading element, which
+    may name the site rather than the document: measured on the MediaWiki corpus,
+    the page ``<h1>`` is "Truyện kiếm hiệp", the wiki's own name, on an article
+    whose ``<title>`` is "Wiki:Ý Thiên Đồ Long ký". A title that is empty or only
+    whitespace counts as absent, so a page declaring one yields no heading
+    rather than a blank one. An ``<svg>``'s own ``<title>`` is skipped: it labels
+    an icon, not the document.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for element in soup.find_all(TITLE_TAG):
+        if element.find_parent("svg") is not None:
+            continue
+        return element.get_text(strip=True) or None
+    return None
+
+
+def _with_title(selected: str, title: str | None) -> str:
+    """Prepend ``title`` to ``selected`` as a heading, unless it already has one.
+
+    A selection that carries a heading is left untouched: the heading is the
+    document's own, and adding a second would name the document twice in the
+    converted markdown. The title goes into the HTML as an element rather than
+    onto finished markdown, so Docling stays the only producer of markdown, and
+    it arrives as content -- embedded and searchable like any other text, and
+    charged nothing against the chunk-size budget, unlike node metadata.
+    """
+    if not title or _has_heading(selected):
+        return selected
+    soup = BeautifulSoup(selected, "html.parser")
+    heading = soup.new_tag("h1")
+    heading.string = title
+    # A fragment has no ``<body>``, and a heading placed outside ``<html>`` is
+    # dropped by Docling's HTML backend. Measured: it converts the serialization
+    # ``<h1>Title</h1><html>...`` to markdown without the heading at all, which
+    # is why this inserts into the body rather than at the head of the document.
+    target = soup.body if soup.body is not None else soup
+    target.insert(0, heading)
+    return str(soup)
+
+
+def _has_heading(html: str) -> bool:
+    """Whether ``html`` already carries a heading element of its own."""
+    return BeautifulSoup(html, "html.parser").find(HEADING_TAGS) is not None
 
 
 def _resolve_targets(html: str, base: str) -> str:

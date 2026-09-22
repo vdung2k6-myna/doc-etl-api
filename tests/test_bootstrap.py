@@ -67,7 +67,7 @@ def test_bootstrap_isolates_a_failing_source(corpus_dir, caplog):
     pipeline = MagicMock()
     pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
 
-    def ingest_file(source_id, file, filename, mime_type=None):
+    def ingest_file(source_id, file, filename, mime_type=None, collections=()):
         if filename == "beta.txt":
             raise RuntimeError("unreadable")
         return {}, {}
@@ -212,3 +212,102 @@ def test_corpus_file_and_a_later_upload_share_one_source(corpus_dir):
     assert any("edited content" in text for text in stored)
     assert not any("corpus content" in text for text in stored)
     assert any("corpus content of beta.txt" in text for text in _stored_texts(pipeline, "beta.txt"))
+
+
+# --- Corpus tagging ----------------------------------------------------------
+
+
+def _corpus_settings(corpus_dir, collections: str, urls: str = "") -> Settings:
+    return Settings(
+        vector_store_backend="simple",
+        embedding_model=EMBEDDING_MODEL_NAME,
+        chunk_size=128,
+        chunk_overlap=10,
+        knowledge_corpus_dir=str(corpus_dir),
+        knowledge_corpus_urls=urls,
+        knowledge_corpus_collections=collections,
+    )
+
+
+def _corpus_pipeline(settings: Settings) -> IndexPipeline:
+    """A real pipeline over a stubbed converter, so ingestion runs for real."""
+    return IndexPipeline(
+        settings,
+        converter=MagicMock(),
+        embedding_model=StubEmbedding(embed_dim=8),
+    )
+
+
+def test_corpus_collections_tag_every_file_and_url(corpus_dir):
+    """The corpus is tagged through the ordinary ingestion path, as uploads are.
+
+    Applied in `ingest_corpus` rather than by a corpus-only code path, so what a
+    corpus source is tagged with is exactly what an upload naming the same
+    collection would be tagged with.
+    """
+    settings = _corpus_settings(
+        corpus_dir, collections="csharp, dotnet", urls="https://example.com/page"
+    )
+    pipeline = _corpus_pipeline(settings)
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    pipeline.converter.convert_file.side_effect = lambda _file, name: f"Corpus file {name}."
+    pipeline.converter.convert_url.return_value = ("Corpus page body.", "https://example.com/page")
+    state = BootstrapState()
+
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert state.failures == []
+    # Both kinds of corpus source reached the index, and both are tagged.
+    assert {record.source_type for record in pipeline.source_catalog} == {"file", "url"}
+    assert {record.collections for record in pipeline.source_catalog} == {("csharp", "dotnet")}
+    # Tagged in the stored metadata too, which is what a filter reads.
+    for node in pipeline.index.storage_context.docstore.docs.values():
+        assert node.metadata["collections"] == ["csharp", "dotnet"]
+
+
+@pytest.mark.parametrize("collections", ["", "   ", ","])
+def test_an_unset_corpus_collection_leaves_the_corpus_untagged(corpus_dir, collections):
+    """No configured collection is not a failure: the corpus loads untagged."""
+    settings = _corpus_settings(corpus_dir, collections=collections)
+    pipeline = _corpus_pipeline(settings)
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    pipeline.converter.convert_file.side_effect = lambda _file, name: f"Corpus file {name}."
+    state = BootstrapState()
+
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert state.failures == []
+    assert pipeline.indexed_sources == 2
+    assert {record.collections for record in pipeline.source_catalog} == {()}
+
+
+def test_corpus_content_is_reachable_by_a_filtered_search(corpus_dir):
+    """Without the setting the corpus is the one thing no filter can see.
+
+    The corpus is the content that exists to ground answers, so a filtered search
+    that cannot reach it is answering a scoped question from everything except the
+    material kept on hand for it. The contrast below is the point: the identical
+    search reaches the corpus only when the corpus was tagged.
+    """
+    text = "Every corpus file records its own subject in its own wording."
+    tagged_settings = _corpus_settings(corpus_dir, collections="csharp")
+    tagged = _corpus_pipeline(tagged_settings)
+    tagged.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    tagged.converter.convert_file.side_effect = lambda _file, _name: text
+
+    untagged_settings = _corpus_settings(corpus_dir, collections="")
+    untagged = _corpus_pipeline(untagged_settings)
+    untagged.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    untagged.converter.convert_file.side_effect = lambda _file, _name: text
+
+    for pipeline, settings in ((tagged, tagged_settings), (untagged, untagged_settings)):
+        ingest_corpus(pipeline, settings, BootstrapState())
+        assert pipeline.indexed_sources == 2, "the corpus did not load"
+
+    results = tagged.search("subject", top_k=5, collections=["csharp"])
+    assert results
+    assert {result["source_name"] for result in results} == {"alpha.txt", "beta.txt"}
+    # The same search over the same content, differing only in the setting.
+    assert untagged.search("subject", top_k=5, collections=["csharp"]) == []

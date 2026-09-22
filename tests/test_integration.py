@@ -21,6 +21,18 @@ def _stub_converter(convert=None):
     converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
     if convert is not None:
         converter.convert_file.side_effect = convert
+
+    # A bare MagicMock iterates to nothing, so an unstubbed `convert_url` would
+    # surface as "not enough values to unpack (expected 2, got 0)" when
+    # `ingest_url` unpacks its result -- a mock artifact that reads like a
+    # parsing bug and hides its own cause. Fail with the reason instead.
+    def unexpected_url(url, **kwargs):
+        raise AssertionError(
+            f"convert_url({url!r}) was called, but this test does not stub URL "
+            "ingestion -- a corpus URL probably reached the settings"
+        )
+
+    converter.convert_url.side_effect = unexpected_url
     return converter
 
 
@@ -84,7 +96,18 @@ def test_search_while_indexing_is_well_formed_and_excludes_the_new_source():
     assert results, "the already-indexed source should still be searchable"
     assert "incoming" not in {r["source_id"] for r in results}
     for result in results:
-        assert set(result) == {"text", "score", "source_id", "source_type", "source_name"}
+        assert set(result) == {
+            "text",
+            "score",
+            "source_id",
+            "source_type",
+            "source_name",
+            "position",
+            "neighbours_before",
+            "neighbours_after",
+            "neighbours",
+        }
+        assert result["neighbours"] == [], "the request asked for no neighbours"
 
     gate.set()
     ingesting.join(timeout=10)
@@ -223,3 +246,48 @@ def test_a_host_that_refuses_unidentified_clients_is_ingested_anyway(monkeypatch
     assert job["status"] == "completed", f"the ingestion did not survive the fetch: {job}"
     assert sent_agents == [DEFAULT_USER_AGENT], "the request did not identify itself"
     assert client.get("/health").json()["indexed_sources"] == 1
+
+
+def test_collections_scope_the_whole_path_from_upload_to_search():
+    """The whole path, through the routes: two uploads land in different
+    collections, the catalog reports both, and a filtered search returns only the
+    source in the collection that was asked for.
+
+    Run end to end because the parts are only useful joined: a collection that a
+    filter cannot act on, or that the catalog does not report, would leave a
+    caller with no way to find what the filter is meant to select.
+    """
+    contents = {
+        "guide.txt": "# Guide\n\nThe STAR method structures behavioural answers.",
+        "notes.txt": "# Notes\n\nThe XYZZY convention records unrelated remarks.",
+    }
+    converter = _stub_converter(lambda file, filename: contents[filename])
+    client = TestClient(_build_app(converter))
+
+    for name, collection in (("guide.txt", "interviews"), ("notes.txt", "conventions")):
+        response = client.post(
+            "/sources/files",
+            files={"files": (name, BytesIO(b"x"), "text/plain")},
+            data={"collections": [collection]},
+        )
+        assert response.status_code == 202, response.text
+
+    catalog = client.get("/sources").json()["sources"]
+    assert {source["name"]: source["collections"] for source in catalog} == {
+        "guide.txt": ["interviews"],
+        "notes.txt": ["conventions"],
+    }
+    assert all(source["chunk_count"] >= 1 for source in catalog)
+
+    scoped = client.post(
+        "/search", json={"query": "method", "top_k": 10, "collections": ["interviews"]}
+    )
+    assert scoped.status_code == 200
+    results = scoped.json()["results"]
+    assert results
+    assert {result["source_name"] for result in results} == {"guide.txt"}
+
+    # The other source is still reachable without a filter, so the scope narrowed
+    # one search rather than the index.
+    unscoped = client.post("/search", json={"query": "method", "top_k": 10}).json()["results"]
+    assert {result["source_name"] for result in unscoped} == {"guide.txt", "notes.txt"}
