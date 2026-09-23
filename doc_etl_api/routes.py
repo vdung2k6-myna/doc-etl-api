@@ -12,6 +12,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
@@ -27,11 +28,13 @@ from doc_etl_api.schemas import (
     IngestFileResponse,
     IngestUrlResponse,
     JobStatusResponse,
+    NeighbourChunk,
     SearchRequest,
     SearchResponse,
     SearchResult,
     SourceCatalogEntry,
     SourceCatalogResponse,
+    SourceContentResponse,
     UrlIngestRequest,
 )
 
@@ -359,18 +362,53 @@ async def search(
 
 
 @router.get(
+    "/sources/content",
+    response_model=SourceContentResponse,
+    summary="Get a source's stored content",
+    description="Return every chunk the index stores for one source, in reading order, "
+    "addressed by the `address` the source catalog reports. The chunks are what was "
+    "chunked and indexed, which is not a copy of the document that was submitted. The "
+    "read performs no retrieval and no embedding: it returns what the index already "
+    "holds. An address no indexed source has is reported as not found.",
+)
+async def get_source_content(
+    pipeline: PipelineDep,
+    address: Annotated[str, Query(description="The source's address, as the catalog reports it")],
+) -> SourceContentResponse:
+    # The read takes the index lock, which is a threading.Lock, so it must not run
+    # on the event loop: doing so would stall every other route for as long as a
+    # concurrent ingestion holds the lock.
+    content = await run_in_threadpool(pipeline.source_content, address)
+    if content is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Source {address!r} not found.",
+        )
+    record, chunks = content
+    return SourceContentResponse(
+        name=record.name,
+        source_type=record.source_type,
+        collections=list(record.collections),
+        chunk_count=record.chunk_count,
+        chunks=[NeighbourChunk(**chunk) for chunk in chunks],
+    )
+
+
+@router.get(
     "/sources",
     response_model=SourceCatalogResponse,
     summary="List indexed sources",
-    description="Report every source currently in the index with its name, type, collections, "
-    "and chunk count. Served from state maintained as sources are ingested, so it "
-    "performs no retrieval and no embedding.",
+    description="Report every source currently in the index with its name, address, type, "
+    "collections, and chunk count. The address is what the source's content is fetched by; "
+    "for a URL that redirected it is the final URL, which differs from the name. Served from "
+    "state maintained as sources are ingested, so it performs no retrieval and no embedding.",
 )
 async def list_sources(pipeline: PipelineDep) -> SourceCatalogResponse:
     return SourceCatalogResponse(
         sources=[
             SourceCatalogEntry(
                 name=record.name,
+                address=record.address,
                 source_type=record.source_type,
                 collections=list(record.collections),
                 chunk_count=record.chunk_count,

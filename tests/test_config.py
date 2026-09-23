@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from pydantic_settings import SettingsError
 
 from doc_etl_api.config import (
     MAX_COLLECTIONS_PER_REQUEST,
@@ -217,3 +219,163 @@ def test_a_malformed_corpus_collection_stops_the_settings_being_built():
             Settings()
 
     assert "C# 12" in str(exc_info.value)
+
+
+# --- OCR languages ----------------------------------------------------------
+
+
+def test_ocr_language_defaults_to_vietnamese():
+    """Unconfigured must still read the service's own content correctly.
+
+    A default of "none configured" would leave the defect this setting exists to
+    fix in place until an operator opted in, so the default names the language
+    the content is written in.
+    """
+    assert Settings().pdf_ocr_language_list == ["vi"]
+
+
+def test_ocr_languages_from_env():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PDF_OCR_LANGUAGES", "vi, en ,")
+        s = Settings()
+
+    assert s.pdf_ocr_language_list == ["vi", "en"]
+
+
+@pytest.mark.parametrize("blank", ["", "   ", ",", " , "])
+def test_an_ocr_language_setting_naming_no_language_is_rejected(blank):
+    """An empty language list does not mean "no OCR".
+
+    It means the OCR engine's own default, which is a set of European languages
+    -- so accepting it would reproduce the defect while looking deliberate.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PDF_OCR_LANGUAGES", blank)
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+    message = str(exc_info.value)
+    assert "names no language" in message
+    if blank.strip():
+        assert repr(blank) in message
+
+
+def test_a_malformed_ocr_language_stops_the_settings_being_built():
+    """A typo must fail at startup, not the first document that needs OCR."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PDF_OCR_LANGUAGES", "vi, vie tnam")
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+    assert "vie tnam" in str(exc_info.value)
+
+
+# --- Corpus file collections ------------------------------------------------
+
+
+def test_corpus_file_collections_are_unset_by_default():
+    assert Settings().knowledge_corpus_file_collections == {}
+
+
+def test_corpus_file_collections_from_env():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(
+            "KNOWLEDGE_CORPUS_FILE_COLLECTIONS",
+            json.dumps({"101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt": ["truyen-cuoi"]}),
+        )
+        s = Settings()
+
+    assert s.knowledge_corpus_file_collections == {
+        "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt": ["truyen-cuoi"]
+    }
+
+
+def test_corpus_file_collections_are_normalized_like_an_uploads():
+    """The tag stored for a corpus file is the tag a filter reads.
+
+    Padded and repeated names are normalized here exactly as an upload's are, so
+    a corpus file and an upload naming the same collection meet as one
+    collection rather than as two spellings of it.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(
+            "KNOWLEDGE_CORPUS_FILE_COLLECTIONS",
+            json.dumps({"alpha.txt": [" csharp ", "csharp", "dotnet"]}),
+        )
+        s = Settings()
+
+    assert s.knowledge_corpus_file_collections == {"alpha.txt": ["csharp", "dotnet"]}
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "sub/alpha.txt",  # a path, on any platform
+        "sub\\alpha.txt",  # a path, on Windows
+        "https://example.com/page",  # a URL is not a corpus file
+    ],
+)
+def test_a_corpus_file_entry_naming_a_path_is_rejected(filename):
+    """A path can never match, so it fails where the setting is read.
+
+    The corpus directory is scanned without recursing and an entry matches a
+    file by its filename alone. Refusing it here names the setting; letting it
+    through would tag nothing and report only that a file was missing.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KNOWLEDGE_CORPUS_FILE_COLLECTIONS", json.dumps({filename: ["csharp"]}))
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+    assert repr(filename) in str(exc_info.value)
+
+
+def test_a_corpus_file_entry_naming_no_collection_is_rejected():
+    """Tagging nothing is the one thing an entry cannot be for.
+
+    Every filtered search is scoped by collection, so a source in no collection
+    cannot be reached by one. An entry naming no collection is therefore read as
+    a mistake rather than as a way to say "no collections" -- that is written by
+    configuring no entry for the file and no corpus collections.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KNOWLEDGE_CORPUS_FILE_COLLECTIONS", json.dumps({"alpha.txt": []}))
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+    assert "alpha.txt" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("filename", ["", "   "])
+def test_a_corpus_file_entry_needs_a_filename(filename):
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KNOWLEDGE_CORPUS_FILE_COLLECTIONS", json.dumps({filename: ["csharp"]}))
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+    assert "filename is empty" in str(exc_info.value)
+
+
+def test_a_malformed_collection_in_a_corpus_file_entry_stops_the_settings_being_built():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KNOWLEDGE_CORPUS_FILE_COLLECTIONS", json.dumps({"alpha.txt": ["C# 12"]}))
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+    # The entry is named as well as the collection, so the message points at the
+    # part of the configuration to change.
+    assert "alpha.txt" in str(exc_info.value)
+    assert "C# 12" in str(exc_info.value)
+
+
+def test_an_unparseable_corpus_file_collections_value_stops_the_settings_being_built():
+    """The value is read as JSON, and JSON that does not parse is refused here.
+
+    Refused as the settings are built rather than at the bootstrap, where it
+    would instead fail every corpus source one at a time and leave the index
+    empty -- the same reasoning as the collection validator above.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KNOWLEDGE_CORPUS_FILE_COLLECTIONS", "{csharp")
+        with pytest.raises(SettingsError):
+            Settings()

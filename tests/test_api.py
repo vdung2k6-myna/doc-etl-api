@@ -422,6 +422,35 @@ def test_the_neighbour_count_is_bounded(client):
         assert response.status_code == 422, count
 
 
+def test_a_search_result_declares_source_name_exactly_once():
+    """The model declared the field twice, a stray from an earlier edit.
+
+    Python keeps the last binding, so the earlier description was dead text no
+    caller could ever read; the surviving one is the only declaration.
+    """
+    fields = SearchResult.model_fields
+
+    assert list(fields).count("source_name") == 1
+    assert {"address", "collections"} <= set(fields)
+
+
+def test_the_routing_fields_default_rather_than_being_required():
+    """A hit from a path that does not record them is reported, not rejected."""
+    result = SearchResult(
+        text="t",
+        score=0.5,
+        source_id="s",
+        source_type="file",
+        source_name="n",
+        position=0,
+        neighbours_before=0,
+        neighbours_after=0,
+    )
+
+    assert result.address == ""
+    assert result.collections == []
+
+
 def test_the_search_documentation_names_every_field_the_route_serves():
     """The documented surface is the served one.
 
@@ -814,6 +843,7 @@ def test_the_catalog_reports_an_ingested_source(client):
     client.app.state.pipeline.source_catalog = _catalog(
         SourceRecord(
             name="report.pdf",
+            address="report.pdf",
             source_type="file",
             collections=("csharp", "dotnet"),
             chunk_count=12,
@@ -827,6 +857,7 @@ def test_the_catalog_reports_an_ingested_source(client):
         "sources": [
             {
                 "name": "report.pdf",
+                "address": "report.pdf",
                 "source_type": "file",
                 "collections": ["csharp", "dotnet"],
                 "chunk_count": 12,
@@ -837,9 +868,19 @@ def test_the_catalog_reports_an_ingested_source(client):
 
 def test_the_catalog_lists_every_source(client):
     client.app.state.pipeline.source_catalog = _catalog(
-        SourceRecord(name="report.pdf", source_type="file", collections=(), chunk_count=3),
         SourceRecord(
-            name="https://example.com", source_type="url", collections=("csharp",), chunk_count=7
+            name="report.pdf",
+            address="report.pdf",
+            source_type="file",
+            collections=(),
+            chunk_count=3,
+        ),
+        SourceRecord(
+            name="https://example.com/",
+            address="https://example.com/home",
+            source_type="url",
+            collections=("csharp",),
+            chunk_count=7,
         ),
     )
 
@@ -849,7 +890,7 @@ def test_the_catalog_lists_every_source(client):
     body = response.json()
     assert [source["name"] for source in body["sources"]] == [
         "report.pdf",
-        "https://example.com",
+        "https://example.com/",
     ]
     assert [source["source_type"] for source in body["sources"]] == ["file", "url"]
 
@@ -870,7 +911,13 @@ def test_an_untagged_source_appears_with_an_empty_collection_list(client):
     collection" is only answerable by listing them and reading the empty lists.
     """
     client.app.state.pipeline.source_catalog = _catalog(
-        SourceRecord(name="plain.pdf", source_type="file", collections=(), chunk_count=4)
+        SourceRecord(
+            name="plain.pdf",
+            address="plain.pdf",
+            source_type="file",
+            collections=(),
+            chunk_count=4,
+        )
     )
 
     response = client.get("/sources")
@@ -882,7 +929,13 @@ def test_an_untagged_source_appears_with_an_empty_collection_list(client):
 def test_the_catalog_performs_no_retrieval_or_embedding(client):
     pipeline = client.app.state.pipeline
     pipeline.source_catalog = _catalog(
-        SourceRecord(name="report.pdf", source_type="file", collections=("csharp",), chunk_count=2)
+        SourceRecord(
+            name="report.pdf",
+            address="report.pdf",
+            source_type="file",
+            collections=("csharp",),
+            chunk_count=2,
+        )
     )
     # Any attempt to reach the index or the embedding model must explode, so a
     # passing test proves the catalog did neither.
@@ -896,3 +949,151 @@ def test_the_catalog_performs_no_retrieval_or_embedding(client):
     assert response.status_code == 200
     assert len(response.json()["sources"]) == 1
     pipeline.search.assert_not_called()
+
+
+# --- Reading a source's content ----------------------------------------------
+
+
+def _catalog_record(**overrides) -> SourceRecord:
+    fields = {
+        "name": "report.pdf",
+        "address": "report.pdf",
+        "source_type": "file",
+        "collections": ("csharp",),
+        "chunk_count": 2,
+    }
+    fields.update(overrides)
+    return SourceRecord(**fields)
+
+
+def test_a_sources_content_is_returned_with_its_positions(client):
+    client.app.state.pipeline.source_content.return_value = (
+        _catalog_record(),
+        [{"text": "first chunk", "position": 0}, {"text": "second chunk", "position": 1}],
+    )
+
+    response = client.get("/sources/content", params={"address": "report.pdf"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "report.pdf"
+    assert body["source_type"] == "file"
+    assert body["collections"] == ["csharp"]
+    assert [chunk["position"] for chunk in body["chunks"]] == [0, 1]
+    assert [chunk["text"] for chunk in body["chunks"]] == ["first chunk", "second chunk"]
+    assert len(body["chunks"]) == body["chunk_count"], "the count does not describe the chunks"
+    client.app.state.pipeline.source_content.assert_called_once_with("report.pdf")
+
+
+def test_an_unknown_address_is_not_found_and_names_what_was_asked_for(client):
+    client.app.state.pipeline.source_content.return_value = None
+
+    response = client.get("/sources/content", params={"address": "missing.pdf"})
+
+    assert response.status_code == 404
+    assert repr("missing.pdf") in response.json()["detail"]
+
+
+def test_a_source_holding_no_chunks_is_returned_empty_rather_than_missing(client):
+    """A source that stored nothing is a source, not an unknown address."""
+    client.app.state.pipeline.source_content.return_value = (
+        _catalog_record(name="empty.txt", address="empty.txt", collections=(), chunk_count=0),
+        [],
+    )
+
+    response = client.get("/sources/content", params={"address": "empty.txt"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "empty.txt"
+    assert body["chunks"] == []
+
+
+async def test_the_content_read_runs_off_the_event_loop(client):
+    """The read takes the index lock a concurrent ingestion may be holding."""
+    app = client.app
+    read_threads: list[int] = []
+
+    def record_read(address):
+        read_threads.append(threading.get_ident())
+        return (_catalog_record(address=address), [{"text": "chunk", "position": 0}])
+
+    app.state.pipeline.source_content.side_effect = record_read
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        response = await http.get("/sources/content", params={"address": "report.pdf"})
+
+    assert response.status_code == 200
+    assert read_threads, "the content endpoint never reached the pipeline"
+    assert read_threads[0] != threading.get_ident(), "the content read ran on the event loop"
+
+
+# --- Routing metadata on a search response -----------------------------------
+
+
+def _hit(**overrides) -> dict:
+    fields = {
+        "text": "chunk one",
+        "score": 0.9,
+        "source_id": "s1",
+        "source_type": "file",
+        "source_name": "report.pdf",
+        "address": "report.pdf",
+        "collections": ["handbook"],
+        "position": 0,
+        "neighbours_before": 0,
+        "neighbours_after": 4,
+    }
+    fields.update(overrides)
+    return fields
+
+
+def test_a_search_response_carries_the_address_and_collections_of_each_hit(client):
+    """The two fields survive the boundary, per hit rather than per response."""
+    client.app.state.pipeline.search.return_value = [
+        _hit(),
+        _hit(
+            text="chunk two",
+            source_id="s2",
+            source_type="url",
+            source_name="https://example.com/archive",
+            address="https://example.com/archive/index.html",
+            collections=[],
+            position=3,
+        ),
+    ]
+
+    response = client.post("/search", json={"query": "hello", "top_k": 2})
+
+    assert response.status_code == 200
+    first, second = response.json()["results"]
+    assert first["address"] == "report.pdf"
+    assert first["collections"] == ["handbook"]
+    assert second["source_name"] == "https://example.com/archive"
+    assert second["address"] == "https://example.com/archive/index.html"
+    assert second["address"] != second["source_name"]
+    assert second["collections"] == [], "an untagged source omits nothing and reports empty"
+
+
+def test_a_hit_from_a_pipeline_that_reports_no_routing_fields_still_answers(client):
+    """The fields default, so an older result shape is served rather than 500."""
+    client.app.state.pipeline.search.return_value = [
+        {
+            "text": "chunk one",
+            "score": 0.9,
+            "source_id": "s1",
+            "source_type": "file",
+            "source_name": "report.pdf",
+            "position": 0,
+            "neighbours_before": 0,
+            "neighbours_after": 4,
+        }
+    ]
+
+    response = client.post("/search", json={"query": "hello", "top_k": 1})
+
+    assert response.status_code == 200
+    (result,) = response.json()["results"]
+    assert result["address"] == ""
+    assert result["collections"] == []

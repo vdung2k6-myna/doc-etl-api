@@ -72,6 +72,15 @@ def validate_collections(values: Sequence[str]) -> list[str]:
 # an identity that such hosts accept.
 DEFAULT_USER_AGENT = "doc-etl-api/0.1.0"
 
+# Vietnamese. Left unconfigured the OCR engine would pick its own default, a set
+# of European languages, which reads Vietnamese with a recogniser that does not
+# know its diacritics.
+DEFAULT_PDF_OCR_LANGUAGES = "vi"
+# The shape of an OCR language code: `vi`, `en`, `ch_sim`. Deliberately loose,
+# because the codes are the OCR engine's and they change when it gains a
+# language; this rejects a mistyped setting without claiming to know the list.
+OCR_LANGUAGE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
 
 class VectorStoreBackend(str, Enum):
     SIMPLE = "simple"
@@ -113,6 +122,11 @@ class Settings(BaseSettings):
     max_file_size_mb: int = Field(default=50)
     url_fetch_timeout_seconds: int = Field(default=30)
     user_agent: str = Field(default=DEFAULT_USER_AGENT)
+    # The languages a scanned document is read in. Comma-separated, like the
+    # corpus settings below. Vietnamese by default, because the service's content
+    # is Vietnamese and a recogniser that does not know the language's diacritics
+    # drops them -- and in Vietnamese the diacritics are the word, not decoration.
+    pdf_ocr_languages: str = Field(default=DEFAULT_PDF_OCR_LANGUAGES)
 
     knowledge_corpus_dir: str = Field(default="")
     knowledge_corpus_urls: str = Field(default="")
@@ -120,6 +134,12 @@ class Settings(BaseSettings):
     # -- the content that exists specifically to ground answers -- would be the
     # one set of sources invisible to every filtered search.
     knowledge_corpus_collections: str = Field(default="")
+    # Per-file corpus collections, keyed by filename, for a corpus directory that
+    # holds documents belonging to different collections. An entry replaces the
+    # setting above for the file it names; every other file keeps it. Read as
+    # JSON, so a filename needs no escaping and cannot be mistaken for part of
+    # the value beside it.
+    knowledge_corpus_file_collections: dict[str, list[str]] = Field(default_factory=dict)
 
     log_level: str = Field(default="INFO")
 
@@ -132,6 +152,16 @@ class Settings(BaseSettings):
     def knowledge_corpus_url_list(self) -> list[str]:
         """The configured corpus URLs, parsed from the comma-separated setting."""
         return [url.strip() for url in self.knowledge_corpus_urls.split(",") if url.strip()]
+
+    @property
+    def pdf_ocr_language_list(self) -> list[str]:
+        """The configured OCR languages, parsed from the comma-separated setting.
+
+        Already validated and non-empty when these settings were built, so this
+        only splits: the order is the operator's, and a language named twice is
+        passed through as the operator wrote it.
+        """
+        return [name.strip() for name in self.pdf_ocr_languages.split(",") if name.strip()]
 
     @property
     def knowledge_corpus_collection_list(self) -> list[str]:
@@ -174,6 +204,39 @@ class Settings(BaseSettings):
                 f"Unsupported vector store backend: {value!r}. Supported backends: {supported}"
             ) from exc
 
+    @field_validator("pdf_ocr_languages")
+    @classmethod
+    def _validate_pdf_ocr_languages(cls, value: str) -> str:
+        """Reject an OCR language setting that names no usable language.
+
+        Checked here rather than where the recogniser is built, for the same
+        reason as the corpus settings above: a typo should stop the service from
+        starting, not fail the first document that needs OCR -- by which time the
+        job has already been accepted and the operator is looking at a job log
+        rather than at their configuration.
+
+        A setting naming no language is refused rather than read as "recognise
+        nothing". An empty language list does not mean no OCR: it means the
+        engine's own default, a set of European languages, so a deployment that
+        configured nothing would still OCR, in the wrong language, with nothing
+        in the configuration to show it.
+        """
+        names = [name.strip() for name in value.split(",") if name.strip()]
+        if not names:
+            raise ValueError(
+                f"Invalid OCR language setting: {value!r} names no language. Scanned "
+                "documents are read in the configured languages; to read them with the "
+                "engine's own default, name that default's languages here rather than "
+                f"leaving the setting empty. For example: {DEFAULT_PDF_OCR_LANGUAGES!r}."
+            )
+        for name in names:
+            if not OCR_LANGUAGE_PATTERN.match(name):
+                raise ValueError(
+                    f"Invalid OCR language: {name!r}. A language is named by its code, "
+                    "for example 'vi' for Vietnamese or 'en' for English."
+                )
+        return value
+
     @field_validator("knowledge_corpus_collections")
     @classmethod
     def _validate_corpus_collections(cls, value: str) -> str:
@@ -189,6 +252,55 @@ class Settings(BaseSettings):
             if name.strip():
                 validate_collection_name(name)
         return value
+
+    @field_validator("knowledge_corpus_file_collections")
+    @classmethod
+    def _validate_corpus_file_collections(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Reject a malformed per-file corpus entry as the settings are built.
+
+        Checked here for the same reason as the corpus collections above: a typo
+        should stop the service from starting, not tag a corpus source with
+        something no filter will ever ask for.
+
+        Two shapes are refused because neither can do what it says. A key naming
+        a path can never match, since the corpus directory is scanned without
+        recursing and an entry matches a file by its filename alone. An entry
+        naming no collection would store a source that every filtered search is
+        blind to, which is the opposite of what an entry is for -- so it is read
+        as a mistake rather than as a request to tag nothing, and to tag nothing
+        an operator writes no entry and configures no corpus collections.
+
+        The keys are kept verbatim: a filename is a literal, not a value with
+        padding to forgive. The collections are normalized exactly as an
+        upload's are, so the tag stored here is the tag a filter reads.
+        """
+        normalized: dict[str, list[str]] = {}
+        for filename, collections in value.items():
+            if not filename.strip():
+                raise ValueError(
+                    "Invalid corpus file collection entry: the filename is empty. An "
+                    "entry names a file in the corpus directory."
+                )
+            if Path(filename).name != filename:
+                raise ValueError(
+                    f"Invalid corpus file collection entry: {filename!r} names a path. "
+                    "The corpus directory is scanned without recursing, so an entry "
+                    "matches a file by its filename alone and a path can never match."
+                )
+            if not collections:
+                raise ValueError(
+                    f"Invalid corpus file collection entry: {filename!r} names no "
+                    "collection. A corpus source in no collection is invisible to every "
+                    "filtered search; to tag it with nothing, configure no entry for it "
+                    "and no corpus collections."
+                )
+            try:
+                normalized[filename] = validate_collections(collections)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid corpus file collection entry for {filename!r}: {exc}"
+                ) from exc
+        return normalized
 
 
 settings = Settings()

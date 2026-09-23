@@ -102,11 +102,15 @@ def test_search_while_indexing_is_well_formed_and_excludes_the_new_source():
             "source_id",
             "source_type",
             "source_name",
+            "address",
+            "collections",
             "position",
             "neighbours_before",
             "neighbours_after",
             "neighbours",
         }
+        assert result["address"] == "existing.txt"
+        assert result["collections"] == []
         assert result["neighbours"] == [], "the request asked for no neighbours"
 
     gate.set()

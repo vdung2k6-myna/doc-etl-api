@@ -12,11 +12,13 @@ import numpy as np
 import pytest
 import requests
 import tiktoken
-from docling.datamodel.base_models import ConversionStatus
+from docling.datamodel.base_models import ConversionStatus, InputFormat
+from docling.datamodel.pipeline_options import EasyOcrOptions, OcrMode
+from docling.document_converter import DocumentConverter
 from llama_index.core import Document as LlamaDocument
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core.embeddings import MockEmbedding
-from llama_index.core.schema import MetadataMode
+from llama_index.core.schema import MetadataMode, TextNode
 
 from doc_etl_api.config import DEFAULT_USER_AGENT, Settings
 from doc_etl_api.pipeline import (
@@ -122,6 +124,76 @@ def test_docling_converter_supported_files():
     assert converter.is_supported_file("notes.docx")
     assert converter.is_supported_file("page.html")
     assert not converter.is_supported_file("archive.zip")
+
+
+def _pdf_options(converter: DoclingConverter):
+    """The pipeline options the converter will use for a PDF."""
+    return converter._converter.format_to_options[InputFormat.PDF].pipeline_options
+
+
+def test_a_scanned_page_is_read_in_the_configured_language():
+    """The default converter must not keep Docling's language-free OCR.
+
+    Docling reads an image with a Chinese/English recogniser when no language is
+    named, which drops Vietnamese diacritics -- 57% of them, measured, on the
+    scanned book this change was made against.
+    """
+    options = _pdf_options(DoclingConverter())
+
+    assert isinstance(options.ocr_options, EasyOcrOptions)
+    assert options.ocr_options.lang == ["vi"]
+
+
+def test_the_configured_languages_are_the_ones_used(monkeypatch):
+    """The language is deployment configuration, not a constant in the code."""
+    monkeypatch.setattr("doc_etl_api.pipeline.settings", Settings(pdf_ocr_languages="en, vi"))
+
+    options = _pdf_options(DoclingConverter())
+
+    assert options.ocr_options.lang == ["en", "vi"]
+
+
+def test_an_injected_converter_is_used_unchanged():
+    """The injection point is how the tests supply a converter they control."""
+    injected = MagicMock(spec=DocumentConverter)
+
+    assert DoclingConverter(injected)._converter is injected
+
+
+def test_ocr_does_not_replace_a_page_that_carries_its_own_text():
+    """OCR must apply only where there is no text to read.
+
+    Docling's default mode is what that is: the full-page mode would replace an
+    accurate text layer with recognised text, which is a different failure from
+    the one being fixed and would slow every digital PDF down to do it.
+    """
+    options = _pdf_options(DoclingConverter())
+
+    assert options.ocr_options.mode is OcrMode.DEFAULT
+
+
+def test_only_the_pdf_pipeline_is_reconfigured():
+    """OCR is performed by the PDF pipeline; every other format keeps its options."""
+    configured = DoclingConverter()._converter.format_to_options
+    default = DocumentConverter().format_to_options
+
+    for other in (InputFormat.DOCX, InputFormat.HTML, InputFormat.XLSX):
+        assert configured[other].pipeline_options == default[other].pipeline_options
+    assert configured[InputFormat.PDF].pipeline_options != default[InputFormat.PDF].pipeline_options
+
+
+def test_device_selection_is_left_to_docling(recwarn):
+    """`use_gpu` is deprecated in favour of Docling's accelerator options.
+
+    The field is left unset so the device is chosen where the library now expects
+    it, rather than pinned through a field it has moved away from. Asserted on
+    the field itself: this Docling version warns only once the recogniser loads,
+    not at construction, so a warning check alone would pass either way.
+    """
+    options = _pdf_options(DoclingConverter())
+
+    assert options.ocr_options.use_gpu is None
+    assert [w for w in recwarn.list if issubclass(w.category, DeprecationWarning)] == []
 
 
 def test_docling_converter_file(settings, tmp_path):
@@ -708,6 +780,127 @@ def test_urls_landing_on_one_page_share_a_document_identity(searchable_pipeline)
         searchable_pipeline.ingest_url(source_id=submitted, url=submitted)
 
     assert set(searchable_pipeline.index.ref_doc_info) == {"https://example.com/final"}
+
+
+def test_a_files_address_is_the_filename_it_was_uploaded_as(searchable_pipeline):
+    """For a file the two names coincide: both report the filename."""
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    record = searchable_pipeline.source_catalog[0]
+
+    assert record.name == "doc.txt"
+    assert record.address == "doc.txt"
+
+
+def test_a_redirected_url_is_addressed_by_where_it_landed(searchable_pipeline):
+    """The name a source is displayed under is not always what finds it again.
+
+    A URL source is stored under its final URL -- which is what makes two request
+    URLs that redirect to one page a single source -- while its name stays the URL
+    that was submitted. Both are reported, so a caller can display the page it
+    asked for and fetch the content it landed on.
+    """
+    searchable_pipeline.converter.convert_url.return_value = (
+        "# Page\n\nSome content.",
+        "https://example.com/final",
+    )
+
+    searchable_pipeline.ingest_url(source_id="source-1", url="https://example.com/submitted")
+
+    record = searchable_pipeline.source_catalog[0]
+    assert record.name == "https://example.com/submitted"
+    assert record.address == "https://example.com/final"
+    assert record.name != record.address
+
+
+def test_a_files_chunks_carry_the_address_they_are_fetched_by(searchable_pipeline):
+    """A search reports the address, so it is recorded where identity is minted."""
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    nodes = _stored_nodes(searchable_pipeline)
+
+    assert nodes
+    assert {node.metadata["address"] for node in nodes} == {"doc.txt"}
+
+
+def test_a_urls_chunks_carry_the_address_it_landed_on(searchable_pipeline):
+    """The address is the final URL, which is not the name the source reports.
+
+    Recording it is what keeps the two from having to agree: a caller joins on
+    the address, and a URL that redirected would otherwise hand it the URL that
+    was submitted -- which is not what the source is stored under.
+    """
+    searchable_pipeline.converter.convert_url.return_value = (
+        "# Page\n\nSome content.",
+        "https://example.com/final",
+    )
+
+    searchable_pipeline.ingest_url(source_id="source-1", url="https://example.com/submitted")
+
+    nodes = _stored_nodes(searchable_pipeline)
+    assert nodes
+    metadata = nodes[0].metadata
+    assert metadata["address"] == "https://example.com/final"
+    assert metadata["source_name"] == "https://example.com/submitted"
+    assert metadata["address"] != metadata["source_name"]
+
+
+def test_the_address_is_kept_out_of_every_model(searchable_pipeline):
+    """The splitter measures a node's metadata, so the key must not be rendered.
+
+    Asserted on the renderings the splitter budgets for -- the embedder's and an
+    LLM's -- because `_get_metadata_str` keeps whichever is longer, so a key
+    excluded from one of them only is still charged through the other. This is
+    the property that holds whatever the document is; the node count is not, and
+    was measured not to move on the fixture used here.
+    """
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    nodes = _stored_nodes(searchable_pipeline)
+    assert len(nodes) > 1, "the document must split for this test to mean anything"
+    for node in nodes:
+        assert node.metadata["address"] == "doc.txt", "the key must still be stored to report"
+        for mode in (MetadataMode.EMBED, MetadataMode.LLM):
+            rendered = node.get_metadata_str(mode=mode)
+            assert "address" not in rendered, f"the key is rendered for {mode}"
+        # The chunk's own text never carries metadata, and the address is not
+        # smuggled into the text it stores.
+        assert "doc.txt" not in node.get_content()
+
+
+def test_the_exclusion_removes_one_metadata_line_and_nothing_else(searchable_pipeline):
+    """What the exclusion buys, stated as what it does to the splitter's reading.
+
+    The address value is already rendered under `source_name` for a file (and
+    under `final_url` for a URL), and neither of those keys is excluded, so the
+    value is charged against the chunk budget with or without this exclusion. What
+    it removes is the `address: <value>` line itself. Measured on this fixture,
+    that line was worth 5 tokens and did not move a chunk boundary at
+    CHUNK_SIZE=128, so the node count -- which task 1.3 proposed as the check --
+    cannot tell the exclusion from its absence. The rendering can.
+    """
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    node = _stored_nodes(searchable_pipeline)[0]
+    for mode in (MetadataMode.EMBED, MetadataMode.LLM):
+        rendered = node.get_metadata_str(mode=mode).splitlines()
+        assert not [line for line in rendered if line.startswith("address:")]
+
+        # The same node with the same metadata, differing only in whether the key
+        # is excluded: exactly one line separates the two readings.
+        unexcluded = TextNode(
+            text=node.get_content(),
+            metadata=dict(node.metadata),
+            excluded_embed_metadata_keys=list(node.excluded_embed_metadata_keys),
+            excluded_llm_metadata_keys=list(node.excluded_llm_metadata_keys),
+        )
+        unexcluded.excluded_embed_metadata_keys.remove("address")
+        unexcluded.excluded_llm_metadata_keys.remove("address")
+
+        assert unexcluded.get_metadata_str(mode=mode).splitlines() == [
+            *rendered,
+            "address: doc.txt",
+        ]
 
 
 def test_every_stored_node_carries_its_sources_identity(searchable_pipeline):
@@ -1451,9 +1644,7 @@ def _paragraph_runs(paragraphs: Sequence[str]) -> set[str]:
 
 
 def test_a_heading_opens_a_section_that_the_next_heading_closes():
-    markdown = PARAGRAPH_GAP.join(
-        [HEADING_ONE, PARA_ALPHA, PARA_BRAVO, HEADING_TWO, PARA_CHARLIE]
-    )
+    markdown = PARAGRAPH_GAP.join([HEADING_ONE, PARA_ALPHA, PARA_BRAVO, HEADING_TWO, PARA_CHARLIE])
 
     sections = _split_sections(markdown)
 
@@ -1525,7 +1716,9 @@ def test_each_paragraph_of_a_fitting_section_becomes_its_own_node():
     """
     pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
     section = "\n\n".join([PARA_ALPHA, PARA_BRAVO])
-    assert _model_tokens(section) < 128, "the section must fit the cap for this test to mean anything"
+    assert _model_tokens(section) < 128, (
+        "the section must fit the cap for this test to mean anything"
+    )
 
     chunking = _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{section}")
 
@@ -1561,7 +1754,9 @@ def test_every_node_of_a_long_section_carries_its_heading():
     stored = [node.get_content() for node in _stored_nodes(pipeline)]
     assert len(stored) > 1, "the section must be divided for this test to mean anything"
     for text in stored:
-        assert text.startswith(f"{HEADING_ONE}\n\n"), "a node divided out of a section lost its heading"
+        assert text.startswith(f"{HEADING_ONE}\n\n"), (
+            "a node divided out of a section lost its heading"
+        )
 
 
 def test_a_section_that_is_one_node_carries_its_heading_once():
@@ -1581,7 +1776,9 @@ def test_a_paragraph_wider_than_the_cap_is_divided_at_sentence_boundaries():
     the ones that repeat the sentence at their boundary.
     """
     pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=32)
-    assert _model_tokens(SENTENCE_DOC) > 128, "the fixture must exceed the cap for this test to bite"
+    assert _model_tokens(SENTENCE_DOC) > 128, (
+        "the fixture must exceed the cap for this test to bite"
+    )
 
     chunking = _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{SENTENCE_DOC}")
 
@@ -1664,7 +1861,9 @@ def test_a_fragment_is_merged_inside_its_own_section_before_reaching_across_a_he
     chunking = _ingest_markdown(pipeline, markdown)
 
     assert chunking["floor_merges"] == 1, "the fragment was not merged"
-    carriers = [text for text in (n.get_content() for n in _stored_nodes(pipeline)) if FRAGMENT in text]
+    carriers = [
+        text for text in (n.get_content() for n in _stored_nodes(pipeline)) if FRAGMENT in text
+    ]
     assert len(carriers) == 1, "the fragment was dropped or stored twice"
     assert INFOBOX_HEADER in carriers[0], "the fragment was merged beyond its own section"
     assert "Alpha" not in carriers[0], "the merge joined two of the document's sections"
@@ -1689,7 +1888,9 @@ def test_a_fragment_whose_only_legal_merge_lies_across_a_heading_is_still_merged
 
     assert chunking["floor_merges"] == 1, "the fragment was left stored on its own"
     assert chunking["floor_refusals"] == 0, "a legal merge across the heading was refused"
-    carriers = [text for text in (n.get_content() for n in _stored_nodes(pipeline)) if FRAGMENT_WIDE in text]
+    carriers = [
+        text for text in (n.get_content() for n in _stored_nodes(pipeline)) if FRAGMENT_WIDE in text
+    ]
     assert len(carriers) == 1
     assert "Alpha" in carriers[0], "the only legal merge available was not the one taken"
     assert chunking["max_node_tokens"] <= EMBEDDING_MAX_TOKENS
@@ -1728,7 +1929,9 @@ def test_a_merge_stores_the_heading_its_nodes_share_only_once():
     assert len(stored) == 1, "two below-floor paragraphs did not become one node"
     assert stored[0].count(HEADING_ONE) == 1, "the shared heading was stored once per merged node"
     assert stored[0].startswith(HEADING_ONE), "the merged node lost the heading naming it"
-    assert short_one in stored[0] and short_two in stored[0], "content was dropped to satisfy the floor"
+    assert short_one in stored[0] and short_two in stored[0], (
+        "content was dropped to satisfy the floor"
+    )
 
 
 def test_a_merge_across_a_heading_keeps_both_headings():
@@ -1776,9 +1979,7 @@ def test_the_chunking_outcome_reports_which_boundaries_produced_the_nodes():
     fits = _ingest_markdown(
         pipeline, f"{HEADING_ONE}\n\n{PARA_ALPHA}\n\n{PARA_BRAVO}", filename="fits.txt"
     )
-    divided = _ingest_markdown(
-        pipeline, f"{HEADING_ONE}\n\n{SENTENCE_DOC}", filename="divided.txt"
-    )
+    divided = _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{SENTENCE_DOC}", filename="divided.txt")
 
     assert fits["nodes"] == 2
     assert fits["structural_nodes"] == 2, (
@@ -2348,6 +2549,207 @@ def test_recording_a_position_does_not_reach_the_stored_node(settings):
         "source_type",
         "source_name",
         "mime_type",
+        "address",
         "collections",
     }, keys
     assert _recorded_positions(pipeline), "the fixture recorded no positions to test against"
+
+
+# --- Reading a source's stored content ---------------------------------------
+
+
+def test_the_stored_content_comes_back_in_reading_order(settings):
+    """The whole source, ordered by the position each chunk was stored at.
+
+    The docstore is a dict keyed by node id, so the order its values come out in
+    is incidental; the positions recorded when the nodes were stored are what make
+    the chunks come back as the document reads.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(source_id="doc", file=BytesIO(b"x"), filename="doc.txt")
+
+    record, chunks = pipeline.source_content("doc.txt")
+
+    assert len(chunks) > 1, "the fixture must hold a source with more than one chunk"
+    assert record.chunk_count == len(chunks)
+    assert [chunk["position"] for chunk in chunks] == list(range(len(chunks)))
+    # What comes back is what is stored, not something derived from it.
+    assert {chunk["text"] for chunk in chunks} == {
+        node.get_content() for node in _stored_nodes(pipeline)
+    }
+
+
+def test_a_re_ingested_source_returns_only_its_newer_content(settings):
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = "the first wording of this source"
+    pipeline.ingest_file(source_id="first", file=BytesIO(b"x"), filename="doc.txt")
+
+    pipeline.converter.convert_file.return_value = "the second wording of this source"
+    pipeline.ingest_file(source_id="second", file=BytesIO(b"x"), filename="doc.txt")
+
+    _record, chunks = pipeline.source_content("doc.txt")
+
+    texts = " ".join(chunk["text"] for chunk in chunks)
+    assert "the second wording of this source" in texts
+    assert "the first wording of this source" not in texts
+
+
+def test_an_unknown_address_is_not_an_empty_source(settings):
+    """An address nothing has, and a source holding nothing, are different answers.
+
+    Reporting both as the same would make "you asked for something that is not
+    here" read like "here it is, and it was empty".
+    """
+    pipeline = _collections_pipeline(settings)
+
+    assert pipeline.source_content("nothing.txt") is None
+
+    pipeline.converter.convert_file.return_value = ""
+    pipeline.ingest_file(source_id="empty", file=BytesIO(b"x"), filename="empty.txt")
+
+    record, chunks = pipeline.source_content("empty.txt")
+    assert record.name == "empty.txt"
+    assert chunks == []
+
+
+def test_the_content_read_embeds_nothing(settings, monkeypatch):
+    """The read walks what is stored, so no model is consulted to answer it."""
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(source_id="doc", file=BytesIO(b"x"), filename="doc.txt")
+
+    exploding = MagicMock()
+    exploding.get_text_embedding.side_effect = AssertionError("the content read must not embed")
+    monkeypatch.setattr(pipeline, "_embedding_model", exploding)
+
+    _record, chunks = pipeline.source_content("doc.txt")
+
+    assert chunks
+
+
+def test_the_content_read_takes_the_index_lock(settings):
+    """A replacement rewrites nodes, records and positions together.
+
+    A reader outside the lock could take one ingestion's nodes against another's
+    positions, so the read holds what the writes hold.
+    """
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(source_id="doc", file=BytesIO(b"x"), filename="doc.txt")
+
+    entered = threading.Event()
+    finished = threading.Event()
+
+    def read() -> None:
+        entered.set()
+        pipeline.source_content("doc.txt")
+        finished.set()
+
+    with pipeline._index_lock:
+        reader = threading.Thread(target=read)
+        reader.start()
+        assert entered.wait(timeout=5), "the reading thread never started"
+        assert not finished.wait(timeout=0.5), "the read ran without the lock a write holds"
+    reader.join(timeout=5)
+
+    assert finished.is_set()
+
+
+# --- Routing metadata on a search result -------------------------------------
+
+
+def test_a_result_reports_the_address_and_collections_of_its_source(searchable_pipeline):
+    """Both come off the chunk the search returned, so neither costs a lookup."""
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    (result,) = searchable_pipeline.search("Sentence 5 covers", top_k=1)
+
+    record = searchable_pipeline.source_catalog[0]
+    assert result["address"] == record.address == "doc.txt"
+    assert result["collections"] == list(record.collections) == []
+
+
+def test_a_tagged_sources_collections_reach_every_hit(searchable_pipeline, settings):
+    """A hit reports the set the catalog reports for its source, not a subset."""
+    pipeline = _collections_pipeline(settings)
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(
+        source_id="source-1",
+        file=BytesIO(b"x"),
+        filename="doc.txt",
+        collections=["csharp", "dotnet"],
+    )
+
+    results = pipeline.search("Sentence 5 covers", top_k=3, collections=["csharp"])
+
+    assert results
+    record = pipeline.source_catalog[0]
+    for result in results:
+        assert result["collections"] == list(record.collections) == ["csharp", "dotnet"]
+        assert result["address"] == record.address == "doc.txt"
+
+
+def test_a_url_hits_address_is_where_it_landed_not_what_was_submitted(searchable_pipeline):
+    """The join a caller makes on `address` must find the source that stored it."""
+    searchable_pipeline.converter.convert_url.return_value = (
+        "# Page\n\nSome content about widgets.",
+        "https://example.com/final",
+    )
+    searchable_pipeline.ingest_url(source_id="source-1", url="https://example.com/submitted")
+
+    (result,) = searchable_pipeline.search("widgets", top_k=1)
+
+    assert result["source_name"] == "https://example.com/submitted"
+    assert result["address"] == "https://example.com/final"
+    assert result["address"] != result["source_name"]
+
+
+def test_every_hit_carries_both_keys_even_when_they_are_empty(searchable_pipeline):
+    """A caller reads the fields without checking whether the source has them."""
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    results = searchable_pipeline.search("Sentence 5 covers", top_k=2)
+
+    assert results
+    assert all("address" in result and "collections" in result for result in results)
+
+
+def test_a_search_scans_the_index_once_and_never_reads_the_catalog(
+    searchable_pipeline, monkeypatch
+):
+    """The routing fields come off the hit, so producing them costs no second read.
+
+    The spy is over both ways the search could have paid for the fields: another
+    similarity scan (through the retriever) and a read of the source catalog
+    (through the published snapshot). Either being consulted fails the test, so a
+    future implementation that derives the address by looking the source up
+    cannot pass by leaving the fields correct.
+    """
+    _ingest_text(searchable_pipeline, "doc.txt", SENTENCE_DOC)
+
+    scans: list[str] = []
+    real_as_retriever = searchable_pipeline.index.as_retriever
+
+    def counting_as_retriever(*args, **kwargs):
+        scans.append("as_retriever")
+        return real_as_retriever(*args, **kwargs)
+
+    def forbidden_catalog(_self):
+        raise AssertionError("the search read the source catalog")
+
+    monkeypatch.setattr(searchable_pipeline.index, "as_retriever", counting_as_retriever)
+    monkeypatch.setattr(IndexPipeline, "source_catalog", property(forbidden_catalog))
+
+    # The spy has to be armed, or a search that read the catalog would pass by
+    # touching nothing.
+    with pytest.raises(AssertionError, match="read the source catalog"):
+        _ = searchable_pipeline.source_catalog
+
+    results = searchable_pipeline.search("Sentence 5 covers", top_k=3)
+
+    assert results
+    assert len(scans) == 1, f"the search retrieved more than once: {scans}"
+    for result in results:
+        assert result["address"] == "doc.txt"
+        assert result["collections"] == []

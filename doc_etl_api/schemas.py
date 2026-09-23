@@ -60,6 +60,20 @@ class SearchResult(BaseModel):
     source_id: str = Field(..., description="Source identifier")
     source_type: str = Field(..., description="Source type: file or url")
     source_name: str = Field(..., description="Source filename or URL")
+    address: str = Field(
+        default="",
+        description="The name the index stores this chunk's source under, and therefore the "
+        "value that source's content is fetched by: pass it to `GET /sources/content`. For a "
+        "file it is the filename; for a URL it is the final URL after redirects, which differs "
+        "from the reported source name when the submitted URL redirected. It identifies a "
+        "source to fetch, not to display: it is percent-encoded for a URL.",
+    )
+    collections: list[str] = Field(
+        default_factory=list,
+        description="The collections this chunk's source belongs to, the same set "
+        "`GET /sources` reports for that source. Empty for a source ingested without any, "
+        "which is a source that matches no filter rather than a missing value.",
+    )
     position: int = Field(
         ...,
         description="Zero-based position this chunk holds in its source, in reading order",
@@ -80,7 +94,6 @@ class SearchResult(BaseModel):
         "in reading order, up to the neighbour count the request asked for. Empty when it "
         "asked for none. They carry no score because they were not ranked against the query.",
     )
-    source_name: str = Field(..., description="Original filename or URL")
 
 
 class SearchResponse(BaseModel):
@@ -89,6 +102,12 @@ class SearchResponse(BaseModel):
 
 class SourceCatalogEntry(BaseModel):
     name: str = Field(..., description="Original filename or submitted URL")
+    address: str = Field(
+        ...,
+        description="What the source is stored under and fetched by: the filename for a file, "
+        "or the final URL for a URL. A URL that redirected reports the submitted URL as its "
+        "name and the final URL as its address, so the two differ.",
+    )
     source_type: Literal["file", "url"] = Field(..., description="Source type")
     collections: list[str] = Field(
         default_factory=list, description="Collections the source belongs to, if any"
@@ -98,6 +117,22 @@ class SourceCatalogEntry(BaseModel):
 
 class SourceCatalogResponse(BaseModel):
     sources: list[SourceCatalogEntry] = Field(default_factory=list)
+
+
+class SourceContentResponse(BaseModel):
+    name: str = Field(..., description="Original filename or submitted URL")
+    source_type: Literal["file", "url"] = Field(..., description="Source type")
+    collections: list[str] = Field(
+        default_factory=list, description="Collections the source belongs to, if any"
+    )
+    chunk_count: int = Field(..., description="Number of chunks stored for this source")
+    chunks: list[NeighbourChunk] = Field(
+        default_factory=list,
+        description="Every chunk the index stores for this source, ordered by position. These "
+        "are the chunks as they were chunked and indexed, which is not a copy of the document "
+        "that was submitted: chunking removes repeated headings, splits tables and dedupes "
+        "text. Join them to read the content through.",
+    )
 
 
 class HealthResponse(BaseModel):

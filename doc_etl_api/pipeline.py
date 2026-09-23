@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import BinaryIO
 
 import requests
-from docling.datamodel.base_models import ConversionStatus
+from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.document import ConversionResult
-from docling.document_converter import DocumentConverter
+from docling.datamodel.pipeline_options import EasyOcrOptions, ThreadedPdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from llama_index.core import Document as LlamaDocument
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core import VectorStoreIndex
@@ -30,24 +31,53 @@ logger = logging.getLogger(__name__)
 # The metadata key carrying the collections a source belongs to.
 COLLECTIONS_KEY = "collections"
 
-# Metadata that is written for filtering but never read by a model. Both the
-# embed and the LLM rendering are excluded, and that is not belt-and-braces:
-# metadata is charged against the chunk-size budget before splitting, and
-# `MetadataAwareTextSplitter._get_metadata_str` renders a node both ways and
-# keeps the longer of the two, so excluding one mode alone would still let a
-# collection name shrink the text each chunk can hold. That changes where a
+# The metadata key carrying the name the index stores a source under, which is
+# what its content is fetched by. It is written where the source's identity is
+# decided rather than derived at read time from `source_name` and `final_url`:
+# those two agree with it by accident of which ingestion path ran, and an address
+# that silently became a different string would fail as a lookup on the content
+# endpoint rather than anywhere near the cause.
+ADDRESS_KEY = "address"
+
+# Metadata that is written for filtering and reporting but never read by a model.
+# Both the embed and the LLM rendering are excluded, and that is not
+# belt-and-braces: metadata is charged against the chunk-size budget before
+# splitting, and `MetadataAwareTextSplitter._get_metadata_str` renders a node both
+# ways and keeps the longer of the two, so excluding one mode alone would still
+# let a collection name shrink the text each chunk can hold. That changes where a
 # source splits and therefore its vectors -- measured, tagging one document with
 # two collections took it from 14 nodes to 20. Excluding the key from both
 # readings is what makes tagging metadata-only: the prefilter still sees the
-# collections, no model ever does.
-_MODEL_EXCLUDED_KEYS = [COLLECTIONS_KEY]
+# collections, no model ever does. The address is excluded for the same reason,
+# though it buys less: the address is the same string as `source_name` for a file
+# and as `final_url` for a URL, and neither of those is excluded, so the value is
+# already charged against every chunk's budget and already rendered into what a
+# model would read. What the exclusion removes is the `address: <value>` line
+# itself, which would otherwise be a second copy of a filename or a full URL plus
+# its label, paid for by every chunk of that source. Measured on the fixture
+# below, the extra line was worth 5 tokens and did not move a boundary at
+# CHUNK_SIZE=128 -- but the collections precedent shows that a metadata line can
+# move one, so the key is kept out rather than trusted to be small. Every key in
+# this list is metadata; the rest of the metadata dict is not, and that
+# inconsistency is worth revisiting on its own rather than folded into this change.
+_MODEL_EXCLUDED_KEYS = [COLLECTIONS_KEY, ADDRESS_KEY]
 
 
 @dataclass(frozen=True)
 class SourceRecord:
-    """What a source is, as the catalog reports it."""
+    """What a source is, as the catalog reports it.
+
+    ``name`` and ``address`` are two different things, and for a URL that
+    redirected they differ. The name is what the source was submitted as -- the
+    filename an upload carried, the URL a caller sent -- and it is what the
+    catalog displays. The address is what the index stores the source under and
+    therefore the only thing that finds one again: a filename, or the final URL a
+    submitted URL landed on. Both are reported so a caller can display a source
+    and fetch it without one of those needing to be derived from the other.
+    """
 
     name: str
+    address: str
     source_type: str
     collections: tuple[str, ...]
     chunk_count: int
@@ -677,6 +707,37 @@ def _chunking_outcome(
     }
 
 
+def _pdf_format_options(languages: Sequence[str]) -> dict[InputFormat, PdfFormatOption]:
+    """Docling's options for the PDF pipeline, with OCR in *languages*.
+
+    Docling's own default reads every image with a Chinese/English recogniser, so
+    a Vietnamese scan comes back without its diacritics -- and in Vietnamese the
+    diacritics are the word, not decoration. Measured on a 162-page scan, that was
+    57% of the diacritics lost, so the pages no longer matched a query for their
+    own wording. Naming the language is what fixes it.
+
+    Two fields are deliberately left alone:
+
+    * The OCR mode, so OCR applies to a page only where there is no text to read.
+      A page carrying its own text layer keeps it rather than having accurate text
+      replaced by recognised text. (``force_full_page_ocr`` is the field this used
+      to be expressed with; it is deprecated in favour of ``mode``, and the
+      default mode is the same behaviour.)
+    * ``use_gpu``, which is deprecated in favour of Docling's accelerator options
+      and warns at runtime when set. Device selection stays with Docling.
+
+    Only the PDF entry is configured: OCR is performed by the PDF pipeline, so
+    DOCX, HTML, XLSX and the rest keep the behaviour they have today. The
+    threaded pipeline is the one Docling's own default PDF entry uses, so
+    choosing it here keeps page handling as it was and changes only the OCR --
+    the base class carries the same settings but selects the single-threaded
+    pipeline, which would quietly slow every PDF down.
+    """
+    pipeline_options = ThreadedPdfPipelineOptions()
+    pipeline_options.ocr_options = EasyOcrOptions(lang=list(languages))
+    return {InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+
+
 class DoclingConverter:
     """Convert files and URLs to structured markdown using Docling."""
 
@@ -697,7 +758,15 @@ class DoclingConverter:
     }
 
     def __init__(self, converter: DocumentConverter | None = None) -> None:
-        self._converter = converter or DocumentConverter()
+        """Build a converter configured for this deployment, or take the one given.
+
+        Only the fallback is configured. An injected converter is used exactly as
+        handed over, so a caller can supply one it controls -- which is what the
+        tests do, and why the injection point is kept rather than replaced.
+        """
+        self._converter = converter or DocumentConverter(
+            format_options=_pdf_format_options(settings.pdf_ocr_language_list)
+        )
 
     def is_supported_file(self, filename: str) -> bool:
         return Path(filename).suffix.lower() in self.SUPPORTED_FILE_EXTENSIONS
@@ -1031,6 +1100,7 @@ class IndexPipeline:
             self._index.insert_nodes(nodes)
             self._source_records[source_key] = SourceRecord(
                 name=name,
+                address=source_key,
                 source_type=source_type,
                 collections=tuple(collections),
                 chunk_count=len(nodes),
@@ -1072,6 +1142,7 @@ class IndexPipeline:
             "source_type": "file",
             "source_name": filename,
             "mime_type": mime_type,
+            ADDRESS_KEY: source_key,
             COLLECTIONS_KEY: collections,
         }
 
@@ -1134,6 +1205,7 @@ class IndexPipeline:
             "source_type": "url",
             "source_name": url,
             "final_url": final_url,
+            ADDRESS_KEY: source_key,
             COLLECTIONS_KEY: collections,
         }
 
@@ -1219,6 +1291,12 @@ class IndexPipeline:
                         "source_id": chunk.metadata.get("source_id", ""),
                         "source_type": chunk.metadata.get("source_type", ""),
                         "source_name": chunk.metadata.get("source_name", ""),
+                        # Read off the chunk the search already returned, so a hit
+                        # costs no extra retrieval and no catalog read: the two
+                        # values are written with the chunk's identity, and the
+                        # caller needs them per hit rather than per source.
+                        ADDRESS_KEY: chunk.metadata.get(ADDRESS_KEY, ""),
+                        COLLECTIONS_KEY: chunk.metadata.get(COLLECTIONS_KEY, []),
                         "position": adjacency.position,
                         "neighbours_before": adjacency.before,
                         "neighbours_after": adjacency.after,
@@ -1226,6 +1304,40 @@ class IndexPipeline:
                     }
                 )
         return results
+
+    def source_content(self, address: str) -> tuple[SourceRecord, list[dict]] | None:
+        """Every stored chunk of the source *address* names, in reading order.
+
+        None for an address no source has, which is a different answer from a
+        source that stored no chunks: the second is a source, reported with an
+        empty list, and collapsing the two would make "you asked for something
+        that is not here" read the same as "here it is, and it was empty" -- the
+        reason `_adjacency` reports no adjacency rather than a guessed one.
+
+        The read embeds nothing and retrieves nothing: it walks what the store
+        already holds, which is why it can answer for a source of any size without
+        loading a model. It holds the same lock the writes hold, because a
+        replacement rewrites the docstore, the records and the positions together,
+        and a reader outside the lock could take one ingestion's nodes against
+        another's positions.
+
+        The order comes from the position map rather than from the docstore's own
+        iteration order: the docstore is a dict keyed by node id, so its order is
+        incidental, and the position a node was stored at is what makes its chunks
+        come back as the document reads.
+        """
+        with self._index_lock:
+            record = self._source_records.get(address)
+            if record is None:
+                return None
+            positions = self._source_positions.get(address, {})
+            stored = self._index.docstore.docs
+            chunks = [
+                {"text": node.get_content(), "position": position}
+                for node_id, position in sorted(positions.items(), key=lambda item: item[1])
+                if (node := stored.get(node_id)) is not None
+            ]
+        return record, chunks
 
     def _adjacency(self, chunk: BaseNode, count: int) -> _Adjacency:
         """Place *chunk* in its source and collect the neighbours *count* asks for.

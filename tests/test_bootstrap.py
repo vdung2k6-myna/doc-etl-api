@@ -217,7 +217,12 @@ def test_corpus_file_and_a_later_upload_share_one_source(corpus_dir):
 # --- Corpus tagging ----------------------------------------------------------
 
 
-def _corpus_settings(corpus_dir, collections: str, urls: str = "") -> Settings:
+def _corpus_settings(
+    corpus_dir,
+    collections: str,
+    urls: str = "",
+    file_collections: dict[str, list[str]] | None = None,
+) -> Settings:
     return Settings(
         vector_store_backend="simple",
         embedding_model=EMBEDDING_MODEL_NAME,
@@ -226,7 +231,22 @@ def _corpus_settings(corpus_dir, collections: str, urls: str = "") -> Settings:
         knowledge_corpus_dir=str(corpus_dir),
         knowledge_corpus_urls=urls,
         knowledge_corpus_collections=collections,
+        knowledge_corpus_file_collections=file_collections or {},
     )
+
+
+def _tagged_pipeline(corpus_dir, **settings_kwargs) -> tuple[IndexPipeline, Settings]:
+    """A real pipeline over a stubbed converter, with a text file per source."""
+    settings = _corpus_settings(corpus_dir, **settings_kwargs)
+    pipeline = _corpus_pipeline(settings)
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    pipeline.converter.convert_file.side_effect = lambda _file, name: f"Corpus file {name}."
+    pipeline.converter.convert_url.return_value = ("Corpus page body.", "https://example.com/page")
+    return pipeline, settings
+
+
+def _tags_by_name(pipeline: IndexPipeline) -> dict[str, tuple[str, ...]]:
+    return {record.name: record.collections for record in pipeline.source_catalog}
 
 
 def _corpus_pipeline(settings: Settings) -> IndexPipeline:
@@ -311,3 +331,156 @@ def test_corpus_content_is_reachable_by_a_filtered_search(corpus_dir):
     assert {result["source_name"] for result in results} == {"alpha.txt", "beta.txt"}
     # The same search over the same content, differing only in the setting.
     assert untagged.search("subject", top_k=5, collections=["csharp"]) == []
+
+
+# --- Per-file corpus collections ---------------------------------------------
+
+
+def test_a_per_file_entry_overrides_the_corpus_collections(corpus_dir):
+    """One corpus directory can hold documents belonging to different collections.
+
+    The entry replaces the corpus collections for the file it names. A merge
+    would be the wrong shape: the file would then also answer a search for the
+    corpus default, which is a collection it has nothing to do with.
+    """
+    pipeline, settings = _tagged_pipeline(
+        corpus_dir, collections="csharp", file_collections={"alpha.txt": ["dotnet"]}
+    )
+    state = BootstrapState()
+
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert state.failures == []
+    assert _tags_by_name(pipeline) == {"alpha.txt": ("dotnet",), "beta.txt": ("csharp",)}
+    # The override reaches the stored metadata too, which is what a filter reads.
+    by_name = {
+        node.ref_doc_id: node.metadata["collections"]
+        for node in pipeline.index.storage_context.docstore.docs.values()
+    }
+    assert by_name["alpha.txt"] == ["dotnet"]
+    assert by_name["beta.txt"] == ["csharp"]
+
+
+def test_a_per_file_entry_applies_with_no_corpus_collections(corpus_dir):
+    """An entry does not need a corpus-wide default to be there."""
+    pipeline, settings = _tagged_pipeline(
+        corpus_dir, collections="", file_collections={"alpha.txt": ["dotnet"]}
+    )
+
+    ingest_corpus(pipeline, settings, BootstrapState())
+
+    assert _tags_by_name(pipeline) == {"alpha.txt": ("dotnet",), "beta.txt": ()}
+
+
+def test_an_entry_leaves_url_sources_on_the_corpus_collections(corpus_dir):
+    """An entry is keyed by filename, so it cannot reach a URL source."""
+    pipeline, settings = _tagged_pipeline(
+        corpus_dir,
+        collections="csharp",
+        urls="https://example.com/page",
+        file_collections={"alpha.txt": ["dotnet"]},
+    )
+
+    ingest_corpus(pipeline, settings, BootstrapState())
+
+    url_tags = {r.collections for r in pipeline.source_catalog if r.source_type == "url"}
+    assert url_tags == {("csharp",)}
+
+
+def test_a_per_file_entry_tag_is_reachable_by_a_filtered_search(corpus_dir):
+    """The point of the entry: the file is findable under its own collection.
+
+    Both files hold the same wording, so the collection is the only difference
+    between the two searches.
+    """
+    text = "Every corpus file records its own subject in its own wording."
+    settings = _corpus_settings(
+        corpus_dir, collections="csharp", file_collections={"alpha.txt": ["dotnet"]}
+    )
+    pipeline = _corpus_pipeline(settings)
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    pipeline.converter.convert_file.side_effect = lambda _file, _name: text
+
+    ingest_corpus(pipeline, settings, BootstrapState())
+
+    assert {
+        r["source_name"] for r in pipeline.search("subject", top_k=5, collections=["dotnet"])
+    } == {"alpha.txt"}
+    assert {
+        r["source_name"] for r in pipeline.search("subject", top_k=5, collections=["csharp"])
+    } == {"beta.txt"}
+
+
+def test_an_entry_naming_a_file_the_corpus_does_not_ingest_is_a_failure(corpus_dir, caplog):
+    """A filename typo tags nothing, so it must not pass silently.
+
+    `ignored.zip` is in the corpus directory but is not a supported document
+    type, so it is not ingested either: the tag the entry asked for was never
+    applied, and a failure is the only outcome that says so.
+    """
+    pipeline, settings = _tagged_pipeline(
+        corpus_dir,
+        collections="csharp",
+        file_collections={"gamma.txt": ["dotnet"], "ignored.zip": ["dotnet"]},
+    )
+    state = BootstrapState()
+
+    with caplog.at_level(logging.ERROR, logger="doc_etl_api.bootstrap"):
+        ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.FAILED
+    assert {failure.split(":")[0] for failure in state.failures} == {"gamma.txt", "ignored.zip"}
+    assert "gamma.txt" in caplog.text
+    # The rest of the corpus still loaded, under the collections it was given.
+    assert _tags_by_name(pipeline) == {"alpha.txt": ("csharp",), "beta.txt": ("csharp",)}
+
+
+def test_the_bootstrap_log_reports_both_tag_sources(corpus_dir, caplog):
+    """One line shows where each file's tag came from, which a wrong tag needs."""
+    pipeline, settings = _tagged_pipeline(
+        corpus_dir, collections="csharp", file_collections={"alpha.txt": ["dotnet"]}
+    )
+
+    with caplog.at_level(logging.INFO, logger="doc_etl_api.bootstrap"):
+        ingest_corpus(pipeline, settings, BootstrapState())
+
+    assert "collections=['csharp']" in caplog.text
+    assert "file_collections={'alpha.txt': ['dotnet']}" in caplog.text
+
+
+def test_a_corpus_source_is_fetchable_by_its_filename(tmp_path):
+    """The corpus and an upload agree on what an address is."""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from doc_etl_api.jobs import JobRegistry
+    from doc_etl_api.main import create_app
+
+    (tmp_path / "handbook.txt").write_text("handbook")
+    pipeline = IndexPipeline(
+        Settings(knowledge_corpus_dir=str(tmp_path), embedding_model=EMBEDDING_MODEL_NAME),
+        converter=MagicMock(),
+        embedding_model=StubEmbedding(embed_dim=8),
+    )
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    pipeline.converter.convert_file.return_value = "# Handbook\n\nGrounding content."
+    state = BootstrapState()
+
+    ingest_corpus(pipeline, Settings(knowledge_corpus_dir=str(tmp_path)), state)
+    assert state.status is BootstrapStatus.COMPLETE
+
+    with patch("doc_etl_api.main._load_models", return_value=(MagicMock(), MagicMock())):
+        with patch("doc_etl_api.main.create_pipeline", return_value=MagicMock()):
+            app = create_app()
+    app.state.pipeline = pipeline
+    app.state.jobs = JobRegistry()
+
+    response = TestClient(app).get("/sources/content", params={"address": "handbook.txt"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "handbook.txt"
+    assert body["chunks"], "the corpus source stored no chunks"
+    assert "Grounding content" in body["chunks"][0]["text"]

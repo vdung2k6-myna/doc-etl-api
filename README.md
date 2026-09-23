@@ -172,6 +172,35 @@ source. Repeats across different sources are never dropped.
 }
 ```
 
+### Scanned documents and OCR
+
+A PDF whose pages are images rather than text is read with OCR. Which language
+it is read in is deployment configuration, `PDF_OCR_LANGUAGES`, defaulting to
+Vietnamese. Name the languages your documents are written in, comma-separated —
+`PDF_OCR_LANGUAGES=vi,en`. A value naming no language is rejected as the settings
+are built rather than read as "recognise nothing", because an empty language list
+means the OCR engine's own default, a set of European languages, which would
+leave the defect in place while looking like a deliberate choice.
+
+The language matters more than it looks. A recogniser that does not know a
+language's diacritics does not simply drop them — it substitutes others, and in
+Vietnamese the diacritics are the word: `ma`, `má`, `mà`, `mả`, `mã` and `mạ` are
+six different words. Measured on a 162-page Vietnamese scan, reading it without
+the language named recovered 57% fewer diacritics than reading it with `vi`, and
+the result no longer matched a search for the page's own wording.
+
+Only image content is read this way. A page that carries its own text layer keeps
+it — OCR applies where there is no text to read — so a digital PDF is not
+re-typed by a recogniser. Only PDFs are affected; DOCX, HTML, XLSX and the other
+formats behave as they did.
+
+Recognition runs through EasyOCR, whose models are downloaded on first use and
+cached under `~/.EasyOCR/model` afterwards. Vietnamese rides the Latin
+recognition model, and that download is what makes the first scanned document of
+a deployment slower than the ones after it. A deployment without network access
+must pre-seed that directory, or the first scanned PDF it is sent will fail to
+read.
+
 ### Ingest URLs
 
 ```bash
@@ -325,9 +354,13 @@ its content, so a source always belongs to what its most recent ingestion named.
   never filters sees the same results either way.
 
 The startup corpus can be tagged from configuration so it is reachable by a
-filtered search; see `KNOWLEDGE_CORPUS_COLLECTIONS` below. A source in no
-collection matches no filter, so it is only findable by an unfiltered search —
-which is what `GET /sources` is for.
+filtered search; see `KNOWLEDGE_CORPUS_COLLECTIONS` below. One corpus directory
+can also hold documents belonging to different collections:
+`KNOWLEDGE_CORPUS_FILE_COLLECTIONS` maps a filename to its own collections,
+replacing the corpus-wide ones for that file alone, so a document that belongs
+somewhere else can be kept in the corpus without being tagged with the corpus
+default. A source in no collection matches no filter, so it is only findable by
+an unfiltered search — which is what `GET /sources` is for.
 
 ### List indexed sources
 
@@ -342,12 +375,14 @@ Response:
   "sources": [
     {
       "name": "example.pdf",
+      "address": "example.pdf",
       "source_type": "file",
       "collections": ["handbook"],
       "chunk_count": 12
     },
     {
       "name": "https://example.com/archive",
+      "address": "https://example.com/archive/index.html",
       "source_type": "url",
       "collections": [],
       "chunk_count": 4
@@ -361,6 +396,65 @@ One entry per indexed source, including sources in no collection — an empty
 how you find what a filter will never reach. `GET /sources` performs no retrieval
 and no embedding, like `/health`, so it stays responsive regardless of index size
 or search load.
+
+An entry's `address` is what the source is stored under, and what its content is
+fetched by; see [Get a source's content](#get-a-sources-content). For a file it is
+the filename, the same value as the name. For a URL it is the final URL after
+redirects, which is why the second entry above reports a name it was submitted as
+and a different address it landed on: a page is one source however many request
+URLs reach it, and the address is the one that finds it.
+
+### Get a source's content
+
+```bash
+curl "http://localhost:8000/sources/content?address=example.pdf"
+```
+
+Response:
+
+```json
+{
+  "name": "example.pdf",
+  "source_type": "file",
+  "collections": ["handbook"],
+  "chunk_count": 3,
+  "chunks": [
+    {"text": "Docling converts documents to structured markdown...", "position": 0},
+    {"text": "Tables become markdown tables...", "position": 1},
+    {"text": "Headings survive as markdown headings...", "position": 2}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name`, `source_type`, `collections` | The source's catalog entry, reported as `/sources` reports it. |
+| `chunk_count` | How many chunks the index stores for the source, equal to the length of `chunks`. |
+| `chunks` | Every stored chunk of the source, in reading order, each as `text` and its zero-based `position`. None carries a score: nothing was ranked. |
+
+`address` is required, and it is the address the catalog reports, which is where
+you find it — see [List indexed sources](#list-indexed-sources). For a file it is
+the filename; for a URL it is the final URL, so a page that redirected is
+addressed by where it landed rather than where it was submitted. A URL's own
+reserved characters have to be encoded in a query string, which `curl` will do:
+
+```bash
+curl --get "http://localhost:8000/sources/content" \
+  --data-urlencode "address=https://example.com/archive/index.html"
+```
+
+The content is what was chunked and indexed, which is not a copy of the document
+that was submitted: chunking merges a short unit into a neighbour, drops a text a
+merge already stores, and carries a repeated heading once rather than once per
+node. This is the text a search returns, in the order it reads — for the passage
+around a single hit, [Neighbours](#neighbours) is cheaper than fetching the whole
+source.
+
+The read performs no retrieval and no embedding, like `/health`, so it stays
+responsive regardless of index size or search load. An address no indexed source
+has is reported as `404`, naming the address that was asked for. A source that
+stored no chunks is a `200` with an empty `chunks` list: it exists, and is simply
+empty, which is a different answer from an address that names nothing.
 
 ### Search
 
@@ -388,6 +482,8 @@ Response:
       "source_id": "a1b2c3d4...",
       "source_type": "file",
       "source_name": "example.pdf",
+      "address": "example.pdf",
+      "collections": ["handbook"],
       "position": 4,
       "neighbours_before": 4,
       "neighbours_after": 7,
@@ -405,9 +501,17 @@ Response:
 | `text` | The chunk's text. |
 | `score` | Its relevance to the query. |
 | `source_id`, `source_type`, `source_name` | Where the chunk came from. |
+| `address` | The name the hit's source is stored under, and the value that source's content is fetched by — pass it to `GET /sources/content`, as [Get a source's content](#get-a-sources-content) describes. For a file it is the filename, the same as `source_name`; for a URL it is the final URL after redirects, so a hit from a page whose submitted URL redirected reports a name it was submitted as and a different address it landed on. It identifies a source to fetch rather than to display. |
+| `collections` | The collections the hit's source belongs to, the same set `GET /sources` reports for it. Empty for a source ingested without any — a source that matches no filter, not a missing value. |
 | `position` | Where the chunk sits in its source: counted from 0, in reading order. |
 | `neighbours_before`, `neighbours_after` | How many chunks the source holds on each side of this one, whether or not any were returned. Zero at the source's first or last chunk. |
 | `neighbours` | The adjacent chunks themselves, in reading order, when the request asked for them; empty when it did not. |
+
+Both routing fields are read off the chunk the search already returned, so a
+search that reports them costs the same retrieval as one that does not: no second
+lookup, and nothing read from the catalog beside the index. They are per hit
+rather than per response, so a search spanning several sources names each hit's
+own source without the caller joining anything.
 
 `top_k` applies within the scope rather than being padded from outside it: a
 collection holding fewer chunks than `top_k` returns fewer results.
@@ -466,9 +570,11 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `MAX_FILE_SIZE_MB` | `50` | Maximum uploaded file size in MB. |
 | `URL_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for fetching URLs. |
 | `USER_AGENT` | `doc-etl-api/0.1.0` | Sent on every page fetch. It names this service rather than the HTTP library, because hosts with a client-identity policy refuse the library's default — Wikipedia answers `403` to `python-requests/*` and `200` to this. Set it to include the contact details such a policy asks for. A blank value falls back to this default rather than sending an empty header, which those hosts refuse as well. |
+| `PDF_OCR_LANGUAGES` | `vi` | Comma-separated languages a scanned PDF is read in. Defaults to Vietnamese, because a recogniser that does not know a language's diacritics substitutes others rather than dropping them, and in Vietnamese the diacritics are the word — reading a Vietnamese scan without `vi` was measured to recover 57% fewer of them. Only pages with no text layer are read this way; a page carrying its own text keeps it. A value naming no language, or a malformed code, is rejected as the settings are built, so a typo stops the service from starting rather than failing the first document that needs OCR. |
 | `KNOWLEDGE_CORPUS_DIR` | *(empty)* | Local directory whose supported files are ingested at startup, so a restart does not leave the index empty. Empty disables startup ingestion for local files. |
 | `KNOWLEDGE_CORPUS_URLS` | *(empty)* | Comma-separated URLs ingested at startup. Empty contributes nothing. |
 | `KNOWLEDGE_CORPUS_COLLECTIONS` | *(empty)* | Comma-separated collections every startup corpus source is tagged with, so a corpus is reachable by a filtered search. Empty leaves corpus sources untagged; a malformed name is rejected as the settings are built, which stops the service from starting rather than failing each corpus source in turn and leaving the index empty. |
+| `KNOWLEDGE_CORPUS_FILE_COLLECTIONS` | *(empty)* | Per-file collections for the startup corpus, as a JSON object mapping a filename to a list of collections — `{"101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt": ["truyen-cuoi"]}`. An entry replaces `KNOWLEDGE_CORPUS_COLLECTIONS` for the file it names instead of adding to it, which is what lets one corpus directory hold documents belonging to different collections; every other file, and every corpus URL, keeps the corpus collections. An entry naming a file the corpus does not ingest — absent, or of an unsupported type — is reported as a bootstrap failure, because a filename typo would otherwise tag nothing and say nothing. An entry naming no collection is rejected as the settings are built, since a source in no collection matches no filter; so is a key naming a path, since the scan does not recurse and an entry matches a file by its filename alone. |
 | `LOG_LEVEL` | `INFO` | Level for application logs. Search timings and bootstrap progress are logged at `INFO`, so raising this to `WARNING` hides them. |
 | `DOC_ETL_API_ENV_FILE` | `.env` | Which environment file to read — not a setting, and it cannot be set inside one. It is taken from the process environment before any setting is read, because it decides whether a file is read at all, so a value written into `.env` would never be seen. An empty value disables the file entirely: a `Settings()` built with no arguments then falls back to the code defaults instead of the developer's `.env`. That is what `tests/conftest.py` does, so a test session asserts the defaults rather than whatever corpus the developer has configured. Leave it unset to run the service. |
 

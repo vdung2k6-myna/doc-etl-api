@@ -97,7 +97,5 @@ def test_importing_the_module_performs_no_corpus_fetch():
     The host is `.invalid`, reserved and unresolvable, so a fetch that escapes
     the patch fails immediately rather than reaching a real host.
     """
-    result = _import_in_fresh_interpreter(
-        KNOWLEDGE_CORPUS_URLS="https://example.invalid/guide"
-    )
+    result = _import_in_fresh_interpreter(KNOWLEDGE_CORPUS_URLS="https://example.invalid/guide")
     assert result.returncode == 0, result.stderr

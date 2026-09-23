@@ -47,13 +47,23 @@ def corpus_files(directory: Path | None, supported: set[str]) -> list[Path]:
     )
 
 
+def _record_failure(state: BootstrapState, label: str, reason: str) -> None:
+    """Record one corpus source's failure and log it, without propagating it.
+
+    Both kinds of failure go through here -- a source that could not be ingested
+    and a configuration entry that names a source the corpus does not have -- so
+    the reason a bootstrap reports itself failed reads the same way either way.
+    """
+    state.failures.append(f"{label}: {reason}")
+    logger.error("Knowledge bootstrap failed for source=%s error=%s", label, reason)
+
+
 def _ingest_one(state: BootstrapState, label: str, ingest: Callable[[], object]) -> None:
     """Run one corpus source, recording rather than propagating its failure."""
     try:
         ingest()
     except Exception as exc:
-        state.failures.append(f"{label}: {exc}")
-        logger.error("Knowledge bootstrap failed for source=%s error=%s", label, exc)
+        _record_failure(state, label, str(exc))
 
 
 def ingest_corpus(
@@ -73,6 +83,10 @@ def ingest_corpus(
     # content that exists specifically to ground answers -- would be the one set
     # of sources invisible to every filtered search.
     collections = app_settings.knowledge_corpus_collection_list
+    # A per-file entry replaces the setting above for the file it names, so one
+    # corpus directory can hold documents belonging to different collections.
+    # URLs are unaffected: an entry is keyed by filename.
+    file_collections = app_settings.knowledge_corpus_file_collections
 
     if corpus_path is None and not corpus_urls:
         state.status = BootstrapStatus.DISABLED
@@ -81,25 +95,43 @@ def ingest_corpus(
     state.status = BootstrapStatus.IN_PROGRESS
     files = corpus_files(corpus_path, pipeline.converter.SUPPORTED_FILE_EXTENSIONS)
     logger.info(
-        "Knowledge bootstrap started dir=%s files=%d urls=%d collections=%s",
+        "Knowledge bootstrap started dir=%s files=%d urls=%d collections=%s file_collections=%s",
         corpus_path,
         len(files),
         len(corpus_urls),
         collections,
+        file_collections,
     )
 
-    for path in files:
+    ingested: set[str] = set()
 
-        def ingest_file(target: Path = path) -> None:
+    for path in files:
+        ingested.add(path.name)
+        file_tag = file_collections.get(path.name, collections)
+
+        def ingest_file(target: Path = path, tag: list[str] = file_tag) -> None:
             with target.open("rb") as handle:
                 pipeline.ingest_file(
                     source_id=str(uuid.uuid4()),
                     file=handle,
                     filename=target.name,
-                    collections=collections,
+                    collections=tag,
                 )
 
         _ingest_one(state, str(path), ingest_file)
+
+    # An entry naming a file the corpus does not ingest -- absent, or of an
+    # unsupported type -- is a configuration that does not do what it says.
+    # Checked against what was ingested rather than what exists on disk, because
+    # either way the tag the operator asked for was never applied. Reported like
+    # a failed source: silently tagging nothing is the same outcome as tagging
+    # the wrong collection, which is what this setting exists to prevent.
+    for filename in sorted(set(file_collections) - ingested):
+        _record_failure(
+            state,
+            filename,
+            "named by the corpus file collections but not ingested from the corpus",
+        )
 
     for url in corpus_urls:
         _ingest_one(
