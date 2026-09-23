@@ -311,7 +311,7 @@ def test_corpus_file_collections_are_normalized_like_an_uploads():
     "filename",
     [
         "sub/alpha.txt",  # a path, on any platform
-        "sub\\alpha.txt",  # a path, on Windows
+        "sub\\alpha.txt",  # a path on Windows, refused on every platform
         "https://example.com/page",  # a URL is not a corpus file
     ],
 )

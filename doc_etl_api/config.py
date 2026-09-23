@@ -264,11 +264,13 @@ class Settings(BaseSettings):
 
         Two shapes are refused because neither can do what it says. A key naming
         a path can never match, since the corpus directory is scanned without
-        recursing and an entry matches a file by its filename alone. An entry
-        naming no collection would store a source that every filtered search is
-        blind to, which is the opposite of what an entry is for -- so it is read
-        as a mistake rather than as a request to tag nothing, and to tag nothing
-        an operator writes no entry and configures no corpus collections.
+        recursing and an entry matches a file by its filename alone. Both
+        separators are refused on every platform, so the setting means the same
+        thing wherever the service runs. An entry naming no collection would
+        store a source that every filtered search is blind to, which is the
+        opposite of what an entry is for -- so it is read as a mistake rather
+        than as a request to tag nothing, and to tag nothing an operator writes
+        no entry and configures no corpus collections.
 
         The keys are kept verbatim: a filename is a literal, not a value with
         padding to forgive. The collections are normalized exactly as an
@@ -281,7 +283,13 @@ class Settings(BaseSettings):
                     "Invalid corpus file collection entry: the filename is empty. An "
                     "entry names a file in the corpus directory."
                 )
-            if Path(filename).name != filename:
+            # Both separators, on every platform. `pathlib` reads a backslash as
+            # a separator only on Windows, so testing the name with it would let
+            # a name through here that Windows reads as a path -- the same
+            # setting validating differently depending on where it runs, which
+            # is how an entry that fails on a developer's machine reaches a
+            # Linux deployment, or the reverse.
+            if "/" in filename or "\\" in filename:
                 raise ValueError(
                     f"Invalid corpus file collection entry: {filename!r} names a path. "
                     "The corpus directory is scanned without recursing, so an entry "
