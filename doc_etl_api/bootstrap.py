@@ -5,8 +5,11 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from doc_etl_api.pipeline import content_hash
 
 if TYPE_CHECKING:
     from doc_etl_api.config import Settings
@@ -76,6 +79,13 @@ def ingest_corpus(
     Reuses the ordinary ingestion path so the corpus goes through the same
     parse/chunk/embed/index stages as an uploaded file, and a source that fails
     does not abort the rest of the corpus.
+
+    Each source is compared with what the index already holds before it is
+    ingested, so a restart over a durable backend spends its time on the corpus
+    that changed rather than on the whole corpus again. The comparison is on a
+    digest of the source's own bytes -- for a file, the bytes on disk; for a URL,
+    the body that came back -- which is the one thing that can be taken before
+    the parse the comparison exists to avoid.
     """
     corpus_path = app_settings.knowledge_corpus_path
     corpus_urls = app_settings.knowledge_corpus_url_list
@@ -104,19 +114,30 @@ def ingest_corpus(
     )
 
     ingested: set[str] = set()
+    unchanged: list[str] = []
+
+    def skip(label: str) -> None:
+        """Note a source the index already holds, which needs no work from here."""
+        unchanged.append(label)
+        logger.info("Knowledge bootstrap skipped source=%s reason=unchanged", label)
 
     for path in files:
         ingested.add(path.name)
         file_tag = file_collections.get(path.name, collections)
 
         def ingest_file(target: Path = path, tag: list[str] = file_tag) -> None:
-            with target.open("rb") as handle:
-                pipeline.ingest_file(
-                    source_id=str(uuid.uuid4()),
-                    file=handle,
-                    filename=target.name,
-                    collections=tag,
-                )
+            # Read whole before deciding, and read only: nothing is parsed,
+            # chunked or embedded for a file the index holds as it now stands.
+            payload = target.read_bytes()
+            if pipeline.is_current(target.name, content_hash(payload), tag):
+                skip(target.name)
+                return
+            pipeline.ingest_file(
+                source_id=str(uuid.uuid4()),
+                file=BytesIO(payload),
+                filename=target.name,
+                collections=tag,
+            )
 
         _ingest_one(state, str(path), ingest_file)
 
@@ -134,17 +155,30 @@ def ingest_corpus(
         )
 
     for url in corpus_urls:
-        _ingest_one(
-            state,
-            url,
-            lambda target=url: pipeline.ingest_url(
-                source_id=str(uuid.uuid4()), url=target, collections=collections
-            ),
-        )
+
+        def ingest_url(target: str = url) -> None:
+            # Fetched, because a page's content cannot be known without asking
+            # for it, then compared before anything parses it. The fetch is the
+            # cost this cannot avoid; the conversion is the cost it saves.
+            body, final_url = pipeline.fetch_page(target)
+            if pipeline.is_current(final_url, content_hash(body), collections):
+                skip(target)
+                return
+            pipeline.ingest_page(
+                source_id=str(uuid.uuid4()),
+                url=target,
+                body=body,
+                final_url=final_url,
+                collections=collections,
+            )
+
+        _ingest_one(state, url, ingest_url)
 
     state.status = BootstrapStatus.FAILED if state.failures else BootstrapStatus.COMPLETE
     logger.info(
-        "Knowledge bootstrap finished status=%s failures=%d",
+        "Knowledge bootstrap finished status=%s considered=%d unchanged=%d failures=%d",
         state.status.value,
+        len(files) + len(corpus_urls),
+        len(unchanged),
         len(state.failures),
     )

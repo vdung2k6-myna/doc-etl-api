@@ -5,8 +5,9 @@ from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 _LOG_LEVELS = tuple(
     logging.getLevelName(level)
@@ -84,6 +85,27 @@ OCR_LANGUAGE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 class VectorStoreBackend(str, Enum):
     SIMPLE = "simple"
+    POSTGRES = "postgres"
+
+
+# The durable backend's settings that have no default: a deployment that selects
+# it states where its database is. Collected here so one error can name all of
+# the settings that are missing, instead of the operator restarting once per
+# setting to discover the next one.
+REQUIRED_POSTGRES_SETTINGS = (
+    "postgres_host",
+    "postgres_database",
+    "postgres_user",
+    "postgres_password",
+)
+
+# The table name reaches statements as an identifier -- the store's own tables
+# are named after it -- so it is validated rather than escaped: a value that is
+# not an identifier cannot be made into one here. Lowercase only, because
+# Postgres folds an unquoted identifier to lowercase, so `DocIndex` and
+# `docindex` would name the same table while the settings read back as if they
+# did not.
+POSTGRES_IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 # The file settings are read from. A test session sets ``DOC_ETL_API_ENV_FILE``
@@ -109,6 +131,18 @@ class Settings(BaseSettings):
 
     vector_store_backend: VectorStoreBackend = Field(default=VectorStoreBackend.SIMPLE)
     embedding_model: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
+    # Where the durable backend's database is. Read only when that backend is
+    # selected, so a deployment on the default backend can carry a stale or
+    # half-written set of these without failing to start. Host, database, user
+    # and password are required together and have no default; the port and the
+    # table name do, because 5432 is where a Postgres reached over TCP usually
+    # is and the table belongs to this service alone.
+    postgres_host: str = Field(default="")
+    postgres_port: int = Field(default=5432, gt=0, lt=65536)
+    postgres_database: str = Field(default="")
+    postgres_user: str = Field(default="")
+    postgres_password: str = Field(default="")
+    postgres_table_name: str = Field(default="doc_etl_api_index")
     # Unset means "follow the embedding model's input limit"; see IndexPipeline,
     # which resolves the default against the model it is constructed with.
     chunk_size: int | None = Field(default=None, gt=0)
@@ -174,6 +208,34 @@ class Settings(BaseSettings):
         ]
 
     @property
+    def postgres_connection_url(self) -> URL:
+        """The URL the durable backend connects with, built from the settings.
+
+        Built rather than assembled by hand so a password containing a character
+        that means something in a URL -- `@`, `:`, `/` -- is escaped here instead
+        of being read as part of the address. The default rendering of this URL
+        hides the password, which is what an error message should show.
+        """
+        return URL.create(
+            drivername="postgresql+psycopg2",
+            username=self.postgres_user,
+            password=self.postgres_password,
+            host=self.postgres_host,
+            port=self.postgres_port,
+            database=self.postgres_database,
+        )
+
+    @property
+    def postgres_address(self) -> str:
+        """Where the durable backend's database is, for an error message.
+
+        Names the host, port and database but never the user or the password: an
+        error is written to a log, and which database is unreachable is the part
+        an operator acts on.
+        """
+        return f"{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
+
+    @property
     def resolved_user_agent(self) -> str:
         """The user agent to send, falling back to the default when unset.
 
@@ -183,6 +245,47 @@ class Settings(BaseSettings):
         reproduce the failure this setting exists to avoid.
         """
         return self.user_agent.strip() or DEFAULT_USER_AGENT
+
+    @model_validator(mode="after")
+    def _validate_postgres_settings(self) -> "Settings":
+        """Check the durable backend's settings when, and only when, it is selected.
+
+        A partial set is refused here, as the settings are built, rather than
+        where the connection is attempted: the service reads this configuration
+        once, and a missing setting found at startup names itself in one message
+        that an operator can act on. Found later, it fails per request against a
+        store that was never there.
+
+        The check is conditional because these settings belong to one backend. A
+        deployment on the default backend is not required to carry them, and one
+        that carries a half-filled set while pointing at the default backend
+        starts: the settings it is not using cannot mislead it. That also keeps
+        switching backends a one-setting change, rather than one that first
+        requires clearing out the other backend's leftovers.
+
+        The table name is checked here too, for the same reason: it is spliced
+        into statements as an identifier, so a value that is not one is refused
+        before it can reach a query.
+        """
+        if self.vector_store_backend is not VectorStoreBackend.POSTGRES:
+            return self
+        missing = [
+            name.upper() for name in REQUIRED_POSTGRES_SETTINGS if not getattr(self, name).strip()
+        ]
+        if missing:
+            raise ValueError(
+                "Vector store backend 'postgres' needs POSTGRES_HOST, "
+                "POSTGRES_DATABASE, POSTGRES_USER and POSTGRES_PASSWORD. Missing: "
+                f"{', '.join(missing)}. POSTGRES_PORT and POSTGRES_TABLE_NAME have "
+                "defaults."
+            )
+        if not POSTGRES_IDENTIFIER_PATTERN.match(self.postgres_table_name):
+            raise ValueError(
+                f"Invalid POSTGRES_TABLE_NAME: {self.postgres_table_name!r}. The "
+                "table name is used as an SQL identifier, so it uses lowercase "
+                "letters, digits and underscores and does not start with a digit."
+            )
+        return self
 
     @field_validator("log_level", mode="before")
     @classmethod

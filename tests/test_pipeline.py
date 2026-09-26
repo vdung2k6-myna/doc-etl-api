@@ -1,9 +1,11 @@
 import hashlib
+import importlib.util
 import logging
 import re
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,15 +22,19 @@ from llama_index.core import Settings as LlamaSettings
 from llama_index.core.embeddings import MockEmbedding
 from llama_index.core.schema import MetadataMode, TextNode
 
-from doc_etl_api.config import DEFAULT_USER_AGENT, Settings
+from doc_etl_api.config import DEFAULT_USER_AGENT, Settings, VectorStoreBackend
 from doc_etl_api.pipeline import (
+    _STORE_BUILDERS,
     DoclingConverter,
     IndexPipeline,
     _content_token_ids,
     _node_id,
     _split_oversized_text,
     _split_sections,
+    content_hash,
+    create_pipeline,
 )
+from doc_etl_api.store import InProcessIndexStore, SourceRecord
 from tests.stubs import (
     EMBEDDING_MAX_TOKENS,
     EMBEDDING_MODEL_NAME,
@@ -103,6 +109,27 @@ def _stub_pipeline(chunk_size=None, chunk_overlap=10, embedding_model=None, min_
     )
 
 
+def stub_page(
+    converter,
+    markdown: str,
+    *,
+    url: str = "https://example.com/final",
+    body: bytes | None = None,
+) -> None:
+    """Stub both halves of ingesting a page: the fetch, then the conversion.
+
+    The pair rather than one call, because the pipeline digests what the fetch
+    returned before it converts anything. A test that stubbed only the conversion
+    would leave the fetch answering with a bare `MagicMock`, which is not bytes
+    and has no digest.
+    """
+    converter.fetch_page.return_value = (
+        body or f"<html><body>{markdown}</body></html>".encode(),
+        url,
+    )
+    converter.convert_page.return_value = markdown
+
+
 @pytest.fixture
 def settings():
     # Chunk sizes are stated explicitly here: IndexPipeline derives its default
@@ -151,6 +178,24 @@ def test_the_configured_languages_are_the_ones_used(monkeypatch):
     options = _pdf_options(DoclingConverter())
 
     assert options.ocr_options.lang == ["en", "vi"]
+
+
+def test_the_configured_ocr_engine_is_installed():
+    """The declared dependencies must include the engine the pipeline names.
+
+    `easyocr` reaches Docling only through Docling's own `easyocr` extra, so a
+    declaration that omits it installs an environment where every PDF fails as
+    the pipeline is built -- `do_ocr` defaults true, so the OCR model is
+    constructed whether or not the document needs OCR. The suite runs in the
+    environment the project declares, which is what makes this the place the
+    omission surfaces rather than the first scanned PDF of a deployment.
+    """
+    engine = _pdf_options(DoclingConverter()).ocr_options.kind
+
+    assert importlib.util.find_spec(engine) is not None, (
+        f"the configured OCR engine {engine!r} is not importable in this "
+        f"environment, so every PDF ingestion would fail when the pipeline is built"
+    )
 
 
 def test_an_injected_converter_is_used_unchanged():
@@ -225,6 +270,7 @@ def test_docling_converter_url(settings, tmp_path):
             content=html,
             raise_for_status=MagicMock(),
         )
+        body, final_url = converter.fetch_page("https://example.com/page")
         with patch.object(
             converter._converter,
             "convert",
@@ -233,7 +279,7 @@ def test_docling_converter_url(settings, tmp_path):
                 document=MagicMock(export_to_markdown=lambda: "# Title\n\nBody text."),
             ),
         ):
-            markdown, final_url = converter.convert_url("https://example.com/page")
+            markdown = converter.convert_page(body, final_url)
 
     assert "# Title" in markdown
     assert final_url == "https://example.com/page"
@@ -257,16 +303,24 @@ _URL_PAGE = (
 )
 
 
-def fetch(converter, *, url: str = "https://example.com/page", html: str = _URL_PAGE):
-    """Convert *html* through `convert_url`, standing in for the HTTP fetch."""
+def fetch(
+    converter, *, url: str = "https://example.com/page", html: str = _URL_PAGE
+) -> tuple[str, str]:
+    """Fetch and convert *html*, standing in for the HTTP request.
+
+    Both halves the pipeline runs, in the order it runs them: the request that
+    returns the page's bytes and where it landed, then the conversion that
+    turns those bytes into markdown.
+    """
     with patch("doc_etl_api.pipeline.requests.get") as mock_get:
         mock_get.return_value = MagicMock(
             url=url, content=html.encode(), raise_for_status=MagicMock()
         )
-        return converter.convert_url("https://example.com/start")
+        body, final_url = converter.fetch_page("https://example.com/start")
+    return converter.convert_page(body, final_url), final_url
 
 
-def test_convert_url_indexes_only_the_main_content() -> None:
+def test_convert_page_indexes_only_the_main_content() -> None:
     markdown, final_url = fetch(DoclingConverter())
 
     assert final_url == "https://example.com/page"
@@ -344,12 +398,12 @@ def test_the_fetch_never_sends_the_http_library_default() -> None:
         assert sent == expected
 
 
-def test_convert_url_excludes_navigation_that_carries_a_heading() -> None:
+def test_convert_page_excludes_navigation_that_carries_a_heading() -> None:
     """Regression: a heading inside the navigation used to defeat extraction.
 
     Docling's boilerplate heuristic labels everything before the first heading as
     furniture, so a heading anywhere in the page chrome flips the whole document
-    to body content. Measured against the pre-change `convert_url`, this page
+    to body content. Measured against the pre-change conversion, this page
     reached the markdown with its navigation and promotional banner intact; both
     assertions below failed.
     """
@@ -359,7 +413,7 @@ def test_convert_url_excludes_navigation_that_carries_a_heading() -> None:
     assert "Buy now" not in markdown, "a heading in the chrome defeated extraction"
 
 
-def test_convert_url_markdown_links_are_urls() -> None:
+def test_convert_page_markdown_links_are_urls() -> None:
     """Asserted platform-independently: the leak is `\\pricing` on Windows and
     `/pricing` elsewhere, and only the first looks obviously wrong.
     """
@@ -371,7 +425,7 @@ def test_convert_url_markdown_links_are_urls() -> None:
         assert target.startswith(("http://", "https://")), f"link target is not a URL: {target}"
 
 
-def test_convert_url_resolves_relative_links_against_the_final_url() -> None:
+def test_convert_page_resolves_relative_links_against_the_final_url() -> None:
     """A root-relative href must reach the markdown as an absolute URL.
 
     The page redirects, and the link is resolved against where it landed rather
@@ -419,20 +473,26 @@ def test_index_pipeline_ingest_url(settings):
 
     with patch.object(
         pipeline.converter,
-        "convert_url",
-        return_value=("# Page\n\nContent from URL.", "https://example.com/final"),
+        "fetch_page",
+        return_value=(b"<html><body>Content from URL.</body></html>", "https://example.com/final"),
     ):
-        with patch.object(pipeline._index, "insert_nodes") as mock_insert:
-            result, timings = pipeline.ingest_url(
-                source_id=source_id,
-                url="https://example.com/page",
-            )
+        with patch.object(
+            pipeline.converter,
+            "convert_page",
+            return_value="# Page\n\nContent from URL.",
+        ):
+            with patch.object(pipeline._index, "insert_nodes") as mock_insert:
+                result, timings = pipeline.ingest_url(
+                    source_id=source_id,
+                    url="https://example.com/page",
+                )
 
     assert result["source_id"] == source_id
     assert result["source_type"] == "url"
     assert result["name"] == "https://example.com/page"
     assert result["final_url"] == "https://example.com/final"
     assert result["status"] == "indexed"
+    assert "fetch_ms" in timings
     assert "parse_ms" in timings
     assert "chunk_ms" in timings
     assert "embed_ms" in timings
@@ -634,7 +694,7 @@ def test_per_source_log_line_carries_the_chunking_outcome(caplog):
     """A sizing mismatch must be visible in the logs without polling the API."""
     pipeline = _stub_pipeline(chunk_size=64, chunk_overlap=8)
     pipeline.converter.convert_file.return_value = SENTENCE_DOC
-    pipeline.converter.convert_url.return_value = (SENTENCE_DOC, "https://example.com/final")
+    stub_page(pipeline.converter, SENTENCE_DOC)
 
     with caplog.at_level(logging.INFO):
         file_result, _ = pipeline.ingest_file(
@@ -771,9 +831,8 @@ def test_urls_landing_on_one_page_share_a_document_identity(searchable_pipeline)
 
     Two different request URLs that redirect to one page are one source.
     """
-    searchable_pipeline.converter.convert_url.return_value = (
-        "# Page\n\nSome content.",
-        "https://example.com/final",
+    stub_page(
+        searchable_pipeline.converter, "# Page\n\nSome content.", url="https://example.com/final"
     )
 
     for submitted in ("https://example.com/a", "https://example.com/b"):
@@ -800,9 +859,8 @@ def test_a_redirected_url_is_addressed_by_where_it_landed(searchable_pipeline):
     that was submitted. Both are reported, so a caller can display the page it
     asked for and fetch the content it landed on.
     """
-    searchable_pipeline.converter.convert_url.return_value = (
-        "# Page\n\nSome content.",
-        "https://example.com/final",
+    stub_page(
+        searchable_pipeline.converter, "# Page\n\nSome content.", url="https://example.com/final"
     )
 
     searchable_pipeline.ingest_url(source_id="source-1", url="https://example.com/submitted")
@@ -830,9 +888,8 @@ def test_a_urls_chunks_carry_the_address_it_landed_on(searchable_pipeline):
     the address, and a URL that redirected would otherwise hand it the URL that
     was submitted -- which is not what the source is stored under.
     """
-    searchable_pipeline.converter.convert_url.return_value = (
-        "# Page\n\nSome content.",
-        "https://example.com/final",
+    stub_page(
+        searchable_pipeline.converter, "# Page\n\nSome content.", url="https://example.com/final"
     )
 
     searchable_pipeline.ingest_url(source_id="source-1", url="https://example.com/submitted")
@@ -2108,7 +2165,7 @@ def test_re_uploading_a_document_replaces_its_collections(settings):
 def test_collections_reach_a_source_whose_url_redirected(settings):
     """A page is identified by where it landed; its collections follow it there."""
     pipeline = _collections_pipeline(settings)
-    pipeline.converter.convert_url.return_value = (SENTENCE_DOC, "https://example.com/final")
+    stub_page(pipeline.converter, SENTENCE_DOC, url="https://example.com/final")
 
     result, _ = pipeline.ingest_url(
         source_id="source", url="https://example.com/start", collections=["csharp"]
@@ -2416,7 +2473,7 @@ def test_a_scoped_search_returns_neighbours_only_from_its_scope(settings):
 def test_the_source_record_describes_what_was_ingested(settings):
     pipeline = _collections_pipeline(settings)
     pipeline.converter.convert_file.return_value = SENTENCE_DOC
-    pipeline.converter.convert_url.return_value = (PLAIN_DOC, "https://example.com/final")
+    stub_page(pipeline.converter, PLAIN_DOC, url="https://example.com/final")
 
     pipeline.ingest_file(
         source_id="file-source",
@@ -2482,11 +2539,16 @@ def test_the_catalog_a_reader_holds_cannot_change_underneath_it(settings):
 
 
 def _recorded_positions(pipeline: IndexPipeline) -> dict[str, int]:
-    """Every node id the pipeline recorded a position for, and that position."""
+    """Every node id the store recorded a position for, and that position.
+
+    Read from the store rather than from a snapshot the pipeline publishes: the
+    published catalog carries the sources, and this is the other half of what the
+    store holds about them.
+    """
     return {
         node_id: position
-        for positions in pipeline._source_positions.values()
-        for node_id, position in positions.items()
+        for record in pipeline.source_catalog
+        for node_id, position in pipeline._store.positions(record.address).items()
     }
 
 
@@ -2692,9 +2754,10 @@ def test_a_tagged_sources_collections_reach_every_hit(searchable_pipeline, setti
 
 def test_a_url_hits_address_is_where_it_landed_not_what_was_submitted(searchable_pipeline):
     """The join a caller makes on `address` must find the source that stored it."""
-    searchable_pipeline.converter.convert_url.return_value = (
+    stub_page(
+        searchable_pipeline.converter,
         "# Page\n\nSome content about widgets.",
-        "https://example.com/final",
+        url="https://example.com/final",
     )
     searchable_pipeline.ingest_url(source_id="source-1", url="https://example.com/submitted")
 
@@ -2753,3 +2816,187 @@ def test_a_search_scans_the_index_once_and_never_reads_the_catalog(
     for result in results:
         assert result["address"] == "doc.txt"
         assert result["collections"] == []
+
+
+def test_the_default_backend_builds_the_in_process_store():
+    """The backend the settings name is the one whose store is built.
+
+    The store is what decides whether a restart starts from an empty index, so a
+    deployment on the in-memory backend has to get it: a store built for another
+    backend would either fail differently or, worse, keep the index somewhere the
+    deployment did not ask for. The durable member is covered where a database
+    is, in the tests that skip without one.
+    """
+    pipeline = create_pipeline(
+        Settings(
+            vector_store_backend="simple",
+            embedding_model=EMBEDDING_MODEL_NAME,
+            chunk_overlap=10,
+        ),
+        converter=MagicMock(),
+        embedding_model=StubEmbedding(embed_dim=8),
+    )
+
+    assert isinstance(pipeline._store, InProcessIndexStore)
+    assert pipeline._store.storage_context is None, "the in-memory store declares a context"
+    assert pipeline._store.store_nodes_override is False
+
+
+@pytest.mark.parametrize("backend", list(VectorStoreBackend))
+def test_a_backend_with_no_store_is_refused_by_name(backend, monkeypatch):
+    """A name the settings accept and no store answers fails startup, by name.
+
+    Building a different store instead is the quiet failure this guard is for: a
+    deployment that selected a durable backend and silently received the
+    in-memory one would lose its index on every restart while reporting itself
+    healthy. The postgres settings are named and never reached -- the refusal
+    happens before any store is built, which is the point.
+    """
+    monkeypatch.delitem(_STORE_BUILDERS, backend)
+
+    with pytest.raises(NotImplementedError, match=backend.value):
+        create_pipeline(
+            Settings(
+                vector_store_backend=backend.value,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                postgres_host="localhost",
+                postgres_database="doc_etl_api",
+                postgres_user="doc_etl_api",
+                postgres_password="never-reached",
+            ),
+            converter=MagicMock(),
+            embedding_model=StubEmbedding(embed_dim=8),
+        )
+
+
+# --- The digest recorded for a source ---------------------------------------
+#
+# What a source is, for the purpose of deciding whether the index already holds
+# it, is the bytes it was ingested from. These tests pin that down for both
+# ingestion paths: a digest over the bytes rather than over the markdown, stable
+# across a re-ingestion of identical bytes, different for edited ones.
+
+
+def _file_record(pipeline: IndexPipeline, name: str) -> SourceRecord:
+    return next(record for record in pipeline.source_catalog if record.address == name)
+
+
+def test_a_files_record_carries_the_digest_of_its_bytes(settings):
+    """The digest a file is recorded under is taken over the uploaded bytes.
+
+    Over the bytes and not the markdown, because the markdown is this pipeline's
+    reading of the file: startup compares digests to decide whether a corpus file
+    needs ingesting, and a digest of the markdown could only be taken after the
+    conversion the comparison exists to avoid.
+    """
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(source_id="one", file=BytesIO(b"the file"), filename="doc.txt")
+
+    assert _file_record(pipeline, "doc.txt").content_hash == content_hash(b"the file")
+
+
+def test_re_ingesting_the_same_bytes_keeps_the_digest(settings):
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(source_id="one", file=BytesIO(b"the file"), filename="doc.txt")
+    first = _file_record(pipeline, "doc.txt").content_hash
+    pipeline.ingest_file(source_id="two", file=BytesIO(b"the file"), filename="doc.txt")
+
+    assert _file_record(pipeline, "doc.txt").content_hash == first
+
+
+def test_re_ingesting_edited_bytes_changes_the_digest(settings):
+    """The change signal the bootstrap acts on: same name, different bytes."""
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+
+    pipeline.ingest_file(source_id="one", file=BytesIO(b"the file"), filename="doc.txt")
+    first = _file_record(pipeline, "doc.txt").content_hash
+    pipeline.ingest_file(source_id="two", file=BytesIO(b"the file, edited"), filename="doc.txt")
+
+    assert _file_record(pipeline, "doc.txt").content_hash != first
+
+
+def test_a_urls_record_carries_the_digest_of_the_page_it_fetched(settings):
+    pipeline = _stub_pipeline()
+    body = b"<html><body><h1>Page</h1></body></html>"
+    stub_page(pipeline.converter, SENTENCE_DOC, url="https://example.com/final", body=body)
+
+    pipeline.ingest_url(source_id="one", url="https://example.com/start")
+
+    recorded = _file_record(pipeline, "https://example.com/final")
+    assert recorded.content_hash == content_hash(body)
+
+
+def test_the_digest_of_a_page_that_changed_changes_with_it(settings):
+    """Two fetches of one address: the same page is one digest, a new one is new."""
+    pipeline = _stub_pipeline()
+    stub_page(pipeline.converter, SENTENCE_DOC, url="https://example.com/final", body=b"first")
+    pipeline.ingest_url(source_id="one", url="https://example.com/start")
+    first = _file_record(pipeline, "https://example.com/final").content_hash
+
+    stub_page(pipeline.converter, PLAIN_DOC, url="https://example.com/final", body=b"second")
+    pipeline.ingest_url(source_id="two", url="https://example.com/start")
+
+    assert _file_record(pipeline, "https://example.com/final").content_hash != first
+
+
+def test_a_source_the_index_holds_unchanged_is_current(settings):
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(source_id="one", file=BytesIO(b"the file"), filename="doc.txt")
+
+    assert pipeline.is_current("doc.txt", content_hash(b"the file"), [])
+
+
+def test_a_source_holding_other_content_is_not_current(settings):
+    """The digest decides, not the address: an edited file is not current."""
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(source_id="one", file=BytesIO(b"the file"), filename="doc.txt")
+
+    assert not pipeline.is_current("doc.txt", content_hash(b"the file, edited"), [])
+
+
+def test_a_source_offered_different_collections_is_not_current(settings):
+    """Unchanged content is not the whole question: collections are held too.
+
+    They are written with a source's nodes, which is how a filtered search
+    reaches it, so a source the index holds under one collection is not the
+    source a configuration now asks for under another.
+    """
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(
+        source_id="one", file=BytesIO(b"the file"), filename="doc.txt", collections=["csharp"]
+    )
+
+    assert pipeline.is_current("doc.txt", content_hash(b"the file"), ["csharp"])
+    assert not pipeline.is_current("doc.txt", content_hash(b"the file"), ["dotnet"])
+    assert not pipeline.is_current("doc.txt", content_hash(b"the file"), [])
+
+
+def test_a_source_the_index_does_not_hold_is_not_current(settings):
+    pipeline = _stub_pipeline()
+
+    assert not pipeline.is_current("never-ingested.txt", content_hash(b"anything"), [])
+
+
+def test_a_record_with_no_digest_is_not_current(settings):
+    """A digest that was never recorded says nothing, and nothing is not a match.
+
+    A store written before digests were recorded holds sources whose content is
+    unknown, and treating unknown as unchanged would freeze them at whatever they
+    said when digests began -- the silent staleness this comparison exists to
+    prevent. So they are ingested again, once, and carry a digest from then on.
+    """
+    pipeline = _stub_pipeline()
+    pipeline.converter.convert_file.return_value = SENTENCE_DOC
+    pipeline.ingest_file(source_id="one", file=BytesIO(b"the file"), filename="doc.txt")
+    record = _file_record(pipeline, "doc.txt")
+    pipeline._source_records["doc.txt"] = replace(record, content_hash=None)
+
+    assert not pipeline.is_current("doc.txt", content_hash(b"the file"), [])

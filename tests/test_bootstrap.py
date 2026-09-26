@@ -8,6 +8,7 @@ from doc_etl_api.bootstrap import BootstrapState, BootstrapStatus, corpus_files,
 from doc_etl_api.config import Settings
 from doc_etl_api.pipeline import IndexPipeline
 from tests.stubs import EMBEDDING_MODEL_NAME, StubEmbedding
+from tests.test_pipeline import stub_page
 
 
 @pytest.fixture
@@ -43,6 +44,9 @@ def test_bootstrap_disabled_when_no_corpus_configured():
 def test_bootstrap_ingests_every_file_and_url(corpus_dir):
     pipeline = MagicMock()
     pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    # An index that holds nothing: every configured source needs ingesting.
+    pipeline.is_current.return_value = False
+    pipeline.fetch_page.side_effect = lambda url, **kwargs: (b"<html>page</html>", url)
     state = BootstrapState()
     app_settings = Settings(
         knowledge_corpus_dir=str(corpus_dir),
@@ -57,7 +61,7 @@ def test_bootstrap_ingests_every_file_and_url(corpus_dir):
         "alpha.txt",
         "beta.txt",
     }
-    assert [c.kwargs["url"] for c in pipeline.ingest_url.call_args_list] == [
+    assert [c.kwargs["url"] for c in pipeline.ingest_page.call_args_list] == [
         "https://example.com/a",
         "https://example.com/b",
     ]
@@ -66,6 +70,8 @@ def test_bootstrap_ingests_every_file_and_url(corpus_dir):
 def test_bootstrap_isolates_a_failing_source(corpus_dir, caplog):
     pipeline = MagicMock()
     pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    pipeline.is_current.return_value = False
+    pipeline.fetch_page.side_effect = lambda url, **kwargs: (b"<html>page</html>", url)
 
     def ingest_file(source_id, file, filename, mime_type=None, collections=()):
         if filename == "beta.txt":
@@ -87,7 +93,7 @@ def test_bootstrap_isolates_a_failing_source(corpus_dir, caplog):
 
     # Every source was attempted, not just the ones before the failure.
     assert pipeline.ingest_file.call_count == 2
-    assert pipeline.ingest_url.call_count == 1
+    assert pipeline.ingest_page.call_count == 1
     assert state.status is BootstrapStatus.FAILED
     assert len(state.failures) == 1
     assert "beta.txt" in state.failures[0]
@@ -219,7 +225,7 @@ def test_corpus_file_and_a_later_upload_share_one_source(corpus_dir):
 
 def _corpus_settings(
     corpus_dir,
-    collections: str,
+    collections: str = "",
     urls: str = "",
     file_collections: dict[str, list[str]] | None = None,
 ) -> Settings:
@@ -241,7 +247,7 @@ def _tagged_pipeline(corpus_dir, **settings_kwargs) -> tuple[IndexPipeline, Sett
     pipeline = _corpus_pipeline(settings)
     pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
     pipeline.converter.convert_file.side_effect = lambda _file, name: f"Corpus file {name}."
-    pipeline.converter.convert_url.return_value = ("Corpus page body.", "https://example.com/page")
+    stub_page(pipeline.converter, "Corpus page body.", url="https://example.com/page")
     return pipeline, settings
 
 
@@ -271,7 +277,7 @@ def test_corpus_collections_tag_every_file_and_url(corpus_dir):
     pipeline = _corpus_pipeline(settings)
     pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
     pipeline.converter.convert_file.side_effect = lambda _file, name: f"Corpus file {name}."
-    pipeline.converter.convert_url.return_value = ("Corpus page body.", "https://example.com/page")
+    stub_page(pipeline.converter, "Corpus page body.", url="https://example.com/page")
     state = BootstrapState()
 
     ingest_corpus(pipeline, settings, state)
@@ -484,3 +490,131 @@ def test_a_corpus_source_is_fetchable_by_its_filename(tmp_path):
     assert body["name"] == "handbook.txt"
     assert body["chunks"], "the corpus source stored no chunks"
     assert "Grounding content" in body["chunks"][0]["text"]
+
+
+# --- A second startup over a corpus the index already holds -------------------
+
+
+def _recording_pipeline(corpus_dir, **settings_kwargs):
+    """A real pipeline whose converter reads the corpus and records every parse.
+
+    The conversion is the stage the digest comparison exists to skip, so it is
+    the call that has to be countable. It returns the file's own text -- not a
+    fixed string -- so an edited file is genuinely edited content.
+    """
+    settings = _corpus_settings(corpus_dir, **settings_kwargs)
+    pipeline = _corpus_pipeline(settings)
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    parsed: list[str] = []
+
+    def convert_file(file, name):
+        parsed.append(name)
+        return (corpus_dir / name).read_text()
+
+    pipeline.converter.convert_file.side_effect = convert_file
+    return pipeline, settings, parsed
+
+
+def test_the_second_startup_over_an_unchanged_corpus_parses_nothing(corpus_dir):
+    """A restart over an unchanged corpus does no conversion work at all.
+
+    Nothing else has to be established to know the corpus is still there: the
+    index was never emptied, so what the second startup skips is work rather than
+    content. Both halves are asserted, because a bootstrap that skipped the
+    corpus *and* lost it would satisfy the first assertion alone.
+    """
+    pipeline, settings, parsed = _recording_pipeline(corpus_dir)
+    ingest_corpus(pipeline, settings, BootstrapState())
+    assert parsed == ["alpha.txt", "beta.txt"], "the first startup did not load the corpus"
+
+    parsed.clear()
+    state = BootstrapState()
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert state.failures == []
+    assert parsed == [], "the second startup parsed an unchanged corpus again"
+    assert pipeline.indexed_sources == 2
+    assert pipeline.search("alpha", top_k=5), "the corpus is no longer searchable"
+
+
+def test_editing_one_corpus_file_re_ingests_that_file_alone(corpus_dir):
+    """One edited file is ingested again; its neighbours are left alone.
+
+    The corpus is a directory, so which of its files changed is not something a
+    whole-corpus decision could act on: re-ingesting everything would re-embed
+    documents nothing changed, and re-ingesting nothing would leave the index
+    answering from the superseded text.
+    """
+    pipeline, settings, parsed = _recording_pipeline(corpus_dir)
+    ingest_corpus(pipeline, settings, BootstrapState())
+
+    (corpus_dir / "alpha.txt").write_text("alpha, revised")
+    parsed.clear()
+    state = BootstrapState()
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert parsed == ["alpha.txt"], "a file whose bytes did not change was parsed again"
+    stored = _stored_texts(pipeline, "alpha.txt")
+    assert any("revised" in text for text in stored), "the index kept the old content"
+    assert not any(text.strip() == "alpha" for text in stored), (
+        "the superseded content is still stored"
+    )
+
+
+def test_a_corpus_file_tagged_differently_is_ingested_again(corpus_dir):
+    """A re-tagged file is not the source the index holds, so it is ingested.
+
+    Collections are part of what the index holds -- they are how a filtered
+    search reaches a source -- and they are written with its nodes. Skipping a
+    re-tagged file would leave the setting with nothing to apply, at every
+    restart, while the bootstrap reported a complete corpus.
+    """
+    pipeline, settings, parsed = _recording_pipeline(corpus_dir, collections="csharp")
+    ingest_corpus(pipeline, settings, BootstrapState())
+    assert _tags_by_name(pipeline) == {"alpha.txt": ("csharp",), "beta.txt": ("csharp",)}
+
+    parsed.clear()
+    retagged = _corpus_settings(corpus_dir, collections="dotnet")
+    ingest_corpus(pipeline, retagged, BootstrapState())
+
+    assert parsed == ["alpha.txt", "beta.txt"], "the new collections were never applied"
+    assert _tags_by_name(pipeline) == {"alpha.txt": ("dotnet",), "beta.txt": ("dotnet",)}
+
+
+def test_a_corpus_page_is_fetched_for_comparison_and_only_converted_when_changed(corpus_dir):
+    """A page is fetched every startup, and parsed only when it changed.
+
+    The fetch cannot be skipped -- whether a page changed is not knowable without
+    asking for it -- but the conversion can, and that is the expensive half of
+    the two. A page that did change is converted and replaces what the index held.
+    """
+    url = "https://example.com/page"
+    pipeline, settings, _ = _recording_pipeline(corpus_dir, urls=url)
+    page = {"body": b"<html><body>Corpus page body.</body></html>", "markdown": "Corpus page body."}
+    pipeline.converter.fetch_page.side_effect = lambda target, **kwargs: (page["body"], target)
+    pipeline.converter.convert_page.side_effect = lambda body, target: page["markdown"]
+
+    ingest_corpus(pipeline, settings, BootstrapState())
+    assert pipeline.converter.convert_page.call_count == 1
+
+    pipeline.converter.convert_page.reset_mock()
+    state = BootstrapState()
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert pipeline.converter.fetch_page.call_count == 2, "the page was never checked"
+    assert pipeline.converter.convert_page.call_count == 0, "an unchanged page was converted again"
+    assert any("Corpus page body." in text for text in _stored_texts(pipeline, url))
+
+    page["body"] = b"<html><body>Corpus page body, revised.</body></html>"
+    page["markdown"] = "Corpus page body, revised."
+    ingest_corpus(pipeline, settings, BootstrapState())
+
+    assert pipeline.converter.convert_page.call_count == 1, "the changed page was not converted"
+    stored = _stored_texts(pipeline, url)
+    assert any("revised" in text for text in stored), "the index kept the old page"
+    assert not any(text.strip() == "Corpus page body." for text in stored), (
+        "the superseded page is still stored"
+    )

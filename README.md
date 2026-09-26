@@ -194,12 +194,19 @@ it — OCR applies where there is no text to read — so a digital PDF is not
 re-typed by a recogniser. Only PDFs are affected; DOCX, HTML, XLSX and the other
 formats behave as they did.
 
-Recognition runs through EasyOCR, whose models are downloaded on first use and
-cached under `~/.EasyOCR/model` afterwards. Vietnamese rides the Latin
-recognition model, and that download is what makes the first scanned document of
-a deployment slower than the ones after it. A deployment without network access
-must pre-seed that directory, or the first scanned PDF it is sent will fail to
-read.
+Recognition runs through EasyOCR. The engine arrives with the project's declared
+dependencies — `docling` is installed with its `easyocr` extra — and declaring
+the extra rather than the package keeps the engine's version constrained to what
+Docling supports. Nothing Docling installs by default will substitute for it: an
+environment built without the extra still starts and still reports itself ready,
+then fails every PDF it is sent, because the OCR model is constructed as the PDF
+pipeline is built rather than only for the pages that need it.
+
+Its models are downloaded on first use and cached under `~/.EasyOCR/model`
+afterwards. Vietnamese rides the Latin recognition model, and that download is
+what makes the first scanned document of a deployment slower than the ones after
+it. A deployment without network access must pre-seed that directory, or the
+first scanned PDF it is sent will fail to read.
 
 ### Ingest URLs
 
@@ -561,7 +568,13 @@ All settings are loaded from environment variables or an `.env` file. Copy
 
 | Variable | Default | Description |
 |---|---|---|
-| `VECTOR_STORE_BACKEND` | `simple` | Vector store backend. Only `simple` is supported in this version. |
+| `VECTOR_STORE_BACKEND` | `simple` | Vector store backend. `simple` keeps the index in this process, so a restart starts from an empty one; `postgres` keeps it in a Postgres database, so it survives one. See [Vector store backends](#vector-store-backends) for what each stores and what the durable backend refuses to start without. |
+| `POSTGRES_HOST` | *(empty)* | Host of the durable backend's database. Required, with the next three, when `VECTOR_STORE_BACKEND` is `postgres`; a missing one stops the service at startup and names itself. Ignored on the default backend. |
+| `POSTGRES_PORT` | `5432` | Port of that database, and the port `docker compose --profile postgres up` publishes. |
+| `POSTGRES_DATABASE` | *(empty)* | Database name. Required by the durable backend. |
+| `POSTGRES_USER` | *(empty)* | User the service connects as. Required by the durable backend. Under `docker compose` this is the container's superuser, which is what lets the store create the `vector` extension. |
+| `POSTGRES_PASSWORD` | *(empty)* | That user's password. Required by the durable backend. Special characters are escaped when the connection URL is built, so a password containing `@`, `:` or `/` needs no quoting. |
+| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, and this service's own catalog. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Hugging Face embedding model name. |
 | `CHUNK_SIZE` | the embedding model's input limit | Bounds a node rather than placing its boundary, in the embedding model's tokens, special tokens included. A node's boundaries are the document's own — a heading opens a section, a paragraph break ends a unit — and a unit that fits is stored as itself; only a unit wider than this is divided further, at sentence boundaries, or at row boundaries with the header repeated if it is a table. Unset derives it from the model (256 for the default model), so it tracks the model rather than going stale against it; an explicit value larger than the model's limit is rejected at startup, because such chunks would be truncated before they were embedded. Measured on the corpus this was tuned on, it is a bound rather than a lever: lowering it from 8,192 to 512 moved the node count only from 386 to 404, because all but 10 of the 577 units were already smaller than 512. Set it only to go smaller. |
 | `CHUNK_OVERLAP` | `50` | Overlap, in the same tokens as `CHUNK_SIZE`, applied only where a unit had to be divided at sentence boundaries — the one case where no boundary of the document's own was left to divide on. A node separated from its neighbour at a heading or paragraph boundary therefore repeats nothing: the seam is where the source changed subject, and repeating text across it would store the same text twice. Overlap is quantized to whole sentences, so the achieved overlap can be lower than this, and is zero when a single sentence exceeds the budget. |
@@ -577,6 +590,87 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `KNOWLEDGE_CORPUS_FILE_COLLECTIONS` | *(empty)* | Per-file collections for the startup corpus, as a JSON object mapping a filename to a list of collections — `{"101-Truyen-Cuoi-Dan-Gian-Viet-Nam.txt": ["truyen-cuoi"]}`. An entry replaces `KNOWLEDGE_CORPUS_COLLECTIONS` for the file it names instead of adding to it, which is what lets one corpus directory hold documents belonging to different collections; every other file, and every corpus URL, keeps the corpus collections. An entry naming a file the corpus does not ingest — absent, or of an unsupported type — is reported as a bootstrap failure, because a filename typo would otherwise tag nothing and say nothing. An entry naming no collection is rejected as the settings are built, since a source in no collection matches no filter; so is a key naming a path, since the scan does not recurse and an entry matches a file by its filename alone. |
 | `LOG_LEVEL` | `INFO` | Level for application logs. Search timings and bootstrap progress are logged at `INFO`, so raising this to `WARNING` hides them. |
 | `DOC_ETL_API_ENV_FILE` | `.env` | Which environment file to read — not a setting, and it cannot be set inside one. It is taken from the process environment before any setting is read, because it decides whether a file is read at all, so a value written into `.env` would never be seen. An empty value disables the file entirely: a `Settings()` built with no arguments then falls back to the code defaults instead of the developer's `.env`. That is what `tests/conftest.py` does, so a test session asserts the defaults rather than whatever corpus the developer has configured. Leave it unset to run the service. |
+
+## Vector store backends
+
+`VECTOR_STORE_BACKEND` selects where the index lives.
+
+| Backend | The index lives | After a restart |
+|---|---|---|
+| `simple` (default) | In this process | It starts empty; the startup corpus is what refills it |
+| `postgres` | A Postgres database | It is still there — sources, chunk text, vectors and collections |
+
+### The durable backend
+
+It needs a database with the `vector` extension (pgvector) available. The image
+in `docker-compose.yml` carries it:
+
+```bash
+docker compose --profile postgres up -d
+```
+
+`docker compose` reads the same `.env` the service does, so the container is
+created with the database, user and password configured there; `POSTGRES_PORT`
+is the port it publishes, which is the port the service connects to. Then point
+the service at it:
+
+```bash
+VECTOR_STORE_BACKEND=postgres python -m doc_etl_api.main
+```
+
+Three things live in that database, and it is three because a durable index is
+not one table:
+
+- **The vectors** — held by pgvector, compared by search.
+- **Each chunk's text and metadata** — held by the docstore, in the same
+  database, so a hit and the text it points at cannot disagree after a restart.
+  Wiring only the vector store would give a half-durable service: search would
+  return hits, and the content endpoint that shows what they say would find
+  nothing to show. pgvector's table carries each chunk's text too, beside its
+  vector, so the text is stored twice — once for search, once for everything
+  that reads content or a hit's neighbours. Both writes are kept on for the
+  durable backend deliberately, and they are two statements rather than one
+  transaction: a chunk costs its text twice over.
+- **This service's own catalog** — the sources, the chunk position of each node
+  for reading order and for neighbours, and the embedding model the collection
+  was built with.
+
+At startup the service connects, enables the extension, creates what is missing
+and validates what it found. It stops rather than serve from a store it cannot
+trust:
+
+- **The database is unreachable** — startup stops, naming the configured backend
+  and the host, port and database it could not reach, never the password.
+- **The `vector` extension is not available** — startup stops, naming the
+  extension. Nothing falls back to `simple`: a deployment that asked for durable
+  storage and silently got an empty in-process one would look like data loss.
+- **The tables were built by a different embedding model, or hold vectors of a
+  different width** — startup stops, naming the model recorded in the database
+  and the one just configured. Two models' vectors live in different spaces, so
+  searching one with the other's query returns confident nonsense rather than an
+  error. Point `POSTGRES_TABLE_NAME` at a fresh name to build a second,
+  independent collection instead.
+
+### The startup corpus, on a durable backend
+
+The corpus is verified rather than re-ingested. Each source records the SHA-256
+of the bytes it was ingested from — the uploaded file's bytes, or the body the
+URL served — and the bootstrap ingests only sources it does not hold or holds
+differently. A corpus that has not changed is therefore neither parsed nor
+embedded again at the second startup, which is what makes a durable backend
+worth its startup cost: without this, the service would parse and embed the same
+documents into a database that already had them, every time it started.
+
+Editing one corpus file re-ingests that file and leaves the rest alone, and so
+does editing what a corpus URL serves — the page is fetched once and compared,
+and converted only when it differs. A source whose collections changed is
+re-ingested as well, so re-tagging a corpus takes effect without waiting for its
+content to change. A URL that cannot be fetched is still reported as a bootstrap
+failure, per source, exactly as before.
+
+Ingesting by hand is unaffected: `POST /sources/files` and `POST /sources/urls`
+always re-ingest, whether or not the content changed. The comparison belongs to
+the startup corpus.
 
 ## Performance notes
 

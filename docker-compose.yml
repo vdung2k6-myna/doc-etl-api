@@ -1,5 +1,6 @@
-# Optional vector store services for future backend support.
-# The default in-memory backend requires no external services.
+# Optional vector store services. The default backend is in-memory and needs none
+# of these; each service is behind a profile so a plain `docker compose up` starts
+# nothing. See "Vector store backends" in the README.
 
 services:
   qdrant:
@@ -11,5 +12,32 @@ services:
     profiles:
       - qdrant
 
+  postgres:
+    # The database behind VECTOR_STORE_BACKEND=postgres. This image carries the
+    # `vector` extension, which the store enables on startup.
+    image: pgvector/pgvector:pg17
+    environment:
+      # Interpolated from the same names the service reads, so a `.env` next to
+      # this file configures the container and the app together.
+      POSTGRES_DB: ${POSTGRES_DATABASE:-doc_etl_api}
+      POSTGRES_USER: ${POSTGRES_USER:-doc_etl_api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-doc_etl_api}
+    ports:
+      # Host:container. Override POSTGRES_PORT if 5432 is taken, and set the same
+      # value for the service so it connects to the port this one publishes.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-doc_etl_api} -d ${POSTGRES_DATABASE:-doc_etl_api}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles:
+      - postgres
+
 volumes:
   qdrant_storage:
+  postgres_data:

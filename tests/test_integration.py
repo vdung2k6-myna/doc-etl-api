@@ -22,17 +22,17 @@ def _stub_converter(convert=None):
     if convert is not None:
         converter.convert_file.side_effect = convert
 
-    # A bare MagicMock iterates to nothing, so an unstubbed `convert_url` would
+    # A bare MagicMock iterates to nothing, so an unstubbed `fetch_page` would
     # surface as "not enough values to unpack (expected 2, got 0)" when
-    # `ingest_url` unpacks its result -- a mock artifact that reads like a
-    # parsing bug and hides its own cause. Fail with the reason instead.
+    # `ingest_url` unpacks what the fetch returned -- a mock artifact that reads
+    # like a parsing bug and hides its own cause. Fail with the reason instead.
     def unexpected_url(url, **kwargs):
         raise AssertionError(
-            f"convert_url({url!r}) was called, but this test does not stub URL "
+            f"fetch_page({url!r}) was called, but this test does not stub URL "
             "ingestion -- a corpus URL probably reached the settings"
         )
 
-    converter.convert_url.side_effect = unexpected_url
+    converter.fetch_page.side_effect = unexpected_url
     return converter
 
 

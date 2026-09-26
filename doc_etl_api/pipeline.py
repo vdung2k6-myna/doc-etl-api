@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO
 
@@ -25,6 +26,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from doc_etl_api.config import DEFAULT_USER_AGENT, Settings, VectorStoreBackend, settings
 from doc_etl_api.extraction import select_main_content
+from doc_etl_api.store import IndexStore, InProcessIndexStore, PostgresIndexStore, SourceRecord
 
 logger = logging.getLogger(__name__)
 
@@ -64,26 +66,6 @@ _MODEL_EXCLUDED_KEYS = [COLLECTIONS_KEY, ADDRESS_KEY]
 
 
 @dataclass(frozen=True)
-class SourceRecord:
-    """What a source is, as the catalog reports it.
-
-    ``name`` and ``address`` are two different things, and for a URL that
-    redirected they differ. The name is what the source was submitted as -- the
-    filename an upload carried, the URL a caller sent -- and it is what the
-    catalog displays. The address is what the index stores the source under and
-    therefore the only thing that finds one again: a filename, or the final URL a
-    submitted URL landed on. Both are reported so a caller can display a source
-    and fetch it without one of those needing to be derived from the other.
-    """
-
-    name: str
-    address: str
-    source_type: str
-    collections: tuple[str, ...]
-    chunk_count: int
-
-
-@dataclass(frozen=True)
 class _Adjacency:
     """Where a hit sits inside its source, and what context surrounds it.
 
@@ -113,6 +95,23 @@ def _node_id(source_key: str, position: int) -> str:
     the id to the source keeps one source's edit from reaching another's content.
     """
     return hashlib.sha256(f"{source_key}\x00{position}".encode()).hexdigest()
+
+
+def content_hash(payload: bytes) -> str:
+    """The digest recorded for a source, over the bytes it was ingested from.
+
+    The bytes, not the converted markdown: the markdown is what this pipeline
+    makes of a source and not what the source is, and a digest of it could only
+    be computed after the parse that the comparison exists to avoid. Recording
+    the bytes is what lets startup decide whether a corpus source needs
+    ingesting by reading it rather than by parsing it.
+
+    The cost is that a converter upgrade does not by itself re-ingest a corpus
+    whose content has not changed. That is the accepted direction: the index
+    holds what the sources said, and re-ingesting on this pipeline's own version
+    would rewrite every source on every upgrade.
+    """
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _embedding_input_limit(embedding_model: object) -> int:
@@ -785,9 +784,17 @@ class DoclingConverter:
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    def convert_url(
+    def fetch_page(
         self, url: str, timeout: int = 30, user_agent: str | None = None
-    ) -> tuple[str, str]:
+    ) -> tuple[bytes, str]:
+        """The page's bytes as the server returned them, and where the request landed.
+
+        Separate from the conversion below so a caller has the bytes before it
+        decides to parse them: startup compares the digest of what came back with
+        the digest it recorded and converts only a page whose content is new. The
+        fetch is unavoidable -- a page cannot be compared without retrieving it --
+        but the parse it would otherwise pay for is not.
+        """
         # The request names this service. Left to the HTTP library's own default,
         # hosts that require a client identity refuse the fetch outright -- a
         # Wikipedia page answers 403 to `python-requests/*` and 200 to a request
@@ -799,11 +806,18 @@ class DoclingConverter:
             headers={"User-Agent": user_agent or DEFAULT_USER_AGENT},
         )
         response.raise_for_status()
-        final_url = response.url
+        return response.content, response.url
 
+    def convert_page(self, body: bytes, url: str) -> str:
+        """Convert a fetched page's *body*, resolved against the *url* it came from.
+
+        *url* is where the page landed, not where the request pointed: a page that
+        redirects carries the links the serving page meant, and resolving them
+        against the requested address rewrites them to the wrong ones.
+        """
         # Only the page's main content is converted. Left whole, the navigation,
         # sidebars, banners and footer are chunked and embedded alongside it.
-        selected = select_main_content(response.content, final_url)
+        selected = select_main_content(body, url)
 
         suffix = ".html"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -814,7 +828,7 @@ class DoclingConverter:
             result: ConversionResult = self._converter.convert(tmp_path)
             if result.status != ConversionStatus.SUCCESS:
                 raise RuntimeError(f"Docling failed to convert {url}: {result.status.value}")
-            return result.document.export_to_markdown(), final_url
+            return result.document.export_to_markdown()
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -827,12 +841,18 @@ class IndexPipeline:
         app_settings: Settings,
         converter: DoclingConverter | None = None,
         embedding_model: HuggingFaceEmbedding | None = None,
+        store: IndexStore | None = None,
     ) -> None:
         self._settings = app_settings
         self._converter = converter or DoclingConverter()
         self._embedding_model = embedding_model or HuggingFaceEmbedding(
             model_name=app_settings.embedding_model
         )
+        # Where the index lives: the store the caller resolved, or the default
+        # one, which keeps everything in this process's memory. `create_pipeline`
+        # is what decides which backend that is, so a pipeline built directly is
+        # the in-memory one it has always been.
+        self._store = store or InProcessIndexStore()
         # Chunk sizing has to be expressed in the vocabulary the embedding model
         # reads and bounded by the window it reads through: previously the two
         # were unrelated -- tiktoken-counted 512 against a 256-token window -- so
@@ -848,29 +868,37 @@ class IndexPipeline:
             chunk_size=self._chunk_size,
             chunk_overlap=app_settings.chunk_overlap,
         )
-        self._index = VectorStoreIndex(nodes=[])
+        self._index = VectorStoreIndex(
+            # The store's map of source to nodes, not a fresh one: the index reads
+            # that map when it deletes a source's earlier content, and a store
+            # that outlives the process holds one the index has not seen.
+            index_struct=self._store.index_struct(),
+            storage_context=self._store.storage_context,
+            # Whether the docstore keeps the text when the vector store does too.
+            # The in-memory vector store does not, so the index writes it either
+            # way; the durable one does, and there the override is what makes the
+            # docstore hold each chunk rather than only the vectors that point at
+            # it. See `PostgresIndexStore`.
+            store_nodes_override=self._store.store_nodes_override,
+        )
         # Guards the shared vector store. Ingestion runs in the Starlette
         # threadpool while search runs on the event loop, so both the write in
         # the ingest methods and the read in `search` must hold this lock.
         self._index_lock = threading.Lock()
         # What is indexed, for the readiness endpoint and the source catalog.
-        # `_source_records` is only ever touched under the lock, and each write
-        # publishes `_source_catalog` as an immutable snapshot, so a reader costs
-        # no retrieval, no embedding work, and no lock. Publishing is what keeps a
-        # reader from iterating a dict another thread is mutating.
+        # These are a cache of what the store holds, rebuilt from it whenever it
+        # changes and once when the pipeline is built -- which is what lets a
+        # durable backend start with the sources an earlier run ingested rather
+        # than with an empty catalog. `_source_records` is only ever touched
+        # under the lock, and each write publishes `_source_catalog` as an
+        # immutable snapshot, so a reader costs no retrieval, no embedding work,
+        # and no lock. Publishing is what keeps a reader from iterating a dict
+        # another thread is mutating.
         self._source_records: dict[str, SourceRecord] = {}
         self._source_catalog: tuple[SourceRecord, ...] = ()
-        # Each source's node ids mapped to the position each holds within it,
-        # written with the source's record so the two cannot disagree. The
-        # position is what makes a hit's neighbours findable: it is computed when
-        # the ids are assigned and then hashed into the id, so a hit cannot be
-        # placed in its source from the hit alone. It is kept here rather than in
-        # the node's metadata because metadata not listed as excluded is embedded
-        # with the text, and this number would then be part of every stored
-        # vector instead of bookkeeping beside the store.
-        self._source_positions: dict[str, dict[str, int]] = {}
         self._indexed_sources = 0
         self._indexed_chunks = 0
+        self._refresh_catalog()
 
     @property
     def converter(self) -> DoclingConverter:
@@ -898,9 +926,61 @@ class IndexPipeline:
         """
         return self._source_catalog
 
+    def _refresh_catalog(self) -> None:
+        """Rebuild what this process reports from what the store holds.
+
+        The store is the record of what this index holds; these three are what
+        the process answers from -- the dict a hit's source is looked up in, the
+        snapshot a reader iterates, and the counters the readiness endpoint
+        reports. Rebuilding them from the store keeps them describing stored
+        content rather than the content this process happened to be told about,
+        and it is what lets a durable backend start with the sources an earlier
+        run left behind instead of with an empty catalog.
+
+        Called once while the pipeline is being built and again after every
+        ingestion, under the lock the write holds.
+        """
+        records = self._store.records()
+        self._source_records = {record.address: record for record in records}
+        self._source_catalog = records
+        self._indexed_sources = len(records)
+        self._indexed_chunks = sum(record.chunk_count for record in records)
+
     @property
     def chunk_size(self) -> int:
         return self._chunk_size
+
+    def is_current(self, address: str, digest: str, collections: Sequence[str]) -> bool:
+        """Whether the index already holds *address* just as it is being offered.
+
+        The question startup asks about each corpus source before ingesting it.
+        A source this answers yes for is one the index retains, and ingesting it
+        again would spend a parse, a chunk and an embed to store what is already
+        stored.
+
+        Both halves of the answer are compared, because both are part of what the
+        index holds. The digest says whether the content is the same; the
+        collections say whether a configuration change has anything to apply. A
+        source whose content is unchanged but whose configured collections differ
+        is not current: its collections are written with its nodes, so honouring
+        the change means ingesting it, and skipping it would make the setting do
+        nothing at every restart while reporting a complete bootstrap.
+
+        No for a source the index does not hold, for one it holds with a
+        different digest or different collections, and for one whose record
+        carries no digest: a record written before digests were recorded says
+        nothing about the content beside it, and saying nothing is not the same
+        as matching. Every no is the safe answer -- re-ingesting unchanged
+        content costs only the work this exists to save, while skipping changed
+        content leaves the index holding what the source no longer says, which
+        nothing later corrects.
+        """
+        record = self._source_records.get(address)
+        return (
+            record is not None
+            and record.content_hash == digest
+            and record.collections == tuple(collections)
+        )
 
     def _resolve_chunk_size(self, configured: int | None) -> int:
         """The chunk size to use, bounded by what the embedding model can read.
@@ -1081,6 +1161,7 @@ class IndexPipeline:
         name: str,
         source_type: str,
         collections: Sequence[str] = (),
+        content_hash: str | None = None,
     ) -> None:
         """Store *nodes* as the whole of *source_key*, replacing its earlier content.
 
@@ -1088,34 +1169,39 @@ class IndexPipeline:
         ingested needs no special case: removing content that is not there is a
         no-op rather than an error. Both halves run inside the index lock, so a
         concurrent search cannot observe a source half-replaced. The counters are
-        recomputed from what each source currently holds, which is what keeps
-        them describing stored content rather than submitted content.
+        recomputed from what the store holds, which is what keeps them describing
+        stored content rather than submitted content.
 
         The source's collections are replaced by the same write that replaces its
         nodes, so what a source belongs to cannot drift from what it holds: a
-        re-ingestion is always the whole of what that source is.
+        re-ingestion is always the whole of what that source is. So is the hash of
+        the bytes it was ingested from, which is what a later startup compares to
+        decide whether this source needs ingesting at all.
+
+        The nodes go to the index, which writes them to the store's vector table
+        and its docstore; the record and the positions go to the store's catalog.
+        The two writes are separate, and a crash between them leaves a source
+        whose text is stored and whose record is a revision behind -- repaired by
+        the next ingestion of that source, and caught by the bootstrap's
+        comparison, since a record whose hash does not match the content it holds
+        is not a record of it.
         """
         with self._index_lock:
             self._index.delete_ref_doc(source_key, delete_from_docstore=True)
             self._index.insert_nodes(nodes)
-            self._source_records[source_key] = SourceRecord(
+            self._store.replace(
+                source_key,
                 name=name,
-                address=source_key,
                 source_type=source_type,
-                collections=tuple(collections),
+                collections=collections,
                 chunk_count=len(nodes),
+                content_hash=content_hash,
+                # Written from the same nodes the line above counts, so a source's
+                # recorded order describes what the store holds and a re-ingestion
+                # replaces it rather than leaving positions from the content before.
+                positions={node.node_id: position for position, node in enumerate(nodes)},
             )
-            # Written from the same nodes the line above counts, so a source's
-            # recorded order describes what the store holds and a re-ingestion
-            # replaces it rather than leaving positions from the content before.
-            self._source_positions[source_key] = {
-                node.node_id: position for position, node in enumerate(nodes)
-            }
-            self._source_catalog = tuple(
-                self._source_records[key] for key in sorted(self._source_records)
-            )
-            self._indexed_sources = len(self._source_records)
-            self._indexed_chunks = sum(item.chunk_count for item in self._source_records.values())
+            self._refresh_catalog()
 
     def ingest_file(
         self,
@@ -1128,7 +1214,14 @@ class IndexPipeline:
         timings: dict[str, float] = {}
 
         parse_start = time.perf_counter()
-        markdown = self._converter.convert_file(file, filename)
+        # Read once and hand the converter a stream of what was read, so the
+        # digest describes exactly the bytes the conversion was given. Reading
+        # before the parse also keeps this path and the corpus bootstrap hashing
+        # the same thing: the file's bytes, whether they arrived as an upload or
+        # were opened by the bootstrap from the corpus directory.
+        payload = file.read()
+        digest = content_hash(payload)
+        markdown = self._converter.convert_file(BytesIO(payload), filename)
         timings["parse_ms"] = _elapsed_ms(parse_start)
 
         # A file's identity is its filename, so re-uploading one replaces the
@@ -1157,7 +1250,12 @@ class IndexPipeline:
 
         index_start = time.perf_counter()
         self._replace_source(
-            source_key, nodes, name=filename, source_type="file", collections=collections
+            source_key,
+            nodes,
+            name=filename,
+            source_type="file",
+            collections=collections,
+            content_hash=digest,
         )
         timings["index_ms"] = _elapsed_ms(index_start)
 
@@ -1179,6 +1277,26 @@ class IndexPipeline:
         )
         return result, timings
 
+    def fetch_page(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
+        """Fetch *url* the way this pipeline fetches pages, without indexing it.
+
+        The bytes are in the caller's hands before anything parses them, which is
+        what lets a decision about a page be made on the page itself: startup
+        compares what came back with what the index recorded and reaches
+        `ingest_page` only for a page whose content has changed.
+
+        The fetch is the ordinary one, down to the configured timeout and user
+        agent, so a page kept by that comparison is the page the same request
+        would have produced. Returns the body and the address it finally landed
+        on -- the identity of the page, which for a redirected request is not the
+        address it was given.
+        """
+        return self._converter.fetch_page(
+            url,
+            timeout=timeout or self._settings.url_fetch_timeout_seconds,
+            user_agent=self._settings.resolved_user_agent,
+        )
+
     def ingest_url(
         self,
         source_id: str,
@@ -1186,13 +1304,42 @@ class IndexPipeline:
         timeout: int | None = None,
         collections: Sequence[str] = (),
     ) -> tuple[dict, dict[str, float]]:
+        fetch_start = time.perf_counter()
+        body, final_url = self.fetch_page(url, timeout=timeout)
+        result, conversion_timings = self.ingest_page(
+            source_id, url=url, body=body, final_url=final_url, collections=collections
+        )
+        return result, {
+            "fetch_ms": _elapsed_ms(fetch_start),
+            **conversion_timings,
+        }
+
+    def ingest_page(
+        self,
+        source_id: str,
+        *,
+        url: str,
+        body: bytes,
+        final_url: str | None = None,
+        collections: Sequence[str] = (),
+    ) -> tuple[dict, dict[str, float]]:
+        """Index a page whose bytes have already been fetched.
+
+        Split from `ingest_url` so the bytes are in hand before the decision to
+        parse them. Startup fetches each configured page, compares the digest of
+        what came back with the digest it recorded, and reaches here only for a
+        page whose content is new -- so a corpus of unchanged pages is fetched
+        and compared rather than converted and embedded.
+
+        *final_url* is where the request landed, when that is not the address it
+        was given; the page's identity is where it landed, so two addresses
+        redirecting to one page stay one source.
+        """
         timings: dict[str, float] = {}
-        timeout = timeout or self._settings.url_fetch_timeout_seconds
+        final_url = final_url or url
 
         parse_start = time.perf_counter()
-        markdown, final_url = self._converter.convert_url(
-            url, timeout=timeout, user_agent=self._settings.resolved_user_agent
-        )
+        markdown = self._converter.convert_page(body, final_url)
         timings["parse_ms"] = _elapsed_ms(parse_start)
 
         # A page's identity is where it finally landed, not where the request
@@ -1220,7 +1367,12 @@ class IndexPipeline:
 
         index_start = time.perf_counter()
         self._replace_source(
-            source_key, nodes, name=url, source_type="url", collections=collections
+            source_key,
+            nodes,
+            name=url,
+            source_type="url",
+            collections=collections,
+            content_hash=content_hash(body),
         )
         timings["index_ms"] = _elapsed_ms(index_start)
 
@@ -1322,21 +1474,24 @@ class IndexPipeline:
         another's positions.
 
         The order comes from the position map rather than from the docstore's own
-        iteration order: the docstore is a dict keyed by node id, so its order is
+        iteration order: the docstore is keyed by node id, so its order is
         incidental, and the position a node was stored at is what makes its chunks
         come back as the document reads.
+
+        Each chunk is read by the id the position map names rather than by walking
+        everything the docstore holds, because the durable docstore's lookup by id
+        is indexed and its full contents are a table scan away.
         """
         with self._index_lock:
             record = self._source_records.get(address)
             if record is None:
                 return None
-            positions = self._source_positions.get(address, {})
-            stored = self._index.docstore.docs
-            chunks = [
-                {"text": node.get_content(), "position": position}
-                for node_id, position in sorted(positions.items(), key=lambda item: item[1])
-                if (node := stored.get(node_id)) is not None
-            ]
+            positions = self._store.positions(address)
+            chunks = []
+            for node_id, position in sorted(positions.items(), key=lambda item: item[1]):
+                node = self._index.docstore.get_node(node_id, raise_error=False)
+                if node is not None:
+                    chunks.append({"text": node.get_content(), "position": position})
         return record, chunks
 
     def _adjacency(self, chunk: BaseNode, count: int) -> _Adjacency:
@@ -1347,23 +1502,26 @@ class IndexPipeline:
         exists.
 
         The caller holds ``_index_lock``: this reads the records an ingest writes,
-        so outside it a replacement could be observed half-applied.
+        so outside it a replacement could be observed half-applied. The record
+        comes from the published cache and the positions from the store, which is
+        one read per hit rather than one per chunk.
         """
         source_key = chunk.ref_doc_id
         record = self._source_records.get(source_key)
-        position = self._source_positions.get(source_key, {}).get(chunk.node_id)
+        position = self._store.positions(source_key).get(chunk.node_id)
         if position is None or record is None:
             return _Adjacency(0, 0, 0, [])
         # A neighbour is the node the same id function names at an adjacent
         # position, which is what makes it the source's own next chunk rather than
         # whatever else the store holds: nothing outside this source is reachable
         # from the hit's position, and the count bounds both sides.
-        stored = self._index.docstore.docs
         neighbours = []
         for offset in range(1, count + 1):
             for place in (position - offset, position + offset):
                 if 0 <= place < record.chunk_count:
-                    adjacent = stored.get(_node_id(source_key, place))
+                    adjacent = self._index.docstore.get_node(
+                        _node_id(source_key, place), raise_error=False
+                    )
                     if adjacent is not None:
                         neighbours.append({"text": adjacent.get_content(), "position": place})
         # Walking outwards is what fills the side that has room when the other is
@@ -1378,14 +1536,50 @@ class IndexPipeline:
         )
 
 
+def _in_process_store(app_settings: Settings, embedding_model: object) -> IndexStore:
+    """The default backend's store, in this process's memory.
+
+    The model is not needed: nothing it holds is declared to a database, so the
+    width it writes is nobody's business but its own.
+    """
+    return InProcessIndexStore()
+
+
+# Which store each backend builds. A member with no entry here is a name the
+# settings accept and no store answers, and it is refused by name rather than
+# built as something else: a deployment that selected a durable backend and
+# silently received the in-memory one would lose its index on every restart while
+# reporting itself healthy.
+_STORE_BUILDERS: dict[VectorStoreBackend, Callable[[Settings, object], IndexStore]] = {
+    VectorStoreBackend.SIMPLE: _in_process_store,
+    VectorStoreBackend.POSTGRES: PostgresIndexStore,
+}
+
+
 def create_pipeline(
     app_settings: Settings | None = None,
     converter: DoclingConverter | None = None,
     embedding_model: HuggingFaceEmbedding | None = None,
 ) -> IndexPipeline:
+    """Build the pipeline for the configured backend.
+
+    The embedding model is resolved here rather than inside the pipeline because
+    a durable store is built *from* it: the width of the vectors it will hold is
+    the model's answer, and the store declares that width to the database. One
+    model, built once, so the store cannot be sized for a different one than the
+    index embeds with.
+    """
     app_settings = app_settings or settings
-    if app_settings.vector_store_backend != VectorStoreBackend.SIMPLE:
+    builder = _STORE_BUILDERS.get(app_settings.vector_store_backend)
+    if builder is None:
         raise NotImplementedError(
-            f"Vector store backend {app_settings.vector_store_backend.value} is not implemented."
+            f"Vector store backend '{app_settings.vector_store_backend.value}' is not "
+            "implemented; no store answers to that name."
         )
-    return IndexPipeline(app_settings, converter=converter, embedding_model=embedding_model)
+    model = embedding_model or HuggingFaceEmbedding(model_name=app_settings.embedding_model)
+    return IndexPipeline(
+        app_settings,
+        converter=converter,
+        embedding_model=model,
+        store=builder(app_settings, model),
+    )
