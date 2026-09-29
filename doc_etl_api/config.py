@@ -152,6 +152,12 @@ class Settings(BaseSettings):
     # node the splitter produces, fragments included.
     min_chunk_tokens: int = Field(default=32, ge=0)
     default_top_k: int = Field(default=5)
+    # How many chunks one section expansion may return. The cap is not a section
+    # size: a document whose headings were dropped upstream has one section that
+    # is the whole source, so the returned part is bounded and the section's true
+    # size is reported beside it, which is how a caller sees a truncated section
+    # rather than mistaking it for the whole one.
+    max_section_chunks: int = Field(default=25, ge=1)
 
     max_file_size_mb: int = Field(default=50)
     url_fetch_timeout_seconds: int = Field(default=30)

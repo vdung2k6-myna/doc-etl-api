@@ -385,6 +385,70 @@ def test_the_neighbour_count_reaches_the_pipeline_when_asked_for(client):
     client.app.state.pipeline.search.assert_called_once_with("test", top_k=2, neighbours=2)
 
 
+def test_a_section_expansion_reaches_the_pipeline_when_asked_for(client):
+    """The request names the expansion; the pipeline is told which one to make."""
+    client.app.state.pipeline.search.return_value = []
+
+    response = client.post("/search", json={"query": "test", "top_k": 2, "expand": "section"})
+
+    assert response.status_code == 200
+    client.app.state.pipeline.search.assert_called_once_with("test", top_k=2, section=True)
+
+
+def test_a_search_that_does_not_ask_for_a_section_passes_no_expansion(client):
+    """The default is not sent, so a caller that wants ranked hits gets the call that always ran."""
+    client.app.state.pipeline.search.return_value = []
+
+    response = client.post("/search", json={"query": "test", "top_k": 2, "expand": None})
+
+    assert response.status_code == 200
+    client.app.state.pipeline.search.assert_called_once_with("test", top_k=2)
+
+
+def test_a_zero_neighbour_count_beside_an_expansion_is_not_a_conflict(client):
+    """Zero neighbours is no neighbours, so it states no second kind of context."""
+    client.app.state.pipeline.search.return_value = []
+
+    response = client.post(
+        "/search", json={"query": "test", "top_k": 2, "neighbours": 0, "expand": "section"}
+    )
+
+    assert response.status_code == 200
+    client.app.state.pipeline.search.assert_called_once_with("test", top_k=2, section=True)
+
+
+def test_asking_for_neighbours_and_a_section_at_once_is_rejected(client):
+    """The two overlap by construction, so the choice cannot be made for the caller."""
+    response = client.post("/search", json={"query": "test", "neighbours": 2, "expand": "section"})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "neighbours" in detail, "the rejection does not name the field it conflicts with"
+    assert "expand" in detail, "the rejection does not name the conflict"
+    client.app.state.pipeline.search.assert_not_called()
+
+
+def test_an_unknown_expansion_is_rejected(client):
+    """The expansion is a named choice, so a misspelling is refused rather than ignored."""
+    response = client.post("/search", json={"query": "test", "expand": "chapter"})
+
+    assert response.status_code == 422
+    client.app.state.pipeline.search.assert_not_called()
+
+
+def test_an_unknown_search_field_is_rejected(client):
+    """A field the route does not serve is an error, not a silently dropped request.
+
+    With the expansion request being one word, a caller that misspells it would
+    otherwise receive an ordinary search response carrying no section and no
+    indication that the section it asked for was never going to arrive.
+    """
+    response = client.post("/search", json={"query": "test", "expansion": "section"})
+
+    assert response.status_code == 422
+    client.app.state.pipeline.search.assert_not_called()
+
+
 def test_the_requested_neighbours_reach_the_response_inside_the_hit(client):
     """A neighbour is returned attached to its hit, not as a result of its own."""
     client.app.state.pipeline.search.return_value = [
@@ -413,6 +477,43 @@ def test_the_requested_neighbours_reach_the_response_inside_the_hit(client):
         {"text": "chunk one", "position": 1},
         {"text": "chunk three", "position": 3},
     ]
+
+
+def test_the_requested_section_reaches_the_response_inside_the_hit(client):
+    """A section is returned attached to its hit, with the size of the whole run.
+
+    The chunks carry no score and this result's own text is among them, so a caller
+    renders the passage without a second shape to splice.
+    """
+    client.app.state.pipeline.search.return_value = [
+        {
+            "text": "chunk two",
+            "score": 0.9,
+            "source_id": "s1",
+            "source_type": "file",
+            "source_name": "report.pdf",
+            "position": 1,
+            "neighbours_before": 1,
+            "neighbours_after": 1,
+            "section": [
+                {"text": "chunk one", "position": 0},
+                {"text": "chunk two", "position": 1},
+                {"text": "chunk three", "position": 2},
+            ],
+            "section_size": 9,
+        }
+    ]
+
+    response = client.post("/search", json={"query": "test", "top_k": 1, "expand": "section"})
+
+    assert response.status_code == 200
+    body = response.json()
+    hit = body["results"][0]
+    assert [chunk["position"] for chunk in hit["section"]] == [0, 1, 2]
+    assert hit["section_size"] == 9, "the bounded section's own size did not reach the caller"
+    for chunk in hit["section"]:
+        assert set(chunk) == {"text", "position"}, chunk
+    assert hit["section"][1]["text"] == hit["text"], "the hit's own text is not in its section"
 
 
 def test_the_neighbour_count_is_bounded(client):
@@ -449,6 +550,8 @@ def test_the_routing_fields_default_rather_than_being_required():
 
     assert result.address == ""
     assert result.collections == []
+    assert result.section == []
+    assert result.section_size == 0
 
 
 def test_the_search_documentation_names_every_field_the_route_serves():

@@ -330,6 +330,16 @@ async def search(
         )
     if collections is not None:
         collections = _requested_collections(collections)
+    if request.neighbours and request.expand:
+        # Two notions of context on one result invite a client to render the same
+        # text twice -- the neighbours and the section overlap by construction --
+        # so the choice is the caller's rather than one the service makes for it.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A search cannot ask for both `neighbours` and an `expand` section. "
+            "Ask for one: a section is the whole run of chunks a result belongs to, and "
+            "neighbours are the chunks beside it.",
+        )
 
     top_k = request.top_k or app_settings.default_top_k
     # Retrieval embeds the query synchronously, so it must not run on the event
@@ -346,15 +356,18 @@ async def search(
         search_kwargs["collections"] = collections
     if request.neighbours:
         search_kwargs["neighbours"] = request.neighbours
+    if request.expand:
+        search_kwargs["section"] = True
     raw_results = await run_in_threadpool(pipeline.search, query, **search_kwargs)
     search_ms = round((time.perf_counter() - search_start) * 1000, 2)
     results = [SearchResult(**r) for r in raw_results]
     logger.info(
-        "Search query=%r top_k=%d collections=%s neighbours=%d results=%d search_ms=%s",
+        "Search query=%r top_k=%d collections=%s neighbours=%d expand=%s results=%d search_ms=%s",
         query,
         top_k,
         collections,
         request.neighbours,
+        request.expand,
         len(results),
         search_ms,
     )

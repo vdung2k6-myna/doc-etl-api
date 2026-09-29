@@ -79,8 +79,46 @@ class _Adjacency:
     neighbours: list[dict]
 
 
+@dataclass(frozen=True)
+class _SectionExpansion:
+    """The part of a hit's section that is returned, and the section's real size.
+
+    ``size`` describes the section the source holds, whether or not all of it was
+    returned, so a bounded answer is visible as incomplete; ``chunks`` carries the
+    returned part of it, in reading order. A size of zero is a hit whose placement
+    could not be established, which is returned as no section rather than as a
+    guessed one.
+    """
+
+    size: int
+    chunks: list[dict]
+
+
+# A hit's place in its source: the source's key, the record describing it, and the
+# position the hit holds within it. Established once per hit by `search` and handed
+# to every walk that needs it, because reading it costs a store query.
+_Placement = tuple[str, SourceRecord, int]
+
+
 def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _section_window(first: int, last: int, position: int, ceiling: int) -> tuple[int, int]:
+    """Which part of the section ``first..last`` one expansion returns.
+
+    The section's own ends bound the window and the hit is kept inside it: a
+    caller that asked for a section receives the part of it its hit is in, never a
+    window from one end that the hit happens not to fall inside. The window is
+    centred on the hit where the section allows, and filled from the other side
+    where an end cuts it short, so a bounded expansion returns the ceiling's worth
+    of chunks wherever the section holds that many.
+    """
+    if last - first + 1 <= ceiling:
+        return first, last
+    start = max(first, position - (ceiling - 1) // 2)
+    end = min(last, start + ceiling - 1)
+    return min(start, end - ceiling + 1), end
 
 
 def _node_id(source_key: str, position: int) -> str:
@@ -225,6 +263,26 @@ class _Section:
 def _is_heading_line(line: str) -> bool:
     """Whether a line opens one of the document's own sections."""
     return _HEADING_LINE.match(line.strip()) is not None
+
+
+def _leading_heading(text: str) -> str | None:
+    """The heading a stored chunk belongs to: the one its text *begins* with.
+
+    Every node of a section is written with that section's heading prefixed to it
+    (`_section_nodes`), so the chunk's first non-blank line is the heading it was
+    written under -- or, for the content before a document's first heading, an
+    ordinary line, which says the chunk belongs to the heading-less section rather
+    than to a heading it never had. `None` is that answer.
+
+    Only the leading line counts. A chunk that swallowed a section left below the
+    node floor carries that section's heading *inside* its text, and a rule that
+    read any heading the chunk contains would place such a chunk in the section
+    that inner heading names. Reading no further than the first line cannot.
+    """
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip() if _is_heading_line(line) else None
+    return None
 
 
 def _split_sections(markdown: str) -> list[_Section]:
@@ -1400,6 +1458,7 @@ class IndexPipeline:
         top_k: int,
         collections: Sequence[str] | None = None,
         neighbours: int = 0,
+        section: bool = False,
     ) -> list[dict]:
         """Rank chunks against *query*, optionally scoped to *collections*.
 
@@ -1417,6 +1476,13 @@ class IndexPipeline:
         result. It is a count, not a flag: no single number expresses "the
         passage around this hit" for every caller. Zero attaches nothing, which
         is what a caller that has not asked for adjacency receives.
+
+        *section* asks for each result's whole section, attached to the result
+        rather than added to the ranking: the ranked list is the same list the
+        same search returns without it, and no chunk of a section spends a slot a
+        ranked hit would have taken. Each result carries the chunks of its section
+        that were returned and the section's true size, which is larger when the
+        configured ceiling bounded them.
         """
         filters = None
         if collections:
@@ -1435,7 +1501,18 @@ class IndexPipeline:
             results = []
             for hit in nodes:
                 chunk = hit.node
-                adjacency = self._adjacency(chunk, neighbours)
+                # The hit's place in its source is established once and handed to
+                # both walks: it costs a store query, and a walk reading its own
+                # copy would pay twice for a value the two already agree on.
+                placement = self._placement(chunk)
+                adjacency = self._adjacency(chunk, neighbours, placement)
+                # An empty expansion is the answer a caller that did not ask for
+                # one receives, and it is also what an unplaced hit reports.
+                expansion = (
+                    self._section(chunk, self._settings.max_section_chunks, placement)
+                    if section
+                    else _SectionExpansion(0, [])
+                )
                 results.append(
                     {
                         "text": chunk.get_content(),
@@ -1453,6 +1530,8 @@ class IndexPipeline:
                         "neighbours_before": adjacency.before,
                         "neighbours_after": adjacency.after,
                         "neighbours": adjacency.neighbours,
+                        "section": expansion.chunks,
+                        "section_size": expansion.size,
                     }
                 )
         return results
@@ -1494,23 +1573,41 @@ class IndexPipeline:
                     chunks.append({"text": node.get_content(), "position": position})
         return record, chunks
 
-    def _adjacency(self, chunk: BaseNode, count: int) -> _Adjacency:
-        """Place *chunk* in its source and collect the neighbours *count* asks for.
-
-        A chunk whose placement cannot be established reports no adjacency rather
-        than a guessed one, so an unknown is never shown as a neighbour that
-        exists.
+    def _placement(self, chunk: BaseNode) -> _Placement | None:
+        """Where *chunk* sits in its source, or None when that cannot be established.
 
         The caller holds ``_index_lock``: this reads the records an ingest writes,
         so outside it a replacement could be observed half-applied. The record
-        comes from the published cache and the positions from the store, which is
-        one read per hit rather than one per chunk.
+        comes from the published cache and the position from the store, the store
+        read being the cost that makes the caller establish this once per hit and
+        pass the same placement to every walk that needs it.
+
+        A chunk whose placement cannot be established is reported as unplaced
+        rather than guessed at, so an unknown is never shown as context that
+        exists.
         """
         source_key = chunk.ref_doc_id
         record = self._source_records.get(source_key)
         position = self._store.positions(source_key).get(chunk.node_id)
         if position is None or record is None:
+            return None
+        return source_key, record, position
+
+    def _adjacency(self, chunk: BaseNode, count: int, placement: _Placement | None) -> _Adjacency:
+        """Collect the neighbours *count* asks for, for a hit at *placement*.
+
+        *placement* is where the hit sits in its source, established by the caller
+        and shared with the section walk, so one hit reads its source's position
+        map once rather than once per walk. A hit whose placement could not be
+        established reports no adjacency rather than a guessed one, so an unknown
+        is never shown as a neighbour that exists.
+
+        The caller holds ``_index_lock``, and the record and positions are read
+        once per hit rather than once per chunk.
+        """
+        if placement is None:
             return _Adjacency(0, 0, 0, [])
+        source_key, record, position = placement
         # A neighbour is the node the same id function names at an adjacent
         # position, which is what makes it the source's own next chunk rather than
         # whatever else the store holds: nothing outside this source is reachable
@@ -1534,6 +1631,69 @@ class IndexPipeline:
             max(record.chunk_count - position - 1, 0),
             neighbours,
         )
+
+    def _section(
+        self, chunk: BaseNode, ceiling: int, placement: _Placement | None
+    ) -> _SectionExpansion:
+        """The run of chunks *chunk* belongs to, and how long that run really is.
+
+        The run is the chunks of the hit's own source whose text begins with the
+        same heading line as the hit's, taken outwards from the hit in reading
+        order until a chunk begins with a different heading or the source ends. A
+        chunk beginning with no heading line belongs to the heading-less section,
+        which is the content before a document's first heading, and that section is
+        walked by the same rule: none matches none.
+
+        Both ends are walked rather than stopping at the ceiling, because the
+        ceiling bounds what is *returned* and the section's real size is what tells
+        a caller whether the answer is complete. What comes back is the part of the
+        section around the hit -- never less than the hit itself -- and the size of
+        the whole run it was taken from.
+
+        The caller holds ``_index_lock``, so a walk of a long section holds it for
+        as many docstore reads as the section has chunks. The ceiling bounds the
+        returned part, not the walk. *placement* is where the hit sits in its
+        source, established once by the caller and shared with the adjacency walk,
+        so one hit reads its source's position map once rather than once per walk;
+        a hit whose placement could not be established reports no section rather
+        than a guessed one.
+        """
+        if placement is None:
+            return _SectionExpansion(0, [])
+        source_key, record, position = placement
+        heading = _leading_heading(chunk.get_content())
+
+        def belonging_text(place: int) -> str | None:
+            """The stored text at *place*, or None when it is not the section's."""
+            node = self._index.docstore.get_node(_node_id(source_key, place), raise_error=False)
+            if node is None:
+                return None
+            text = node.get_content()
+            return text if _leading_heading(text) == heading else None
+
+        before: list[dict] = []
+        first = position
+        while first > 0:
+            text = belonging_text(first - 1)
+            if text is None:
+                break
+            first -= 1
+            before.append({"text": text, "position": first})
+        after: list[dict] = []
+        last = position
+        while last + 1 < record.chunk_count:
+            text = belonging_text(last + 1)
+            if text is None:
+                break
+            last += 1
+            after.append({"text": text, "position": last})
+
+        # Collected outwards on both sides, so the left half reverses to read in
+        # the document's order.
+        before.reverse()
+        whole = [*before, {"text": chunk.get_content(), "position": position}, *after]
+        start, end = _section_window(first, last, position, ceiling)
+        return _SectionExpansion(last - first + 1, whole[start - first : end - first + 1])
 
 
 def _in_process_store(app_settings: Settings, embedding_model: object) -> IndexStore:

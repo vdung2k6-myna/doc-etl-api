@@ -28,7 +28,9 @@ from doc_etl_api.pipeline import (
     DoclingConverter,
     IndexPipeline,
     _content_token_ids,
+    _leading_heading,
     _node_id,
+    _SectionExpansion,
     _split_oversized_text,
     _split_sections,
     content_hash,
@@ -2054,16 +2056,22 @@ def test_the_chunking_outcome_reports_which_boundaries_produced_the_nodes():
 # --- Collections: a filter key that is never content ------------------------
 
 
-def _collections_pipeline(settings) -> IndexPipeline:
+def _collections_pipeline(settings, store=None) -> IndexPipeline:
     """A pipeline whose embedder depends on the text it is given.
 
     The vectors are what this section compares, and `MockEmbedding` returns one
     vector for every text, so a comparison against it would hold whatever the
     text was. `_ContentEmbedding` embeds text as a function of itself, so equal
     vectors mean equal embedded text.
+
+    *store* is for a test that has to watch what the pipeline reads; without one
+    the pipeline builds the in-process store every other test runs against.
     """
     return IndexPipeline(
-        settings, converter=MagicMock(), embedding_model=_ContentEmbedding(embed_dim=8)
+        settings,
+        converter=MagicMock(),
+        embedding_model=_ContentEmbedding(embed_dim=8),
+        store=store,
     )
 
 
@@ -2465,6 +2473,356 @@ def test_a_scoped_search_returns_neighbours_only_from_its_scope(settings):
     assert first["position"] == 0
     assert first["neighbours_before"] == 0
     assert all(neighbour["position"] > 0 for neighbour in first["neighbours"])
+
+
+# --- The heading a stored chunk was written under -----------------------------
+
+
+def test_a_chunk_that_opens_with_a_heading_belongs_to_it():
+    """The heading the chunker prefixed to a node is the section that node came from."""
+    assert _leading_heading(f"{HEADING_ONE}\n\n{PARA_ALPHA}") == HEADING_ONE
+
+
+def test_a_chunk_that_opens_with_content_belongs_to_no_heading():
+    """The content before a document's first heading is a section whose heading is none."""
+    assert _leading_heading(PARA_ALPHA) is None
+
+
+def test_a_heading_inside_a_chunk_does_not_name_the_section_it_belongs_to():
+    """A chunk that swallowed a below-floor section carries headings it does not lead.
+
+    Measured on the book in the live index: its first chunk opens with an image
+    marker and holds two heading-looking lines later in its text, and neither leads
+    a chunk -- each opened a section too small to survive the node floor and was
+    folded into this one. Reading such a heading as membership would put this chunk
+    in the section it swallowed.
+    """
+    swallowed = f"<!-- image -->\n\n{PARA_ALPHA}\n\n{HEADING_TWO}\n\n{PARA_BRAVO}"
+
+    assert _leading_heading(swallowed) is None
+
+
+def test_blank_lines_before_a_chunks_first_line_do_not_hide_its_heading():
+    """The heading is the first line the chunk actually has, not the first character."""
+    assert _leading_heading(f"\n\n{HEADING_ONE}\n\n{PARA_ALPHA}") == HEADING_ONE
+
+
+def test_readme_documents_the_section_ceiling():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert "| `MAX_SECTION_CHUNKS` |" in readme, (
+        "the setting is missing from the configuration table"
+    )
+    assert "truncated section from a complete one" in readme, (
+        "what the ceiling bounds, and how a bounded answer is told from a whole one, "
+        "is not documented"
+    )
+    assert Settings().max_section_chunks == 25
+
+
+# --- Section expansion: the run of chunks a hit belongs to ---------------------
+
+
+# The content a document carries before its first heading, long enough to be
+# stored as several chunks and unlike the sections under a heading.
+PREAMBLE_DOC = SENTENCE_DOC.replace("Sentence", "Preamble")
+
+
+def _sectioned_pipeline(settings) -> IndexPipeline:
+    """One source that holds a heading-less section and two headed ones.
+
+    Every part is long enough at the fixture's chunk size to be stored as several
+    chunks, which is the only shape in which a run of chunks can be told apart from
+    a single chunk.
+    """
+    pipeline = _collections_pipeline(settings)
+    contents = {
+        "sections.txt": "\n\n".join(
+            [PREAMBLE_DOC, HEADING_ONE, SENTENCE_DOC, HEADING_TWO, PLAIN_DOC]
+        )
+    }
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: contents[filename]
+    pipeline.ingest_file(source_id="sections", file=BytesIO(b"x"), filename="sections.txt")
+    return pipeline
+
+
+def _chunk_at(pipeline: IndexPipeline, name: str, position: int):
+    """The stored node at one position of one source, as the walk receives it."""
+    return pipeline.index.docstore.get_node(_node_id(name, position))
+
+
+def _positions_of(pipeline: IndexPipeline, name: str, heading: str | None) -> list[int]:
+    """Every position of one source whose stored chunk begins with *heading*."""
+    return [
+        position
+        for position in range(_chunk_count(pipeline, name))
+        if _leading_heading(_chunk_at(pipeline, name, position).get_content()) == heading
+    ]
+
+
+def _section_at(
+    pipeline: IndexPipeline, name: str, position: int, ceiling: int
+) -> _SectionExpansion:
+    """One stored chunk's section, placed the way a search places it.
+
+    A search establishes each hit's placement once and hands the same one to the
+    section walk, so the walk takes it rather than reading it for itself.
+    """
+    chunk = _chunk_at(pipeline, name, position)
+    return pipeline._section(chunk, ceiling, pipeline._placement(chunk))
+
+
+def test_a_section_is_the_run_of_chunks_that_share_the_hits_heading(settings):
+    pipeline = _sectioned_pipeline(settings)
+    alpha = _positions_of(pipeline, "sections.txt", HEADING_ONE)
+    assert len(alpha) > 2, "the fixture must hold a section with a chunk on each side of a hit"
+
+    section = _section_at(pipeline, "sections.txt", alpha[1], 25)
+
+    assert section.size == len(alpha)
+    assert [chunk["position"] for chunk in section.chunks] == alpha
+
+
+def test_a_section_stops_where_the_heading_changes_on_either_side(settings):
+    """A neighbouring section is not pulled in, at either end of the hit's section."""
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    elsewhere = _positions_of(pipeline, name, None) + _positions_of(pipeline, name, HEADING_TWO)
+    assert elsewhere, "the fixture must hold chunks outside the hit's section"
+
+    for hit in (alpha[0], alpha[-1]):
+        section = _section_at(pipeline, name, hit, 25)
+        returned = {chunk["position"] for chunk in section.chunks}
+        assert returned == set(alpha)
+        assert returned.isdisjoint(elsewhere), "a chunk from another heading was returned"
+
+
+def test_a_section_is_bounded_by_the_source_it_is_in(settings):
+    """The walk ends at the source's own ends, not at a count or at another source."""
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    preamble = _positions_of(pipeline, name, None)
+    closing = _positions_of(pipeline, name, HEADING_TWO)
+    assert preamble[0] == 0, "the fixture must open with its heading-less section"
+    assert closing[-1] == _chunk_count(pipeline, name) - 1, (
+        "the fixture must close with the section under the second heading"
+    )
+
+    opening = _section_at(pipeline, name, preamble[0], 25)
+    last = _section_at(pipeline, name, closing[-1], 25)
+
+    assert [chunk["position"] for chunk in opening.chunks] == preamble
+    assert opening.chunks[0]["position"] == 0
+    assert [chunk["position"] for chunk in last.chunks] == closing
+    assert last.chunks[-1]["position"] == closing[-1]
+
+
+def test_a_run_of_headingless_chunks_is_a_section_of_its_own(settings):
+    """Content before a document's first heading belongs together, under no heading.
+
+    Measured on the live index: a stored chunk can open with an image marker rather
+    than a heading, and it belongs with the chunks around it that also begin with no
+    heading -- and with nothing that begins with one.
+    """
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    preamble = _positions_of(pipeline, name, None)
+    assert len(preamble) > 1, "the fixture must hold more than one heading-less chunk"
+
+    section = _section_at(pipeline, name, preamble[1], 25)
+
+    assert section.size == len(preamble)
+    assert [chunk["position"] for chunk in section.chunks] == preamble
+
+
+def test_a_section_longer_than_the_ceiling_returns_a_bounded_part_of_it(settings):
+    """The ceiling bounds what is returned, not the size the caller is told.
+
+    What comes back is the part of the section the hit is in, so a bounded answer
+    still carries the chunk that was ranked.
+    """
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    middle = alpha[len(alpha) // 2]
+    assert len(alpha) > 3, "the fixture must hold a section longer than the ceiling below"
+
+    section = _section_at(pipeline, name, middle, 3)
+
+    assert section.size == len(alpha), "the section's own size was reported as the bounded one"
+    assert [chunk["position"] for chunk in section.chunks] == [middle - 1, middle, middle + 1]
+
+
+def test_a_bounded_window_slides_to_keep_a_hit_at_a_sections_end(settings):
+    """A hit near an end still receives the ceiling's worth of its section.
+
+    The window is centred on the hit where the section has the room, but centring
+    a hit that sits at an end would push half the window past the section and
+    return fewer chunks than the ceiling allows. So the window is filled from the
+    other side -- without dropping the chunk that was ranked, which is the chunk
+    the caller asked about.
+    """
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    assert len(alpha) > 3, "the fixture must hold a section longer than the ceiling below"
+
+    for hit, window in ((alpha[0], alpha[:3]), (alpha[-1], alpha[-3:])):
+        section = _section_at(pipeline, name, hit, 3)
+        positions = [chunk["position"] for chunk in section.chunks]
+
+        assert section.size == len(alpha), "the section's true size was not reported"
+        assert positions == window, "the window is not the ceiling's length in reading order"
+        assert hit in positions, "the chunk that was ranked is not in its own section"
+
+
+def test_a_ceiling_of_one_returns_the_ranked_chunk_alone(settings):
+    """The smallest ceiling the setting admits still returns a section: the hit.
+
+    A ceiling below one would make asking for a section and asking for none the
+    same request, which is why the setting refuses it. At one, every position of
+    the section returns just the chunk that was ranked, and the section's own size
+    still travels with it rather than being reported as the bounded one.
+    """
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    assert len(alpha) > 1, "the fixture must hold a section longer than the ceiling below"
+
+    for hit in alpha:
+        section = _section_at(pipeline, name, hit, 1)
+
+        assert [chunk["position"] for chunk in section.chunks] == [hit]
+        assert section.size == len(alpha), "the section's own size was reported as the bounded one"
+
+
+def test_a_result_can_carry_its_whole_section(settings):
+    """A three-chunk source searched with a hit on the middle chunk returns all three.
+
+    The section is the passage a hit sits in, not the hit and a fixed number of
+    chunks beside it, and its own size travels with it.
+    """
+    pipeline = _collections_pipeline(settings)
+    document = "\n\n".join([HEADING_ONE, *PARAGRAPHS[:3]])
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: document
+    pipeline.ingest_file(source_id="s", file=BytesIO(b"x"), filename="three.txt")
+    assert _chunk_count(pipeline, "three.txt") == 3, "the fixture must be a three-chunk source"
+
+    results = pipeline.search("Under Bravo", top_k=3, section=True)
+    middle = next(item for item in results if item["position"] == 1)
+
+    assert [chunk["position"] for chunk in middle["section"]] == [0, 1, 2]
+    assert middle["section_size"] == 3
+    assert [chunk["text"] for chunk in middle["section"]] == [
+        _chunk_at(pipeline, "three.txt", place).get_content() for place in range(3)
+    ], "the section is not the stored chunks in reading order"
+
+
+class _CountingStore:
+    """A store that counts how often a source's position map is read.
+
+    ``positions`` is the read that costs a query on the durable backend, so it is
+    the read a search must pay once per hit rather than once per walk that needs
+    the hit's place in its source. Everything else is the wrapped store's.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.positions_reads = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def positions(self, address: str) -> dict[str, int]:
+        self.positions_reads += 1
+        return self._inner.positions(address)
+
+
+def test_a_section_expansion_reads_each_hits_placement_once(settings):
+    """A hit's place in its source is read once, not once per walk that needs it.
+
+    Both walks need it, and a walk reading its own copy makes a section expansion
+    read each hit's position map twice -- a query per hit on the durable backend,
+    paid for a value the two walks already agree on.
+    """
+    store = _CountingStore(InProcessIndexStore())
+    pipeline = _collections_pipeline(settings, store=store)
+    document = "\n\n".join([HEADING_ONE, *PARAGRAPHS[:3]])
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: document
+    pipeline.ingest_file(source_id="s", file=BytesIO(b"x"), filename="three.txt")
+
+    store.positions_reads = 0
+    results = pipeline.search("Under Bravo", top_k=3, section=True)
+
+    assert len(results) > 1, "one hit says nothing about a read per hit"
+    assert store.positions_reads == len(results), (
+        "a hit's placement was read more than once across the two walks"
+    )
+
+
+def test_a_section_chunk_carries_its_text_and_position_and_no_score(settings):
+    """A section chunk was not ranked against the query, so it has no relevance.
+
+    The hit's own text is one of the section's chunks, repeated rather than
+    referenced, so a caller can render the passage without splicing two shapes.
+    """
+    pipeline = _collections_pipeline(settings)
+    document = "\n\n".join([HEADING_ONE, *PARAGRAPHS[:3]])
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: document
+    pipeline.ingest_file(source_id="s", file=BytesIO(b"x"), filename="three.txt")
+
+    results = pipeline.search("Under Bravo", top_k=3, section=True)
+    middle = next(item for item in results if item["position"] == 1)
+
+    for chunk in middle["section"]:
+        assert set(chunk) == {"text", "position"}, chunk
+    assert middle["section"][1]["text"] == middle["text"], (
+        "the hit's own chunk is not in its section"
+    )
+
+
+def test_a_search_that_does_not_ask_for_a_section_carries_none(settings):
+    """Expansion is additive: the ranking and the shape of a result are unchanged.
+
+    A caller that has not asked for a section receives the response it always
+    received -- the same hits, in the same order, with the same scores -- rather
+    than a section nobody requested.
+    """
+    pipeline = _collections_pipeline(settings)
+    document = "\n\n".join([HEADING_ONE, *PARAGRAPHS[:3]])
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: document
+    pipeline.ingest_file(source_id="s", file=BytesIO(b"x"), filename="three.txt")
+
+    ranked = pipeline.search("Under Bravo", top_k=3)
+    widened = pipeline.search("Under Bravo", top_k=3, section=True)
+
+    assert all(item["section"] == [] and item["section_size"] == 0 for item in ranked)
+    assert [(item["position"], item["score"]) for item in widened] == [
+        (item["position"], item["score"]) for item in ranked
+    ], "asking for a section changed the ranking"
+
+
+def test_a_section_longer_than_the_configured_ceiling_is_bounded_and_sized(settings):
+    """The configured ceiling bounds one expansion without changing the size reported.
+
+    The section's own size is what the source holds, so a caller can tell the
+    bounded answer it received from the whole section it asked for.
+    """
+    pipeline = _sectioned_pipeline(settings.model_copy(update={"max_section_chunks": 3}))
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    middle = alpha[len(alpha) // 2]
+    assert len(alpha) > 3, "the fixture must hold a section longer than the configured ceiling"
+
+    hit = next(
+        item
+        for item in pipeline.search("content", top_k=50, section=True)
+        if item["position"] == middle
+    )
+
+    assert [chunk["position"] for chunk in hit["section"]] == [middle - 1, middle, middle + 1]
+    assert hit["section_size"] == len(alpha)
 
 
 # --- The catalog's per-source record ----------------------------------------

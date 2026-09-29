@@ -478,6 +478,12 @@ of those collections; omit it to search every indexed source. See
 Add `"neighbours": 1` to return the chunks stored either side of each result; see
 [Neighbours](#neighbours) for what they are and what they cost.
 
+Add `"expand": "section"` to return the whole section each result belongs to instead
+of a fixed number of adjacent chunks; see [Sections](#sections) for what a section is
+and how a bounded one is reported. `expand` cannot be combined with `neighbours`: a
+request stating both is rejected with `400`, and one naming an expansion the service
+does not serve, or a field it does not serve, with `422`.
+
 Response:
 
 ```json
@@ -513,6 +519,8 @@ Response:
 | `position` | Where the chunk sits in its source: counted from 0, in reading order. |
 | `neighbours_before`, `neighbours_after` | How many chunks the source holds on each side of this one, whether or not any were returned. Zero at the source's first or last chunk. |
 | `neighbours` | The adjacent chunks themselves, in reading order, when the request asked for them; empty when it did not. |
+| `section` | The chunks of the hit's own section, in reading order, when the request asked for a section expansion; empty when it did not. The hit's own text is one of them, repeated rather than referenced, so the passage renders from these chunks alone. |
+| `section_size` | How many chunks the section really holds, whether or not every one of them was returned. Larger than the number of `section` chunks when the expansion was bounded, which is how a truncated section is told from a complete one. Zero when no section was asked for. |
 
 Both routing fields are read off the chunk the search already returned, so a
 search that reports them costs the same retrieval as one that does not: no second
@@ -561,6 +569,66 @@ curl -X POST "http://localhost:8000/search" \
 - **Every result grows three numbers wider**, whether or not neighbours were
   asked for, because the position and the counts say that context exists.
 
+### Sections
+
+A hit is a ranked chunk, and a story or a chapter is not one chunk. `expand` returns
+the whole section each result belongs to, so a caller receives the passage rather
+than a fragment of it:
+
+```bash
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "the story about the son who asks for money to repair a gun", "top_k": 3, "expand": "section"}'
+```
+
+- **A section is the run of chunks that open with the same heading line.** Every
+  chunk of a section is stored with that section's heading prefixed to it, so the
+  heading a chunk begins with is the section it came from. The walk runs outwards
+  from the hit within its own source, in reading order, and stops at the first chunk
+  that begins with a different heading, or at the source's end.
+- **Content before a document's first heading is a section with no heading**, and
+  its chunks are matched against each other, so a title page comes back with the text
+  it introduces rather than alone.
+- **A section is not a document.** What comes back is the run of stored chunks the
+  hit belongs to, not the file: the parse is not stored and the submitted bytes are
+  deleted after parsing. A section ends where its heading ends, not where a page does.
+- **Only the heading a chunk begins with decides membership.** A chunk that swallowed
+  a very short section beneath it carries that section's heading inside its text, and
+  a rule that looked for a heading anywhere in the chunk would place it in the section
+  it swallowed.
+- **A section chunk carries no score**, and the hit's own text is among them: the
+  section repeats it rather than referring to it, so the passage renders from the
+  section alone. Each chunk's `position` says where it sits in the source instead.
+- **The section attaches to the result; it does not join the results.** The ranked
+  list is the list the same search returns without `expand`, in the same order, so
+  `top_k` still counts ranked hits and an unranked section chunk never spends a slot.
+- **The response says how big the section really is.** One expansion returns at most
+  `MAX_SECTION_CHUNKS` chunks, taken around the hit so the ranked chunk is always
+  among them, and `section_size` reports the whole run. Compare the two to see whether
+  the passage is complete:
+
+  ```python
+  section = hit["section"]
+  if len(section) == hit["section_size"]:
+      render(section)  # the whole section
+  else:
+      render(section)  # the part of it that was returned
+      missing = hit["section_size"] - len(section)
+  ```
+
+  Nothing today returns only the rest of a truncated section: `GET /sources/content`
+  returns a source's stored chunks in position order, which is how a caller reads on
+  past a bounded expansion.
+- **They stop at the source boundary**, and inside a collection filter: a section
+  never spans two sources, and a scoped search takes sections only from sources in the
+  requested collections.
+- **The same story in two sources is two sections.** Sections are per source, so a
+  story that both a one-page extract and a book hold is returned once for each, and
+  the caller renders both or picks one.
+- **The ceiling is a limit, not a section size.** A document whose headings were
+  dropped upstream has one section that is the whole source, so the bound is what
+  keeps a request from fetching a 549-chunk document to answer one question.
+
 ## Configuration
 
 All settings are loaded from environment variables or an `.env` file. Copy
@@ -580,6 +648,7 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `CHUNK_OVERLAP` | `50` | Overlap, in the same tokens as `CHUNK_SIZE`, applied only where a unit had to be divided at sentence boundaries — the one case where no boundary of the document's own was left to divide on. A node separated from its neighbour at a heading or paragraph boundary therefore repeats nothing: the seam is where the source changed subject, and repeating text across it would store the same text twice. Overlap is quantized to whole sentences, so the achieved overlap can be lower than this, and is zero when a single sentence exceeds the budget. |
 | `MIN_CHUNK_TOKENS` | `32` | Minimum node size, in the same tokens as `CHUNK_SIZE` and measured the same way — on the node's text as the model reads it, the heading it carries included. A node smaller than this is merged into a neighbour of its own section in preference to one beyond a heading, so satisfying the minimum does not join two topics into one node; a merge that would take the neighbour past the embedding model's input limit is refused and the node kept, so the model's window is never traded away for the minimum. A merged node carries the heading its texts share once rather than once per text, since it opens with it already and the copies say nothing new. The default follows the measured noise floor: the corpus this was tuned on stored 9–14 token scraps that outranked real passages. Setting it to `0` stores every unit of the document as a node of its own, merging nothing. |
 | `DEFAULT_TOP_K` | `5` | Default number of search results. |
+| `MAX_SECTION_CHUNKS` | `25` | How many chunks one section expansion may return — see [Sections](#sections). The cap is a limit on the answer, not a section size: a document whose headings were dropped upstream has one section that is the whole source, so the returned part is bounded and the section's true size is reported beside it as `section_size`, which is how a caller tells a truncated section from a complete one. The bound matters because the walk reads each chunk from the index under the same lock an ingestion takes, and a document in the corpus this was measured on holds 549 chunks in one section. A value below `1` is rejected as the settings are built: a ceiling that would return nothing leaves nothing for asking for no expansion to mean. |
 | `MAX_FILE_SIZE_MB` | `50` | Maximum uploaded file size in MB. |
 | `URL_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for fetching URLs. |
 | `USER_AGENT` | `doc-etl-api/0.1.0` | Sent on every page fetch. It names this service rather than the HTTP library, because hosts with a client-identity policy refuse the library's default — Wikipedia answers `403` to `python-requests/*` and `200` to this. Set it to include the contact details such a policy asks for. A blank value falls back to this default rather than sending an empty header, which those hosts refuse as well. |

@@ -108,10 +108,13 @@ def test_search_while_indexing_is_well_formed_and_excludes_the_new_source():
             "neighbours_before",
             "neighbours_after",
             "neighbours",
+            "section",
+            "section_size",
         }
         assert result["address"] == "existing.txt"
         assert result["collections"] == []
         assert result["neighbours"] == [], "the request asked for no neighbours"
+        assert result["section"] == [], "the request asked for no section"
 
     gate.set()
     ingesting.join(timeout=10)

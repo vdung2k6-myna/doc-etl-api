@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class IngestFileResponse(BaseModel):
@@ -29,6 +29,11 @@ class UrlIngestRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
+    # Unknown fields are refused rather than ignored: a caller that misspells a
+    # field would otherwise receive a normal search response that silently omits
+    # what it asked for, which reads as an answer rather than as a mistake.
+    model_config = ConfigDict(extra="forbid")
+
     query: str = Field(..., description="Search query string")
     top_k: int | None = Field(None, ge=1, le=100, description="Number of results to return")
     collections: list[str] | None = Field(
@@ -44,6 +49,15 @@ class SearchRequest(BaseModel):
         "The default, 0, returns none. Neighbours are the chunks stored before and "
         "after a result within its own source, not the paragraphs around it, and they "
         "carry no score because they were not ranked against the query.",
+    )
+    expand: Literal["section"] | None = Field(
+        None,
+        description="Return each result's whole section rather than a fixed number of "
+        "adjacent chunks. A section is the run of chunks in the result's own source whose "
+        "text begins with the same heading line as the result's, taken outwards until the "
+        "heading changes or the source ends, and every result carries the chunks returned "
+        "and the section's true size. Omit for no section. `section` cannot be combined "
+        "with `neighbours`: stating both is rejected.",
     )
 
 
@@ -93,6 +107,23 @@ class SearchResult(BaseModel):
         description="The chunks stored immediately before and after this one in its source, "
         "in reading order, up to the neighbour count the request asked for. Empty when it "
         "asked for none. They carry no score because they were not ranked against the query.",
+    )
+    section: list[NeighbourChunk] = Field(
+        default_factory=list,
+        description="The chunks of this result's own section, in reading order, when the "
+        "request asked for a section expansion; empty when it did not. This result's own "
+        "text is one of them, repeated rather than referenced, so the passage can be "
+        "rendered from these chunks alone. They carry no score because they were not ranked "
+        "against the query, and they are bounded: `section_size` says how many chunks the "
+        "section really holds.",
+    )
+    section_size: int = Field(
+        0,
+        description="The number of chunks this result's section really holds, whether or "
+        "not every one of them was returned. It is larger than the number of `section` "
+        "chunks when the expansion was bounded, which is how a caller tells a truncated "
+        "section from a complete one. Zero when no section was asked for, or when the "
+        "result's place in its source could not be established.",
     )
 
 
