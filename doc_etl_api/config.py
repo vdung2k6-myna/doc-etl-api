@@ -161,6 +161,19 @@ class Settings(BaseSettings):
 
     max_file_size_mb: int = Field(default=50)
     url_fetch_timeout_seconds: int = Field(default=30)
+    # How long a job may go without advancing before it is reported failed. Only
+    # read with a durable backend, which is the only case where a job's owner can
+    # be an instance other than this one -- with the in-memory backend the row
+    # dies with the process that would have to report it.
+    #
+    # A running job refreshes its row every 30 seconds (see `job_heartbeat`), so
+    # this is generous against the longest *silence* a healthy job can produce,
+    # not against the longest ingestion: a slow parse beats throughout. The floor
+    # is what it costs to notice a job that stopped; the ceiling is what it costs
+    # to be wrong about one that did not, and being wrong is what this value
+    # exists to avoid, since a false failure is repaired by resubmitting and a
+    # job stuck pending forever is not.
+    job_orphan_threshold_seconds: int = Field(default=300, gt=0)
     user_agent: str = Field(default=DEFAULT_USER_AGENT)
     # The languages a scanned document is read in. Comma-separated, like the
     # corpus settings below. Vietnamese by default, because the service's content

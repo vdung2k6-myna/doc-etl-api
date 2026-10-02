@@ -7,10 +7,12 @@ from fastapi.openapi.utils import get_openapi
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from doc_etl_api.bootstrap import BootstrapState, BootstrapStatus, ingest_corpus
+from doc_etl_api.claims import ClaimStore, InProcessClaimStore
 from doc_etl_api.config import Settings, settings
-from doc_etl_api.jobs import JobRegistry
-from doc_etl_api.pipeline import DoclingConverter, create_pipeline
+from doc_etl_api.jobs import InProcessJobStore, JobRegistry, JobStore, instance_id
+from doc_etl_api.pipeline import DoclingConverter, IndexPipeline, create_pipeline
 from doc_etl_api.routes import router
+from doc_etl_api.store import PostgresIndexStore
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +68,50 @@ def _start_corpus_bootstrap(app: FastAPI, app_settings: Settings) -> None:
     state.status = BootstrapStatus.PENDING
     threading.Thread(
         target=ingest_corpus,
-        args=(app.state.pipeline, app_settings, state),
+        args=(app.state.pipeline, app_settings, state, app.state.claims),
         name="knowledge-bootstrap",
         daemon=True,
     ).start()
+
+
+def _build_jobs(app_settings: Settings, pipeline: IndexPipeline) -> JobRegistry:
+    """The jobs registry for the backend the pipeline's index was built for.
+
+    The records follow the index rather than a setting of their own: with a
+    durable backend they go into the same database, through the same engine, so a
+    job is readable from any instance; with the in-memory one there is no shared
+    place to put them and they stay in this process, which is what they always
+    were. Deciding from the store rather than from the setting keeps the two in
+    step -- a registry reading a database no store is using would be the one way
+    to have job status without an index to have status about.
+
+    The owner names this instance, so a job whose instance stops is attributable
+    and can be reported failed instead of pending forever.
+    """
+    store: JobStore = InProcessJobStore()
+    if isinstance(pipeline.store, PostgresIndexStore):
+        store = pipeline.store.job_store()
+    return JobRegistry(
+        store=store,
+        owner=instance_id(),
+        orphan_threshold_seconds=app_settings.job_orphan_threshold_seconds,
+    )
+
+
+def _build_claims(pipeline: IndexPipeline) -> ClaimStore:
+    """The claim store for the backend the pipeline's index was built for.
+
+    The claims follow the index for the same reason the job records do: with a
+    durable backend they go into the same database through the same engine, so a
+    claim is visible to every instance sharing that index -- which is the only
+    case where a claim does anything. With the in-memory backend they stay in
+    this process, where every claim is granted, because there is no other
+    instance for one to conflict with.
+    """
+    store: ClaimStore = InProcessClaimStore()
+    if isinstance(pipeline.store, PostgresIndexStore):
+        store = pipeline.store.claim_store()
+    return store
 
 
 def create_app() -> FastAPI:
@@ -83,7 +125,8 @@ def create_app() -> FastAPI:
 
     converter, embedding_model = _load_models()
     app.state.pipeline = create_pipeline(converter=converter, embedding_model=embedding_model)
-    app.state.jobs = JobRegistry()
+    app.state.jobs = _build_jobs(settings, app.state.pipeline)
+    app.state.claims = _build_claims(app.state.pipeline)
     app.state.bootstrap = BootstrapState()
 
     app.include_router(router)

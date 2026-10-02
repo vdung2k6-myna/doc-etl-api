@@ -926,22 +926,23 @@ class IndexPipeline:
             chunk_size=self._chunk_size,
             chunk_overlap=app_settings.chunk_overlap,
         )
-        self._index = VectorStoreIndex(
-            # The store's map of source to nodes, not a fresh one: the index reads
-            # that map when it deletes a source's earlier content, and a store
-            # that outlives the process holds one the index has not seen.
-            index_struct=self._store.index_struct(),
-            storage_context=self._store.storage_context,
-            # Whether the docstore keeps the text when the vector store does too.
-            # The in-memory vector store does not, so the index writes it either
-            # way; the durable one does, and there the override is what makes the
-            # docstore hold each chunk rather than only the vectors that point at
-            # it. See `PostgresIndexStore`.
-            store_nodes_override=self._store.store_nodes_override,
-        )
-        # Guards the shared vector store. Ingestion runs in the Starlette
-        # threadpool while search runs on the event loop, so both the write in
-        # the ingest methods and the read in `search` must hold this lock.
+        self._index = self._build_index()
+        # Guards the shared index against this process's own threads, and nothing
+        # else. Ingestion runs in the Starlette threadpool while search is
+        # offloaded from the event loop, so the write in the ingest methods, the
+        # read in `search` and the content read all take it -- which is what keeps
+        # one thread from reading a source's positions against another thread's
+        # nodes, and what keeps the catalog snapshot `_refresh_catalog` publishes
+        # coherent for the readers that take it without reading the store.
+        #
+        # It is not what keeps another instance out, and it never was: a lock in
+        # one process is invisible to the next. That guarantee is the store's
+        # transaction, held across the same writes -- see `_replace_source`. What
+        # this lock now costs is that a replacement holds it while that
+        # transaction is open, including while it waits for another instance that
+        # has claimed the same source, so a replacement elsewhere can hold up a
+        # search here. That is the price of the write being indivisible; the
+        # alternative is a search that reads a half-replaced source.
         self._index_lock = threading.Lock()
         # What is indexed, for the readiness endpoint and the source catalog.
         # These are a cache of what the store holds, rebuilt from it whenever it
@@ -958,9 +959,47 @@ class IndexPipeline:
         self._indexed_chunks = 0
         self._refresh_catalog()
 
+    def _build_index(self) -> VectorStoreIndex:
+        """An index over the store, starting from the map the store holds.
+
+        Built rather than kept for the life of the process because that map
+        changes underneath it: the index reads it when it deletes a source's
+        earlier content, and an index built before another instance wrote a
+        source holds a map that does not mention it. Deleting a source the map
+        does not mention is an error in the index, not a no-op -- so an instance
+        that took over a source another instance had written would fail on
+        content that is right there in the store.
+
+        Where the map is the store's, this is what re-reads it; where it is this
+        process's own, the store answers with an empty one and the index keeps
+        the map it built. `index_struct_is_stored` is what tells the two apart,
+        and `_replace_source` is the only place that has to.
+        """
+        return VectorStoreIndex(
+            nodes=[],
+            index_struct=self._store.index_struct(),
+            storage_context=self._store.storage_context,
+            # Whether the docstore keeps the text when the vector store does too.
+            # The in-memory vector store does not, so the index writes it either
+            # way; the durable one does, and there the override is what makes the
+            # docstore hold each chunk rather than only the vectors that point at
+            # it. See `PostgresIndexStore`.
+            store_nodes_override=self._store.store_nodes_override,
+        )
+
     @property
     def converter(self) -> DoclingConverter:
         return self._converter
+
+    @property
+    def store(self) -> IndexStore:
+        """Where this pipeline's index lives.
+
+        Exposed because the job records live in the same place: `main.py` builds
+        the jobs registry from the backend the store was built for, and the store
+        is what knows which backend that was and holds the engine for it.
+        """
+        return self._store
 
     @property
     def index(self) -> VectorStoreIndex:
@@ -1039,6 +1078,24 @@ class IndexPipeline:
             and record.content_hash == digest
             and record.collections == tuple(collections)
         )
+
+    def refresh(self) -> None:
+        """Re-read what the store holds into what this process reports.
+
+        The snapshot `is_current`, `source_catalog` and the readiness counters
+        answer from is this process's own, rebuilt by its own writes. That is
+        what makes those answers cheap and lock-free to read, and it is also what
+        makes them incomplete: content another instance ingested is in the store
+        and not in this process, so an instance deciding whether a source needs
+        ingesting has to look at the store rather than at what it happens to have
+        been told.
+
+        Taken under the same lock a replacement takes, so the rebuild is not run
+        while this process is publishing one of its own -- the snapshot is
+        replaced whole, and a reader never sees a half-rebuilt one.
+        """
+        with self._index_lock:
+            self._refresh_catalog()
 
     def _resolve_chunk_size(self, configured: int | None) -> int:
         """The chunk size to use, bounded by what the embedding model can read.
@@ -1225,10 +1282,13 @@ class IndexPipeline:
 
         Deletion is by document identity, so a source that has never been
         ingested needs no special case: removing content that is not there is a
-        no-op rather than an error. Both halves run inside the index lock, so a
-        concurrent search cannot observe a source half-replaced. The counters are
-        recomputed from what the store holds, which is what keeps them describing
-        stored content rather than submitted content.
+        no-op rather than an error. The whole of it -- the removal, the new nodes
+        and the catalog record -- is one write, so a reader on another instance
+        sees the source's earlier content or its replacement and never a mixture,
+        and a failure part way through leaves the earlier content in place rather
+        than an empty source. The counters are recomputed from what the store
+        holds, which is what keeps them describing stored content rather than
+        submitted content.
 
         The source's collections are replaced by the same write that replaces its
         nodes, so what a source belongs to cannot drift from what it holds: a
@@ -1236,29 +1296,41 @@ class IndexPipeline:
         the bytes it was ingested from, which is what a later startup compares to
         decide whether this source needs ingesting at all.
 
-        The nodes go to the index, which writes them to the store's vector table
-        and its docstore; the record and the positions go to the store's catalog.
-        The two writes are separate, and a crash between them leaves a source
-        whose text is stored and whose record is a revision behind -- repaired by
-        the next ingestion of that source, and caught by the bootstrap's
-        comparison, since a record whose hash does not match the content it holds
-        is not a record of it.
+        The record is written before the nodes, and that order is load-bearing
+        rather than incidental: that write claims the source's row, so a second
+        instance replacing the same source waits on the first one's transaction
+        instead of writing its nodes beside them. `_index_lock` is still held
+        across the whole of it, for what it can still do -- it keeps this
+        process's own ingest and search threads apart, so the catalog snapshot
+        published at the end is read from a store no other thread is writing to.
+        It is not what protects a reader on another instance; the transaction is.
         """
         with self._index_lock:
-            self._index.delete_ref_doc(source_key, delete_from_docstore=True)
-            self._index.insert_nodes(nodes)
-            self._store.replace(
-                source_key,
-                name=name,
-                source_type=source_type,
-                collections=collections,
-                chunk_count=len(nodes),
-                content_hash=content_hash,
-                # Written from the same nodes the line above counts, so a source's
-                # recorded order describes what the store holds and a re-ingestion
-                # replaces it rather than leaving positions from the content before.
-                positions={node.node_id: position for position, node in enumerate(nodes)},
-            )
+            # The replacement is one write, and the catalog snapshot is published
+            # after it commits rather than inside it: the snapshot is rebuilt by
+            # reading the store back, and a read taken inside the transaction
+            # would describe rows a rollback is about to take away.
+            with self._store.transaction():
+                self._store.replace(
+                    source_key,
+                    name=name,
+                    source_type=source_type,
+                    collections=collections,
+                    chunk_count=len(nodes),
+                    content_hash=content_hash,
+                    # Written from the same nodes the index is about to store, so
+                    # a source's recorded order describes what the store holds and
+                    # a re-ingestion replaces it rather than leaving positions from
+                    # the content before.
+                    positions={node.node_id: position for position, node in enumerate(nodes)},
+                )
+                # After the claim, so that the map read is of a source no other
+                # instance is part way through replacing -- and the index is what
+                # reads that map to find the content being removed.
+                if self._store.index_struct_is_stored:
+                    self._index = self._build_index()
+                self._index.delete_ref_doc(source_key, delete_from_docstore=True)
+                self._index.insert_nodes(nodes)
             self._refresh_catalog()
 
     def ingest_file(
@@ -1495,8 +1567,20 @@ class IndexPipeline:
                     )
                 ]
             )
-        retriever = self._index.as_retriever(similarity_top_k=top_k, filters=filters)
+        # Held for the whole read, and read rather than write: a hit's placement
+        # is taken from the positions the store holds, and a replacement writing
+        # those positions in another thread would have this reading one
+        # ingestion's hits against another's. See `_index_lock` at the lock's
+        # definition for what it does and does not cover.
         with self._index_lock:
+            # Built here, inside the lock, rather than before it: the retriever
+            # is handed the index's node ids as they stand at construction, so
+            # one built outside would search the node set from before a write
+            # that committed in between -- a search that answered "no such
+            # content" for content the write had just stored. Which nodes exist
+            # and which are searched have to be the same moment, and this is
+            # that moment.
+            retriever = self._index.as_retriever(similarity_top_k=top_k, filters=filters)
             nodes = retriever.retrieve(query)
             results = []
             for hit in nodes:

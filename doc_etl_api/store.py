@@ -4,21 +4,27 @@ The pipeline is written against one small interface -- `IndexStore` -- and not
 against a backend, so the same ingestion, search and content paths run on either
 of the two that implement it. The default one is the process's own memory: the
 in-memory vector store the index has always used, and the catalog dicts the
-pipeline has always kept beside it. The durable one puts all three kinds of row
-in Postgres -- the embeddings in a pgvector table, each chunk's text and metadata
-in a docstore table, and what this service knows about its sources in tables of
-its own -- so that a restart does not discard them.
+pipeline has always kept beside it. The durable one puts the index in Postgres
+-- the embeddings in a pgvector table, each chunk's text and metadata in a
+docstore table, and what this service knows about its sources in tables of its
+own -- so that a restart does not discard them. Jobs are kept there too, by the
+registry that reads this store's engine, so that a job's record outlives the
+instance that accepted it.
 
-Three tables for one collection, from two naming rules. The library names its
-own two `data_<table>` and `data_<table>_docstore` after the configured table
-name; the catalog tables are named `<table>_sources`, `<table>_positions` and
-`<table>_model` beside them, so that everything one collection needs shares one
-identifier and a second collection is built by naming a second table.
+Three catalog tables for one collection, from two naming rules. The library
+names its own two `data_<table>` and `data_<table>_docstore` after the configured
+table name; the catalog tables are named `<table>_sources`, `<table>_positions`
+and `<table>_model` beside them, so that everything one collection needs shares
+one identifier and a second collection is built by naming a second table. The
+jobs table is named by that same rule -- `<table>_jobs` -- and defined in
+`jobs.py`, beside the registry whose rows it holds.
 """
 
+import contextlib
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -33,7 +39,9 @@ from llama_index.vector_stores.postgres import PGVectorStore
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from doc_etl_api.claims import PostgresClaimStore, claims_table
 from doc_etl_api.config import Settings
+from doc_etl_api.jobs import PostgresJobStore, jobs_table
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +116,42 @@ class IndexStore(Protocol):
 
     def positions(self, address: str) -> dict[str, int]: ...
 
+    @property
+    def index_struct_is_stored(self) -> bool:
+        """Whether the map is the store's to answer for, rather than the index's.
+
+        True where the store outlives the process. There the map the index holds
+        is a copy taken when it was built, and an instance that did not write the
+        last replacement holds a copy that is behind -- so a replacement has to
+        read the map back before it deletes anything, or it fails on a source's
+        node ids that are in the store and not in its own copy.
+        """
+        ...
+
+    def transaction(self) -> AbstractContextManager[None]:
+        """Run the writes inside this block as one unit, or none of them.
+
+        The pipeline wraps one replacement in this, which is the reason it
+        exists: removing a source's earlier nodes, writing its new ones and
+        recording it in the catalog have to reach other instances together. Split
+        into separate commits, a reader on another instance can observe the
+        source with its earlier content removed and its replacement not yet
+        written, and a failure after the removal leaves it that way for good.
+
+        What that costs is the backend's to decide. In this process's memory the
+        writes are already indivisible while the caller's lock is held, so the
+        block has nothing of its own to do. In Postgres it is one transaction on
+        one connection, with the library's own stores joined to it, so that a
+        reader anywhere sees the source before the replacement or after it and
+        never in between.
+
+        The block is not a lock across instances: two instances replacing two
+        different sources still run side by side. It is the source's own catalog
+        row that serializes two replacements of one source, which is why
+        `replace` writes it first.
+        """
+        ...
+
     def replace(
         self,
         address: str,
@@ -158,6 +202,28 @@ class InProcessIndexStore:
     def positions(self, address: str) -> dict[str, int]:
         return dict(self._positions.get(address, {}))
 
+    @property
+    def index_struct_is_stored(self) -> bool:
+        """False: the map is the index's, and this store has nothing to add to it.
+
+        There is one process and one index, so the map the index built is the
+        only one there is and re-reading it would mean replacing it with an
+        empty. See the member's documentation on `IndexStore`.
+        """
+        return False
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Nothing of its own: this process's writes are already one unit.
+
+        There is no second instance reading this store and no commit to get half
+        way through, so the block only needs the caller's lock, which is held
+        around it. It is here rather than left out so that the pipeline has one
+        shape on both backends and the durable one's transaction is not a branch
+        the writer path takes.
+        """
+        yield
+
     def replace(
         self,
         address: str,
@@ -191,7 +257,10 @@ class PostgresIndexStore:
     catalog's reads and the index's writes then reach the same database through
     the same pool, and because the library's stores require an asynchronous
     engine to be given alongside the synchronous one whether or not anything
-    asynchronous is run against it.
+    asynchronous is run against it. One engine is also what makes a replacement
+    one transaction rather than three: `transaction` joins the stores' sessions
+    to a single connection, and there has to be a single engine for there to be
+    one connection to join them to.
 
     The docstore holds each chunk's text even though the vector table holds it
     too. `PGVectorStore` reports that it stores text, which is what keeps the
@@ -237,6 +306,11 @@ class PostgresIndexStore:
             engine=self._engine,
             async_engine=self._async_engine,
         )
+        # Kept so that `transaction` can reach the session factory the docstore
+        # and the index store both write through. Both are built on this one
+        # kvstore rather than one each, which is what makes joining them to a
+        # single transaction a matter of joining one factory.
+        self._kvstore = kvstore
         self._docstore = PostgresDocumentStore(postgres_kvstore=kvstore)
         # The map from a source to its nodes is persisted beside the nodes
         # themselves, in the same table under its own namespace. It is what makes
@@ -250,6 +324,11 @@ class PostgresIndexStore:
         )
         self._establish_vector_table()
         self._validate_collection()
+        # The connection a replacement is in progress on, or None outside one.
+        # `transaction` sets it and clears it; `replace` reads it so that a
+        # record written during a replacement goes to the same transaction as the
+        # nodes rather than to a second one of its own.
+        self._connection: sqlalchemy.Connection | None = None
 
     @property
     def vector_table_name(self) -> str:
@@ -273,6 +352,17 @@ class PostgresIndexStore:
 
     @property
     def store_nodes_override(self) -> bool:
+        return True
+
+    @property
+    def index_struct_is_stored(self) -> bool:
+        """True: the map is in the database, and another instance may have moved it.
+
+        The map is written to the same table as the nodes, under a namespace of
+        its own, so it is part of what a replacement commits. A process is
+        therefore only ever holding a copy of it, taken when the index was built.
+        See the member's documentation on `IndexStore`.
+        """
         return True
 
     def index_struct(self) -> IndexDict:
@@ -380,7 +470,35 @@ class PostgresIndexStore:
             sqlalchemy.Column("model_name", sqlalchemy.Text, primary_key=True),
             sqlalchemy.Column("embed_dim", sqlalchemy.Integer, nullable=False),
         )
+        # The job records, created here with the rest of the schema because this
+        # is where the schema is established: they belong to the same database
+        # and the same base name, and a jobs table that appeared on first use
+        # instead would be a second thing to establish, in a second place, for a
+        # table the readiness endpoint counts rows in.
+        jobs_table(base, metadata)
+        # The bootstrap claims, created here for the same reason and in the same
+        # way: one database, one base name, one place the schema is established.
+        claims_table(base, metadata)
         metadata.create_all(self._engine)
+
+    def job_store(self) -> "PostgresJobStore":
+        """A jobs registry backing over this store's own database and engine.
+
+        Built from the engine rather than from the settings, so it cannot be
+        pointed at a different database than the index it is read beside, and so
+        a deployment holds one pool rather than two.
+        """
+        return PostgresJobStore(self._engine, self._settings.postgres_table_name)
+
+    def claim_store(self) -> "PostgresClaimStore":
+        """A claim store over this store's own database and engine.
+
+        Built from the engine rather than from the settings, for the same reason
+        the job store is: it cannot be pointed at a different database than the
+        index the claims are about, and a deployment holds one pool rather than
+        two.
+        """
+        return PostgresClaimStore(self._engine, self._settings.postgres_table_name)
 
     def _establish_vector_table(self) -> None:
         """Have the vector store create its table now rather than at first use.
@@ -507,6 +625,60 @@ class PostgresIndexStore:
             ).all()
         return {row.node_id: row.position for row in rows}
 
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """One transaction on one connection, with the library's stores joined to it.
+
+        The index writes a replacement through the library's own stores -- the
+        vector store, the docstore and the index store -- and each of those opens
+        a session per call, which is a connection of its own from the pool and a
+        transaction of its own with it. So the replacement would commit in three
+        pieces however this method is written, unless the sessions are pointed at
+        this connection instead.
+
+        That is what happens here, and it is the whole of the mechanism:
+        `sessionmaker(bind=connection)` is SQLAlchemy's own way of putting a
+        session into a transaction that is already open -- it joins as a
+        savepoint, so the session's own `commit()` releases the savepoint and
+        leaves this transaction to decide. It is done by assigning the two
+        session factories the library builds for itself, which is the only way
+        in: neither store accepts a connection, only an engine, and a session
+        built from an engine takes a fresh connection every time.
+
+        Both assignments are private state of a third-party library, so they are
+        restored before this returns whatever happened, and two threads must
+        never be inside this block at once -- the caller holds `_index_lock`
+        around it, and the same lock keeps every reader in this process out while
+        the factories are redirected. Assigning them is the cost of the
+        guarantee: without it a second instance reads a source whose earlier
+        content has been deleted and whose replacement has not been written yet.
+
+        The connection is opened here rather than taken from the session, so that
+        a failure inside the block rolls the whole thing back and leaves the
+        source exactly as it was. The catalog row is written by the caller's
+        first statement inside the block, which is what makes a second instance
+        replacing the same source wait here rather than interleave.
+        """
+        connection = self._engine.connect()
+        outer = connection.begin()
+        vector_sessions = self._vector_store._session
+        kv_sessions = self._kvstore._session
+        self._vector_store._session = sqlalchemy.orm.sessionmaker(bind=connection)
+        self._kvstore._session = sqlalchemy.orm.sessionmaker(bind=connection)
+        self._connection = connection
+        try:
+            yield
+        except BaseException:
+            outer.rollback()
+            raise
+        else:
+            outer.commit()
+        finally:
+            self._connection = None
+            self._vector_store._session = vector_sessions
+            self._kvstore._session = kv_sessions
+            connection.close()
+
     def replace(
         self,
         address: str,
@@ -520,15 +692,21 @@ class PostgresIndexStore:
     ) -> None:
         """Write *address*'s record and positions, replacing what it held.
 
-        Both halves are one transaction, so a source's recorded order always
-        describes one ingestion rather than two halves of two. That is as far as
-        one transaction reaches: the nodes themselves are written by the index to
-        the library's own tables, before this is called, and the two writes are
-        not joined. A crash between them leaves a source whose text is stored and
-        whose record is a revision behind -- which the next ingestion of that
-        source repairs, and which the bootstrap's content comparison would also
-        catch, since a record that does not match the content it holds is not a
-        record of it.
+        The pipeline calls this first inside a replacement's `transaction`, and
+        that order is load-bearing rather than incidental: the upsert below takes
+        the source's row lock, so a second instance replacing the same source
+        waits here instead of writing its nodes alongside the first one's. Called
+        that way, the record commits with the nodes or not at all.
+
+        It also stands on its own, outside a transaction, where it is a write of
+        this call's own. Nothing in the service does that; it is what the
+        interface promises a store asked to write one source, and what the
+        in-process backend answers by writing its dicts.
+
+        The positions are deleted and rewritten rather than merged, so a source's
+        recorded order always describes one ingestion rather than two halves of
+        two -- an ingestion that produced fewer chunks than the one before it
+        would otherwise leave positions past its end pointing at nothing.
         """
         values = {
             "address": address,
@@ -538,7 +716,7 @@ class PostgresIndexStore:
             "chunk_count": chunk_count,
             "content_hash": content_hash,
         }
-        with self._engine.begin() as connection:
+        with self._write_connection() as connection:
             connection.execute(
                 postgresql.insert(self._sources)
                 .values(**values)
@@ -556,6 +734,22 @@ class PostgresIndexStore:
                         for node_id, position in positions.items()
                     ],
                 )
+
+    @contextlib.contextmanager
+    def _write_connection(self) -> Iterator[sqlalchemy.Connection]:
+        """The connection a replacement is in progress on, or one of this call's own.
+
+        Two cases, and the difference between them is the whole of what
+        `transaction` buys: inside one, this is the connection the index's stores
+        were joined to, so the record and the nodes commit together; outside one,
+        it is a transaction that begins and ends with this write, which is what a
+        caller asking this store to write a single source is entitled to.
+        """
+        if self._connection is not None:
+            yield self._connection
+            return
+        with self._engine.begin() as connection:
+            yield connection
 
     def close(self) -> None:
         """Release the connections this store holds.

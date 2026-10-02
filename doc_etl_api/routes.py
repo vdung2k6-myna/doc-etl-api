@@ -21,7 +21,7 @@ from starlette.concurrency import run_in_threadpool
 
 from doc_etl_api.bootstrap import BootstrapState
 from doc_etl_api.config import Settings, settings, validate_collections
-from doc_etl_api.jobs import JobRegistry
+from doc_etl_api.jobs import JobRegistry, job_heartbeat
 from doc_etl_api.pipeline import IndexPipeline
 from doc_etl_api.schemas import (
     HealthResponse,
@@ -91,16 +91,24 @@ def _run_file_ingestion(
     if job is None:
         return
     try:
-        result, timings = pipeline.ingest_file(
-            source_id=source_id,
-            file=BytesIO(file_bytes),
-            filename=filename,
-            mime_type=mime_type,
-            collections=collections,
-        )
+        # The beat runs while the ingestion does, so a job that takes longer than
+        # the orphan threshold to finish says it is still advancing rather than
+        # falling silent and being reported as belonging to a stopped instance.
+        with job_heartbeat(jobs, job_id):
+            result, timings = pipeline.ingest_file(
+                source_id=source_id,
+                file=BytesIO(file_bytes),
+                filename=filename,
+                mime_type=mime_type,
+                collections=collections,
+            )
         job.complete(result, timings)
     except Exception as exc:
         job.fail(str(exc))
+    # Written back rather than left on the object. With the in-memory backing
+    # these were the same object and mutating it was enough; with a durable one
+    # the record is a row, and a mutation that is never written is not a record.
+    jobs.update(job)
 
 
 def _run_url_ingestion(
@@ -116,12 +124,14 @@ def _run_url_ingestion(
     if job is None:
         return
     try:
-        result, timings = pipeline.ingest_url(
-            source_id=source_id, url=url, timeout=timeout, collections=collections
-        )
+        with job_heartbeat(jobs, job_id):
+            result, timings = pipeline.ingest_url(
+                source_id=source_id, url=url, timeout=timeout, collections=collections
+            )
         job.complete(result, timings)
     except Exception as exc:
         job.fail(str(exc))
+    jobs.update(job)
 
 
 @router.get(

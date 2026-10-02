@@ -535,33 +535,49 @@ def test_concurrent_ingestion_keeps_every_source_searchable(searchable_pipeline)
     assert {r["source_id"] for r in results} == {"source-1", "source-2"}
 
 
-def test_search_during_ingestion_returns_well_formed_results(searchable_pipeline):
-    """A search overlapping an index write must not raise or return junk."""
-    ingest_started = threading.Event()
+def test_search_during_ingestion_returns_well_formed_results(searchable_pipeline, monkeypatch):
+    """A search overlapping an index write must not raise or return junk.
+
+    The overlap is with the write itself and not with the parse before it: the
+    insert is held open while the search is submitted, so the two are contending
+    for the index at the moment that matters. The search waits for the write to
+    finish, which is what the lock is for -- and it then has to answer from what
+    the write stored, well-formed, rather than reading the index while another
+    thread has the store half-written or the library's sessions redirected.
+    """
+    reached_the_write = threading.Event()
     allow_ingest_to_finish = threading.Event()
 
-    def convert(file, filename):
-        ingest_started.set()
+    original = type(searchable_pipeline._index).insert_nodes
+
+    def held_open(self, nodes, **kwargs):
+        reached_the_write.set()
         assert allow_ingest_to_finish.wait(timeout=5)
-        return "# Doc\n\nSome content."
+        return original(self, nodes, **kwargs)
 
-    searchable_pipeline.converter.convert_file.side_effect = convert
+    monkeypatch.setattr(type(searchable_pipeline._index), "insert_nodes", held_open)
+    searchable_pipeline.converter.convert_file.side_effect = lambda file, filename: (
+        "# Doc\n\nSome content."
+    )
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ingest = pool.submit(
             searchable_pipeline.ingest_file,
             source_id="source-1",
             file=BytesIO(b"content"),
             filename="doc.txt",
         )
-        assert ingest_started.wait(timeout=5)
-        results = searchable_pipeline.search("Some content", top_k=5)
+        assert reached_the_write.wait(timeout=5), "the ingest never reached the index write"
+        overlapping = pool.submit(searchable_pipeline.search, "Some content", 5)
+        assert not ingest.done(), "the ingest finished before the search was submitted"
         allow_ingest_to_finish.set()
-        future.result(timeout=5)
+        results = overlapping.result(timeout=5)
+        ingest.result(timeout=5)
 
-    assert isinstance(results, list)
+    assert results, "the search returned nothing rather than what the write stored"
     for result in results:
-        assert set(result) == {"text", "score", "source_id", "source_type", "source_name"}
+        assert {"text", "score", "source_id", "source_type", "source_name"} <= set(result)
+    assert {result["source_id"] for result in results} == {"source-1"}
 
 
 def test_index_counters_track_sources_and_chunks(searchable_pipeline):

@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from doc_etl_api.config import MAX_COLLECTIONS_PER_REQUEST, Settings
-from doc_etl_api.jobs import JobRegistry, JobStatus
+from doc_etl_api.jobs import JobStatus
 from doc_etl_api.main import create_app
 from doc_etl_api.pipeline import IndexPipeline, SourceRecord
 from doc_etl_api.schemas import SearchRequest, SearchResult
@@ -26,7 +26,8 @@ def client():
             app = create_app()
     app.state.pipeline = MagicMock()
     app.state.pipeline.converter.is_supported_file.return_value = True
-    app.state.jobs = JobRegistry()
+    # The registry `create_app` built stays: the mocked pipeline is not a durable
+    # store, so it is already backed by the in-memory one this test wants.
     return TestClient(app)
 
 

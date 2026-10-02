@@ -642,7 +642,7 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `POSTGRES_DATABASE` | *(empty)* | Database name. Required by the durable backend. |
 | `POSTGRES_USER` | *(empty)* | User the service connects as. Required by the durable backend. Under `docker compose` this is the container's superuser, which is what lets the store create the `vector` extension. |
 | `POSTGRES_PASSWORD` | *(empty)* | That user's password. Required by the durable backend. Special characters are escaped when the connection URL is built, so a password containing `@`, `:` or `/` needs no quoting. |
-| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, and this service's own catalog. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
+| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, this service's own catalog, and each job's record. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Hugging Face embedding model name. |
 | `CHUNK_SIZE` | the embedding model's input limit | Bounds a node rather than placing its boundary, in the embedding model's tokens, special tokens included. A node's boundaries are the document's own — a heading opens a section, a paragraph break ends a unit — and a unit that fits is stored as itself; only a unit wider than this is divided further, at sentence boundaries, or at row boundaries with the header repeated if it is a table. Unset derives it from the model (256 for the default model), so it tracks the model rather than going stale against it; an explicit value larger than the model's limit is rejected at startup, because such chunks would be truncated before they were embedded. Measured on the corpus this was tuned on, it is a bound rather than a lever: lowering it from 8,192 to 512 moved the node count only from 386 to 404, because all but 10 of the 577 units were already smaller than 512. Set it only to go smaller. |
 | `CHUNK_OVERLAP` | `50` | Overlap, in the same tokens as `CHUNK_SIZE`, applied only where a unit had to be divided at sentence boundaries — the one case where no boundary of the document's own was left to divide on. A node separated from its neighbour at a heading or paragraph boundary therefore repeats nothing: the seam is where the source changed subject, and repeating text across it would store the same text twice. Overlap is quantized to whole sentences, so the achieved overlap can be lower than this, and is zero when a single sentence exceeds the budget. |
@@ -651,6 +651,7 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `MAX_SECTION_CHUNKS` | `25` | How many chunks one section expansion may return — see [Sections](#sections). The cap is a limit on the answer, not a section size: a document whose headings were dropped upstream has one section that is the whole source, so the returned part is bounded and the section's true size is reported beside it as `section_size`, which is how a caller tells a truncated section from a complete one. The bound matters because the walk reads each chunk from the index under the same lock an ingestion takes, and a document in the corpus this was measured on holds 549 chunks in one section. A value below `1` is rejected as the settings are built: a ceiling that would return nothing leaves nothing for asking for no expansion to mean. |
 | `MAX_FILE_SIZE_MB` | `50` | Maximum uploaded file size in MB. |
 | `URL_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for fetching URLs. |
+| `JOB_ORPHAN_THRESHOLD_SECONDS` | `300` | How long a job may go without its owning instance reporting progress before `GET /jobs/{job_id}` reports it `failed`, naming that instance, rather than leaving it `pending` forever. Each job's record carries the instance that owns it and when it last advanced, and a running ingestion advances it every 30 seconds, so this bounds silence rather than how long an ingestion may take: a slow parse keeps reporting. It is read on either backend, but it is the durable one it is for: with `simple` a job's record dies with the process that would have to report it, so a stopped instance leaves nothing to call failed, and what is left for the threshold to catch is an ingestion that stalled inside a process that is still running. Raise it if an instance may be paused long enough to miss several beats; lowering it narrows how long a job whose instance stopped is shown as running, at the cost of calling a healthy but briefly stalled one failed. |
 | `USER_AGENT` | `doc-etl-api/0.1.0` | Sent on every page fetch. It names this service rather than the HTTP library, because hosts with a client-identity policy refuse the library's default — Wikipedia answers `403` to `python-requests/*` and `200` to this. Set it to include the contact details such a policy asks for. A blank value falls back to this default rather than sending an empty header, which those hosts refuse as well. |
 | `PDF_OCR_LANGUAGES` | `vi` | Comma-separated languages a scanned PDF is read in. Defaults to Vietnamese, because a recogniser that does not know a language's diacritics substitutes others rather than dropping them, and in Vietnamese the diacritics are the word — reading a Vietnamese scan without `vi` was measured to recover 57% fewer of them. Only pages with no text layer are read this way; a page carrying its own text keeps it. A value naming no language, or a malformed code, is rejected as the settings are built, so a typo stops the service from starting rather than failing the first document that needs OCR. |
 | `KNOWLEDGE_CORPUS_DIR` | *(empty)* | Local directory whose supported files are ingested at startup, so a restart does not leave the index empty. Empty disables startup ingestion for local files. |
@@ -668,6 +669,16 @@ All settings are loaded from environment variables or an `.env` file. Copy
 |---|---|---|
 | `simple` (default) | In this process | It starts empty; the startup corpus is what refills it |
 | `postgres` | A Postgres database | It is still there — sources, chunk text, vectors and collections |
+
+Job status follows the index rather than a setting of its own. With `postgres`
+each job's record is a row beside the catalog, so `GET /jobs/{job_id}` answers
+from any instance of the service and `jobs_in_flight` counts every instance's
+running work, not just the one that answered the request. With `simple` the
+record lives in the process that accepted the submission — there is nowhere
+shared to put it — so a job polled at a second instance is reported not found.
+That is a limitation of the backend, not of the endpoint: run more than one
+instance behind a load balancer and a caller must be able to poll the same one
+that accepted the submission, or the backend must be `postgres`.
 
 ### The durable backend
 
@@ -687,8 +698,8 @@ the service at it:
 VECTOR_STORE_BACKEND=postgres python -m doc_etl_api.main
 ```
 
-Three things live in that database, and it is three because a durable index is
-not one table:
+Four things live in that database, and it is more than one because a durable
+index is not one table:
 
 - **The vectors** — held by pgvector, compared by search.
 - **Each chunk's text and metadata** — held by the docstore, in the same
@@ -703,6 +714,13 @@ not one table:
 - **This service's own catalog** — the sources, the chunk position of each node
   for reading order and for neighbours, and the embedding model the collection
   was built with.
+- **Each job's record** — its status, result, error, timings, the instance that
+  owns it and when that instance last advanced it. Small, but the part of the
+  service a caller polling a load-balanced address depends on: it is what lets a
+  job submitted to one instance be polled at another, and what lets a job whose
+  instance stopped be reported `failed` rather than `pending` for as long as the
+  row exists. The threshold that decides when is
+  `JOB_ORPHAN_THRESHOLD_SECONDS`.
 
 At startup the service connects, enables the extension, creates what is missing
 and validates what it found. It stops rather than serve from a store it cannot
@@ -740,6 +758,31 @@ failure, per source, exactly as before.
 Ingesting by hand is unaffected: `POST /sources/files` and `POST /sources/urls`
 always re-ingest, whether or not the content changed. The comparison belongs to
 the startup corpus.
+
+### The startup corpus, across several instances
+
+Instances that share a durable backend also share a corpus, and they all start
+at once. Each source is loaded by one of them: an instance takes a claim on a
+source before reading it — a row keyed by the source's address, naming the
+instance and when it was taken, in `<POSTGRES_TABLE_NAME>_claims` — and an
+instance that finds the source already claimed waits for the instance that has
+it instead of loading it again. Replicas therefore do one instance's worth of
+startup work between them, not one per instance.
+
+The instance that waits does not report an empty index for having waited.
+`/health` on it reports `bootstrap: complete` and counts the corpus in
+`indexed_sources` once another instance has ingested it, because it re-reads
+what the store holds rather than answering from what its own startup ingested —
+until then it reports `pending` or `in_progress`, and never `complete` for a
+corpus nobody has loaded.
+
+A claim is released when its ingestion finishes. An instance that stops
+mid-bootstrap leaves its claim behind, and that claim is taken over once it is
+older than `JOB_ORPHAN_THRESHOLD_SECONDS` — the threshold job ownership uses, so
+a dead instance's source is loaded by a surviving one rather than left out of
+the index. The same threshold bounds how long a waiting instance waits: if it
+never gets the claim it reports that source as a bootstrap failure, rather than
+calling a corpus complete that it could not confirm.
 
 ## Performance notes
 

@@ -113,7 +113,7 @@ def test_bootstrap_runs_without_blocking_startup(monkeypatch, tmp_path):
     release = threading.Event()
     finished = threading.Event()
 
-    def blocking_bootstrap(pipeline, app_settings, state):
+    def blocking_bootstrap(pipeline, app_settings, state, claims):
         state.status = BootstrapStatus.IN_PROGRESS
         release.wait(timeout=5)
         state.status = BootstrapStatus.COMPLETE
@@ -461,7 +461,6 @@ def test_a_corpus_source_is_fetchable_by_its_filename(tmp_path):
 
     from fastapi.testclient import TestClient
 
-    from doc_etl_api.jobs import JobRegistry
     from doc_etl_api.main import create_app
 
     (tmp_path / "handbook.txt").write_text("handbook")
@@ -481,7 +480,6 @@ def test_a_corpus_source_is_fetchable_by_its_filename(tmp_path):
         with patch("doc_etl_api.main.create_pipeline", return_value=MagicMock()):
             app = create_app()
     app.state.pipeline = pipeline
-    app.state.jobs = JobRegistry()
 
     response = TestClient(app).get("/sources/content", params={"address": "handbook.txt"})
 

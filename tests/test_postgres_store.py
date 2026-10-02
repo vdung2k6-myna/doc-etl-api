@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from functools import partial
@@ -25,6 +26,7 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import sqlalchemy
 from fastapi import FastAPI
@@ -32,9 +34,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 
+from doc_etl_api.bootstrap import BootstrapState, BootstrapStatus, ingest_corpus
 from doc_etl_api.config import Settings, VectorStoreBackend
 from doc_etl_api.main import create_app
-from doc_etl_api.pipeline import IndexPipeline, content_hash, create_pipeline
+from doc_etl_api.pipeline import IndexPipeline, _node_id, content_hash, create_pipeline
 from doc_etl_api.store import DurableStoreError, PostgresIndexStore
 from tests.stubs import EMBEDDING_MODEL_NAME, StubEmbedding
 
@@ -79,6 +82,21 @@ LONG_DOC = "\n\n".join(
         PARAGRAPH,
         PARAGRAPH.replace("reading order", "source order"),
         PARAGRAPH.replace("a source", "one source"),
+    ]
+)
+
+# Two documents of different length, for the tests that race two instances
+# against one source. A copy of one is then distinguishable from a copy of the
+# other by how many chunks it holds -- which is what makes a mixture of the two
+# visible as a source recording one document's count and holding both. Each
+# carries a word the other does not, so that the copy can also be shown to be one
+# document's rather than a splice of both.
+ALPHA_DOC = PARAGRAPH.replace("reading order", "ALPHAMARK order")
+BRAVO_DOC = "\n\n".join(
+    [
+        PARAGRAPH.replace("reading order", "BRAVOMARK order"),
+        PARAGRAPH.replace("a source", "BRAVOMARK one source"),
+        PARAGRAPH.replace("every chunk", "BRAVOMARK all chunks"),
     ]
 )
 
@@ -147,6 +165,8 @@ def _drop_collection(table: str) -> None:
         f"{table}_sources",
         f"{table}_positions",
         f"{table}_model",
+        f"{table}_jobs",
+        f"{table}_claims",
     ]
     try:
         with engine.begin() as connection:
@@ -562,6 +582,115 @@ def test_a_restart_keeps_both_an_uploaded_document_and_a_configured_corpus(
 
 
 @needs_database
+def test_a_search_is_answered_while_an_ingestion_writes(monkeypatch, tmp_path, collection):
+    """A search submitted during an ingestion job is answered, and the job lands.
+
+    Through the routes, on the durable backend, with the two arriving together:
+    the upload is accepted and runs on a worker of the server's own while the
+    search is served, so a search that comes in at that moment has to get its
+    answer rather than wait for the server to fall idle -- which is what makes the
+    worker the ingestion runs on and the worker the search runs on separate things
+    the service has to keep separate.
+
+    The write is held open so the search is submitted inside it, and the search's
+    own answer is stamped with that: what it has to be is a 200 carrying
+    well-formed results rather than a failure or a half-written source. What the
+    results are drawn from is the index as it stands when the search is served,
+    which is after the write it waited on -- the search is held by the same lock
+    the replacement holds, so a source is never served out of an ingestion that
+    has not finished. That the uploaded document is among the results once the job
+    has run is what says the two requests really did overlap and land.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    contents = {
+        "guide.txt": "# Guide\n\nThe STAR method structures behavioural answers.",
+        "handbook.txt": "# Handbook\n\nThe XYZZY convention records unrelated remarks.",
+    }
+    (corpus / "guide.txt").write_text(contents["guide.txt"])
+    app_settings = _settings(table=collection, knowledge_corpus_dir=str(corpus))
+    monkeypatch.setattr("doc_etl_api.main.settings", app_settings)
+
+    app = _started_app(_stubbed_models(contents, []), app_settings)
+    client = TestClient(app)
+    try:
+        assert _wait_for_bootstrap(client) == "complete"
+
+        pipeline = app.state.pipeline
+        # Set while the ingestion is inside its index write and cleared when it
+        # leaves it, so reading it when the search is submitted says whether the
+        # two really were in flight together or merely close in time.
+        inside_the_write = threading.Event()
+        original = type(pipeline._index).insert_nodes
+
+        def held_open(self, nodes, **kwargs):
+            inside_the_write.set()
+            try:
+                time.sleep(0.5)
+                return original(self, nodes, **kwargs)
+            finally:
+                inside_the_write.clear()
+
+        monkeypatch.setattr(type(pipeline._index), "insert_nodes", held_open)
+
+        accepted: list[httpx.Response] = []
+
+        def upload() -> None:
+            accepted.append(
+                client.post(
+                    "/sources/files",
+                    files={
+                        "files": (
+                            "handbook.txt",
+                            BytesIO(b"the bytes of handbook.txt"),
+                            "text/plain",
+                        )
+                    },
+                )
+            )
+
+        uploading = threading.Thread(target=upload)
+        uploading.start()
+        try:
+            assert inside_the_write.wait(timeout=60), "the ingestion never reached the write"
+            overlapped = inside_the_write.is_set()
+            answered = client.post("/search", json={"query": "STAR", "top_k": 5})
+        finally:
+            uploading.join(timeout=60)
+            monkeypatch.setattr(type(pipeline._index), "insert_nodes", original)
+
+        assert overlapped, "the search was submitted after the write had finished"
+        assert accepted and accepted[0].status_code == 202, [r.status_code for r in accepted]
+        assert answered.status_code == 200, answered.text
+        results = answered.json()["results"]
+        assert results, "the search returned nothing rather than the corpus it holds"
+        # Every hit has to be a chunk a source holds, whole: a source served while
+        # it was being written would come back as a passage with no source, a
+        # splice of two documents, or a chunk of one that is not in it any more.
+        held = {
+            chunk["text"]
+            for name in contents
+            for chunk in client.get("/sources/content", params={"address": name}).json()["chunks"]
+        }
+        assert len(held) >= len(contents), "the sources were not stored as whole chunks"
+        for result in results:
+            assert result["text"] in held, "a result came back carrying text no source holds"
+
+        # Both sources whole and searchable once the job has run, which is what
+        # says the two requests overlapped rather than one happening after the
+        # other: the upload's document is in the index the second search reads.
+        landed = client.post("/search", json={"query": "XYZZY", "top_k": 5}).json()["results"]
+        assert {result["source_name"] for result in landed} == set(contents), (
+            "the ingested document did not become searchable once its job had run"
+        )
+        assert any("XYZZY" in result["text"] for result in landed), (
+            "the ingested document came back without its own text"
+        )
+    finally:
+        app.state.pipeline._store.close()
+
+
+@needs_database
 def test_a_second_process_reads_what_this_one_ingested(collection):
     """What survives a restart is the database, proved across an interpreter.
 
@@ -597,3 +726,595 @@ def test_a_second_process_reads_what_this_one_ingested(collection):
     assert read_back["digest"] == written.content_hash
     assert read_back["collections"] == ["csharp"]
     assert read_back["positions"] == list(range(written.chunk_count))
+
+
+def _committed_state(engine, table: str, address: str) -> tuple[int, int, int]:
+    """What one committed instant says about a source: recorded, held, positioned.
+
+    Read on a connection of its own, which is what makes this an observation of
+    what an instance has published rather than of what this process is midway
+    through writing. The three numbers are the chunk count the catalog records,
+    the nodes the vector table holds for the source, and the positions the
+    catalog holds for it; a replacement that is one write keeps them agreeing at
+    every instant, and one that is three leaves a reader arriving between two of
+    them holding a source whose record counts chunks it does not have.
+    """
+    with engine.connect() as connection:
+        recorded = connection.execute(
+            sqlalchemy.text(f'SELECT chunk_count FROM "{table}_sources" WHERE address = :address'),
+            {"address": address},
+        ).scalar_one_or_none()
+        held = connection.execute(
+            sqlalchemy.text(
+                f"SELECT count(*) FROM \"data_{table}\" WHERE metadata_->>'ref_doc_id' = :address"
+            ),
+            {"address": address},
+        ).scalar_one()
+        positioned = connection.execute(
+            sqlalchemy.text(f'SELECT count(*) FROM "{table}_positions" WHERE address = :address'),
+            {"address": address},
+        ).scalar_one()
+    return (recorded or 0, held, positioned)
+
+
+def _observing_engine():
+    """An engine for watching another instance, on connections of its own.
+
+    `NullPool` because a pooled connection would be handed back to the pool
+    between observations, and a reader is meant to arrive on the database afresh
+    each time -- which is what a second instance does.
+    """
+    return sqlalchemy.create_engine(DATABASE_URL, poolclass=NullPool)
+
+
+@needs_database
+def test_two_instances_ingesting_one_filename_end_with_one_copy(collection):
+    """Two instances replacing one source at once leave one copy, not two.
+
+    Both start from a source neither has written, which is the case a row lock
+    has to answer: with nothing stored there, neither instance's removal takes a
+    lock on anything, and both would insert their own nodes beside the other's.
+    What serializes them is the catalog row each claims first, so the second
+    waits for the first to commit and then replaces the whole of what it wrote.
+
+    The two documents are deliberately of different length, so a copy of one is
+    distinguishable from a copy of the other by how many chunks it holds: a
+    mixture of the two would be a source whose recorded count is one document's
+    and whose content is longer than that.
+    """
+    alpha = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    bravo = _create(_settings(table=collection), markdown=BRAVO_DOC)
+    measured = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    _ingest(measured, "alpha-probe.txt", ALPHA_DOC)
+    _ingest(measured, "bravo-probe.txt", BRAVO_DOC)
+    alpha_chunks = measured.source_content("alpha-probe.txt")[0].chunk_count
+    bravo_chunks = measured.source_content("bravo-probe.txt")[0].chunk_count
+    assert alpha_chunks != bravo_chunks, "the two documents chunk to the same length"
+
+    start = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def ingest(pipeline: IndexPipeline, markdown: str) -> None:
+        try:
+            start.wait(timeout=30)
+            _ingest(pipeline, "shared.txt", markdown)
+        except BaseException as exc:  # noqa: BLE001 -- reported by the assertion below
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=ingest, args=(alpha, ALPHA_DOC)),
+        threading.Thread(target=ingest, args=(bravo, BRAVO_DOC)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    assert not failures, failures
+
+    # A third instance, built over what the two left behind, because the two
+    # writers each hold a catalog snapshot of their own that only their own
+    # ingestion refreshed.
+    reader = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    record, chunks = reader.source_content("shared.txt")
+
+    assert record.chunk_count in (alpha_chunks, bravo_chunks), (
+        "the source holds a chunk count belonging to neither ingestion"
+    )
+    assert len(chunks) == record.chunk_count, (
+        "the source holds more or fewer chunks than it records"
+    )
+    assert _committed_state(_observing_engine(), collection, "shared.txt") == (
+        record.chunk_count,
+        record.chunk_count,
+        record.chunk_count,
+    )
+
+    # And the copy is one document's, whole: only one of the two markers is in it.
+    text = " ".join(chunk["text"] for chunk in chunks)
+    assert ("ALPHAMARK" in text) != ("BRAVOMARK" in text), "the source holds both documents"
+
+    for pipeline in (alpha, bravo, measured, reader):
+        pipeline._store.close()
+
+
+@needs_database
+def test_a_reader_never_observes_a_half_replaced_source(collection, monkeypatch):
+    """A source is never observably missing its content while it is replaced.
+
+    The reader polls the database on connections of its own, which is what another
+    instance's read is: committed state and nothing else. The writer's node insert
+    is held open, and every observation is stamped with whether the writer was
+    inside that window when it was taken -- so the test can point at readings
+    taken while the replacement was half done rather than hope it caught one. Each
+    of those readings has to be the source as it was before, whole; a replacement
+    that committed its removal before its insert would be observed here as a
+    source whose catalog counts chunks the vector table does not hold, which is
+    the failure this test exists to be able to see.
+    """
+    writer = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    _ingest(writer, "shared.txt", ALPHA_DOC)
+    before = _committed_state(_observing_engine(), collection, "shared.txt")
+    assert before[0] > 0
+
+    original = type(writer._index).insert_nodes
+    inside_the_write = threading.Event()
+
+    def held_open(self, nodes, **kwargs):
+        inside_the_write.set()
+        try:
+            time.sleep(0.3)
+            return original(self, nodes, **kwargs)
+        finally:
+            inside_the_write.clear()
+
+    monkeypatch.setattr(type(writer._index), "insert_nodes", held_open)
+
+    engine = _observing_engine()
+    observations: list[tuple[tuple[int, int, int], bool]] = []
+    reading = threading.Event()
+    reading.set()
+
+    def read() -> None:
+        while reading.is_set():
+            observations.append(
+                (_committed_state(engine, collection, "shared.txt"), inside_the_write.is_set())
+            )
+            time.sleep(0.005)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    try:
+        _ingest(writer, "shared.txt", BRAVO_DOC)
+    finally:
+        reading.clear()
+        reader.join(timeout=30)
+        engine.dispose()
+
+    after = _committed_state(_observing_engine(), collection, "shared.txt")
+    assert after[0] != before[0], "the replacement did not land, so nothing was observed"
+
+    during = [state for state, writing in observations if writing]
+    assert during, "no reading was taken while the replacement was half done"
+    assert set(during) == {before}, "a reader saw the source as something other than it was"
+
+    for state, _ in observations:
+        assert state[0] == state[1] == state[2], (
+            f"a reader saw a source recorded as {state[0]} chunks holding {state[1]} "
+            f"nodes and {state[2]} positions"
+        )
+        assert state in (before, after)
+
+    writer._store.close()
+
+
+@needs_database
+def test_a_search_on_another_instance_never_sees_a_half_replaced_source(collection, monkeypatch):
+    """A search served by a second instance answers with one whole copy, never a splice.
+
+    The reader is an instance of its own: its own index, its own connections, its
+    own lock. Nothing here is serialized by one process's lock, so what it can
+    observe is committed state -- which is what makes the replacement being a single
+    transaction the thing under test rather than a second, weaker guarantee that
+    happens to hold here.
+
+    The searches run while the writer's insert is held open, and each is stamped
+    with whether it was served inside that window, so the test points at searches
+    that really overlapped the write instead of hoping to catch one. A search that
+    caught the writer between its removal and its insert would answer with a source
+    that is neither document, or with a splice of the two.
+
+    The reader is built after the earlier copy is committed, so it is an instance
+    that already knows this source. One that had never seen it would answer from an
+    empty map, and its answer would say nothing about the replacement either way.
+    """
+    writer = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    _ingest(writer, "shared.txt", ALPHA_DOC)
+    reader = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    earlier = {chunk["text"] for chunk in reader.source_content("shared.txt")[1]}
+    assert earlier and any("ALPHAMARK" in text for text in earlier)
+
+    original = type(writer._index).insert_nodes
+    inside_the_write = threading.Event()
+
+    def held_open(self, nodes, **kwargs):
+        inside_the_write.set()
+        try:
+            time.sleep(0.3)
+            return original(self, nodes, **kwargs)
+        finally:
+            inside_the_write.clear()
+
+    monkeypatch.setattr(type(writer._index), "insert_nodes", held_open)
+
+    searches: list[tuple[set[str], bool]] = []
+    failures: list[BaseException] = []
+    searching = threading.Event()
+    searching.set()
+
+    def search() -> None:
+        while searching.is_set():
+            try:
+                hits = reader.search("The index keeps every chunk", 10)
+                searches.append(({hit["text"] for hit in hits}, inside_the_write.is_set()))
+            except BaseException as exc:  # noqa: BLE001 -- reported by the assertion below
+                failures.append(exc)
+                return
+            time.sleep(0.005)
+
+    thread = threading.Thread(target=search)
+    thread.start()
+    try:
+        _ingest(writer, "shared.txt", BRAVO_DOC)
+    finally:
+        searching.clear()
+        thread.join(timeout=60)
+
+    assert not failures, failures
+
+    # Read back by the same instance once the replacement has committed, so the two
+    # whole copies the searches below are allowed to answer with are both ones this
+    # reader really serves -- and so a reader that could never see the replacement
+    # would fail here rather than pass the loop by answering the earlier copy always.
+    replaced = {hit["text"] for hit in reader.search("The index keeps every chunk", 10)}
+    assert any("BRAVOMARK" in text for text in replaced), "the replacement never became searchable"
+    assert not (replaced & earlier), "the reader returned what the replacement came for as well"
+
+    during = [texts for texts, writing in searches if writing]
+    assert during, "no search was served while the replacement was half done"
+    for texts, _ in searches:
+        assert texts in (earlier, replaced), (
+            f"a search returned {len(texts)} chunks that are neither copy of the source"
+        )
+    for texts in during:
+        assert texts == earlier, "a search served mid-replacement returned the replacement"
+
+    writer._store.close()
+    reader._store.close()
+
+
+@needs_database
+def test_ingesting_one_document_twice_leaves_the_same_node_ids(durable, collection):
+    """A second ingestion of identical content lands on the nodes the first wrote.
+
+    A source's nodes are named by the source and the position they hold in it, so
+    the same content offered twice describes the same nodes both times -- and the
+    second ingestion's insert reaches identities the first one's already used
+    rather than names of its own. That is what a replay converges on: an insert
+    that minted a fresh identity per ingestion would leave this one's nodes beside
+    the earlier one's wherever a deletion had not reached them, and search would
+    then return the same passage twice, with the store holding both.
+
+    The node count is checked against the rows the vector table holds and not only
+    against the positions, because those two are separate writes and a replay that
+    duplicated would show up in the first and not in the second.
+    """
+    _ingest(durable, "docs.txt", LONG_DOC)
+    first = durable._store.positions("docs.txt")
+    first_chunks = durable.source_content("docs.txt")[1]
+    assert len(first) > 1, "the document was stored as one chunk"
+
+    _ingest(durable, "docs.txt", LONG_DOC)
+    second = durable._store.positions("docs.txt")
+    second_chunks = durable.source_content("docs.txt")[1]
+
+    assert second == first, "a second ingestion of the same content named different nodes"
+    assert second_chunks == first_chunks, "the replay stored content the first ingestion did not"
+    assert set(first) == {_node_id("docs.txt", position) for position in range(len(first))}
+
+    engine = _observing_engine()
+    try:
+        assert _committed_state(engine, collection, "docs.txt") == (len(first),) * 3, (
+            "the replay left rows behind rather than converging on the same nodes"
+        )
+    finally:
+        engine.dispose()
+
+
+@needs_database
+def test_a_replacement_that_fails_leaves_the_earlier_content_in_place(
+    durable, collection, monkeypatch
+):
+    """An interrupted replacement leaves the source as it was, and never empty.
+
+    The interruption is placed at the worst point there is: after the source's
+    earlier content has been removed and before its replacement has been written.
+    A replacement that committed its removal first would be observed here as a
+    source with nothing in it -- the earlier document gone, the new one never
+    written, and no later ingestion to put either back. What has to be there
+    instead is the earlier document in full: the same rows, the same recorded
+    order, and the same record down to the collections it was ingested under.
+    """
+    _ingest(durable, "docs.txt", ALPHA_DOC, collections=["csharp"])
+    before_record = durable.source_content("docs.txt")[0]
+
+    engine = _observing_engine()
+    try:
+        before = _committed_state(engine, collection, "docs.txt")
+        assert before[0] > 0
+
+        original = type(durable._index).insert_nodes
+
+        def refuse(self, nodes, **kwargs):
+            # After the removal: `delete_ref_doc` has already run inside the same
+            # replacement, and the replacement's own nodes have not been written.
+            raise RuntimeError("the replacement was interrupted")
+
+        monkeypatch.setattr(type(durable._index), "insert_nodes", refuse)
+        with pytest.raises(RuntimeError):
+            _ingest(durable, "docs.txt", BRAVO_DOC, collections=["dotnet"])
+        monkeypatch.setattr(type(durable._index), "insert_nodes", original)
+
+        assert _committed_state(engine, collection, "docs.txt") == before, (
+            "the interrupted replacement left the source other than it was"
+        )
+    finally:
+        engine.dispose()
+
+    # Read back over the store rather than from the instance that failed, so the
+    # answer is what is stored and not what the interrupted ingestion cached.
+    reader = _create(_settings(table=collection), markdown=ALPHA_DOC)
+    try:
+        record, chunks = reader.source_content("docs.txt")
+        assert record == before_record, "the interrupted replacement rewrote the record"
+        assert len(chunks) == record.chunk_count, "the source came back short of its record"
+        text = " ".join(chunk["text"] for chunk in chunks)
+        assert "ALPHAMARK" in text, "the earlier document is not in the source"
+        assert "BRAVOMARK" not in text, "the replacement is in the source it failed to be"
+    finally:
+        reader._store.close()
+
+
+# --- A corpus, and the several instances that start from it -------------------
+
+
+def _corpus_pipeline(settings: Settings, contents: dict[str, str], parsed: list[str]):
+    """A pipeline over *contents* as a corpus directory, counting every parse.
+
+    The conversion is the stage the claim exists to keep to one instance, so it
+    is the call that has to be countable. Each file is converted to its own text,
+    so what lands in the index is the file that was read rather than one fixed
+    document for all of them.
+    """
+    pipeline = _create(settings)
+    pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+    lock = threading.Lock()
+
+    def convert_file(file, name):
+        with lock:
+            parsed.append(name)
+        return contents[name]
+
+    pipeline.converter.convert_file.side_effect = convert_file
+    return pipeline
+
+
+@needs_database
+def test_instances_starting_together_ingest_each_corpus_source_once(tmp_path, collection):
+    """Several instances over one corpus do one instance's worth of work.
+
+    Both halves matter and neither implies the other: a corpus loaded zero times
+    is "once per instance" avoided by losing the corpus, and a corpus loaded once
+    per instance is the cost the claim exists to remove. So this asserts that
+    every source is in the index afterwards *and* that its parse happened once.
+
+    The two instances run at the same time on two threads, which is the ordering
+    the claim is for: one of them takes each source, and the other waits for it
+    and then finds the source already current rather than loading it again. They
+    are named apart by hand because they are one process, and a claim tells two
+    instances apart by name -- the default name would make them one instance.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    contents = {
+        "alpha.txt": "# Alpha\n\nThe STAR method structures behavioural answers.",
+        "beta.txt": "# Beta\n\nThe XYZZY convention records unrelated remarks.",
+    }
+    for name, text in contents.items():
+        # Bytes rather than text, so the digest asserted below is the digest of
+        # the file: writing text would translate its newlines on the way out and
+        # the file would be what the corpus holds rather than what was written.
+        (corpus / name).write_bytes(text.encode())
+
+    settings = _settings(table=collection, knowledge_corpus_dir=str(corpus))
+    parsed: list[str] = []
+    first = _corpus_pipeline(settings, contents, parsed)
+    second = _corpus_pipeline(settings, contents, parsed)
+    # One claim store, because that is what the two instances share: the same
+    # database row is what tells them apart.
+    claims = first.store.claim_store()
+    states = [BootstrapState(), BootstrapState()]
+
+    try:
+        threads = [
+            threading.Thread(
+                target=ingest_corpus,
+                args=(pipeline, settings, state, claims, f"instance-{index}"),
+                name=f"bootstrap-{index}",
+            )
+            for index, (pipeline, state) in enumerate(zip((first, second), states, strict=True))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads), (
+            "an instance's bootstrap did not finish"
+        )
+
+        assert [state.status for state in states] == [BootstrapStatus.COMPLETE] * 2, [
+            state.status for state in states
+        ]
+        assert states[0].failures == [] and states[1].failures == [], [
+            states[0].failures,
+            states[1].failures,
+        ]
+        assert sorted(parsed) == sorted(contents), (
+            f"the corpus was parsed {len(parsed)} times rather than once per source"
+        )
+
+        for pipeline in (first, second):
+            pipeline.refresh()
+            for name, text in contents.items():
+                assert pipeline.is_current(name, content_hash(text.encode()), []), (
+                    f"{name} is not in the index this instance reports"
+                )
+            hits = pipeline.search("STAR", top_k=5)
+            assert any("STAR" in hit["text"] for hit in hits), "the corpus is not searchable"
+        assert claims.held("alpha.txt") is None, "a claim outlived the bootstrap that took it"
+        assert claims.held("beta.txt") is None, "a claim outlived the bootstrap that took it"
+    finally:
+        first._store.close()
+        second._store.close()
+
+
+@needs_database
+def test_a_claim_left_by_a_stopped_instance_is_taken_up(tmp_path, collection):
+    """A source claimed by an instance that stopped is loaded by a survivor.
+
+    An instance that stops mid-bootstrap leaves its claim behind: that is what
+    stopping is, as far as a row is concerned, and it is the case the claim has
+    to survive rather than the case it can assume away. What tells that claim
+    apart from one whose owner is still working is its age -- it is taken over
+    once it is older than the threshold job ownership uses -- so the wait is
+    asserted as well as the ingestion. A survivor that took the source at once
+    would duplicate the work the claim exists to keep to one instance; one that
+    never took it would leave the source absent from the index, which is the
+    other half of what this asserts against.
+    """
+    contents = {"guide.txt": "# Guide\n\nThe STAR method structures behavioural answers."}
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, text in contents.items():
+        (corpus / name).write_bytes(text.encode())
+
+    threshold = 1
+    settings = _settings(
+        table=collection,
+        knowledge_corpus_dir=str(corpus),
+        job_orphan_threshold_seconds=threshold,
+    )
+    parsed: list[str] = []
+    survivor = _corpus_pipeline(settings, contents, parsed)
+    claims = survivor.store.claim_store()
+    state = BootstrapState()
+
+    # The claim a stopped instance leaves: taken, and never released, because
+    # the process that would have released it is the one that stopped.
+    assert claims.claim("guide.txt", "instance-that-stopped", threshold)
+
+    try:
+        started = time.monotonic()
+        ingest_corpus(survivor, settings, state, claims, "instance-that-survived")
+        elapsed = time.monotonic() - started
+
+        assert state.status is BootstrapStatus.COMPLETE, state.failures
+        assert state.failures == []
+        assert parsed == ["guide.txt"], "the survivor did not load the stranded source"
+        assert elapsed >= threshold, "the survivor took the claim before it was stale"
+        assert claims.held("guide.txt") is None, "the claim outlived the bootstrap"
+        survivor.refresh()
+        assert survivor.is_current("guide.txt", content_hash(contents["guide.txt"].encode()), [])
+        hits = survivor.search("STAR", top_k=5)
+        assert any("STAR" in hit["text"] for hit in hits), "the source is absent from the index"
+    finally:
+        survivor._store.close()
+
+
+@needs_database
+def test_a_deferring_instance_reports_the_corpus_once_another_loads_it(
+    monkeypatch, tmp_path, collection
+):
+    """An instance that loaded nothing still reports the corpus the other loaded.
+
+    The readiness endpoint is what a caller asks whether the service is usable,
+    so an instance that deferred the whole corpus has to answer with what the
+    index holds rather than with what it did -- a deferring instance that
+    reported an empty index would be taken for one that never got its corpus.
+
+    The other half is asserted before that: while the loading instance is still
+    loading, the deferring one must not report the corpus as present, because
+    nobody has ingested it yet. Both halves are read off the endpoint, which is
+    why the deferring instance is a whole application rather than a pipeline.
+    """
+    contents = {"guide.txt": "# Guide\n\nThe STAR method structures behavioural answers."}
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, text in contents.items():
+        (corpus / name).write_bytes(text.encode())
+
+    app_settings = _settings(table=collection, knowledge_corpus_dir=str(corpus))
+    monkeypatch.setattr("doc_etl_api.main.settings", app_settings)
+
+    # The loading instance, held inside the parse: the claim is taken before the
+    # source is read, so holding the parse holds the claim, and the deferring
+    # instance below has something real to defer to.
+    loaded = threading.Event()
+    release_the_loader = threading.Event()
+
+    def convert_file(file, filename):
+        loaded.set()
+        release_the_loader.wait(timeout=60)
+        return contents[filename]
+
+    loader_converter = _stubbed_models(contents, [])
+    loader_converter.convert_file.side_effect = convert_file
+
+    loader = _started_app(loader_converter, app_settings)
+    loader_client = TestClient(loader)
+    try:
+        assert loaded.wait(timeout=60), "the loader never reached the source"
+        assert loader_client.get("/health").json()["bootstrap"] in ("pending", "in_progress")
+
+        # Named apart by hand: a claim tells instances apart by name, and these
+        # two are one process.
+        monkeypatch.setattr("doc_etl_api.bootstrap.instance_id", lambda: "instance-deferring")
+        deferring_parsed: list[str] = []
+        deferring = _started_app(_stubbed_models(contents, deferring_parsed), app_settings)
+        deferring_client = TestClient(deferring)
+        try:
+            # Nothing has been ingested yet, and the deferring instance says so
+            # by not being complete rather than by claiming a corpus it has not
+            # seen anyone load.
+            health = deferring_client.get("/health").json()
+            assert health["bootstrap"] in ("pending", "in_progress"), (
+                "the deferring instance reported a corpus nobody had loaded"
+            )
+            assert health["indexed_sources"] == 0, (
+                "the deferring instance counted a corpus nobody had loaded"
+            )
+
+            release_the_loader.set()
+            assert _wait_for_bootstrap(loader_client) == "complete"
+            assert _wait_for_bootstrap(deferring_client) == "complete", (
+                "the deferring instance never reported the corpus"
+            )
+            health = deferring_client.get("/health").json()
+            assert health["indexed_sources"] == len(contents), (
+                "the deferring instance reported an index without the corpus in it"
+            )
+            assert deferring_parsed == [], "the deferring instance loaded the corpus itself"
+        finally:
+            deferring.state.pipeline._store.close()
+    finally:
+        release_the_loader.set()
+        loader.state.pipeline._store.close()
