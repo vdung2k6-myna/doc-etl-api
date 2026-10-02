@@ -1,3 +1,29 @@
+"""Convert a source into markdown, cut it into nodes, and answer searches over them.
+
+A source is converted once, and the markdown it converts into serves both the
+index and the caller: it is the text the nodes are cut from and the text
+`GET /sources/content` reads back, so one document is what everything measured
+here is measured against. Every node is located in it twice over -- by its
+position among its source's nodes, which is what the section and neighbour walks
+step through, and by the *range* of that document its own text was built from.
+A node's range runs from where its text begins -- the heading line's first
+character, for a node carrying one -- to just past its last character, and is
+measured as the document is split and carried through the chunker rather than
+searched for in a node's finished text. That text is not always a slice of the
+document: a merge joins two texts with a separator the document may not contain,
+and a table's separator row is stored shortened, so a search would be a guess
+wearing a measurement's clothes.
+
+The text a page contributes is the text that page reads: each layout region's
+recognised boxes are put into reading order -- lines top to bottom, boxes left to
+right -- before the page is assembled, because the order a recogniser lists its boxes
+in is not the order the page reads them in. Only the order is decided that way. The
+characters are the recogniser's own, none of them added, dropped or rewritten, so a
+word the recogniser misread is stored as it misread it. What Docling then reads *off*
+that text -- where a paragraph breaks -- is derived from it, so those boundaries can
+fall differently once the words are in order.
+"""
+
 import hashlib
 import logging
 import re
@@ -16,6 +42,8 @@ from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import EasyOcrOptions, ThreadedPdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.models.factories import get_ocr_factory
+from docling.models.stages.ocr.easyocr_model import EasyOcrModel
 from llama_index.core import Document as LlamaDocument
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core import VectorStoreIndex
@@ -24,9 +52,21 @@ from llama_index.core.schema import BaseNode, NodeRelationship, RelatedNodeInfo,
 from llama_index.core.vector_stores import FilterOperator, MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from doc_etl_api.config import DEFAULT_USER_AGENT, Settings, VectorStoreBackend, settings
+from doc_etl_api.config import (
+    DEFAULT_SECTION_CHUNKS,
+    DEFAULT_USER_AGENT,
+    Settings,
+    VectorStoreBackend,
+    settings,
+)
 from doc_etl_api.extraction import select_main_content
-from doc_etl_api.store import IndexStore, InProcessIndexStore, PostgresIndexStore, SourceRecord
+from doc_etl_api.store import (
+    IndexStore,
+    InProcessIndexStore,
+    NodePosition,
+    PostgresIndexStore,
+    SourceRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,44 +121,82 @@ class _Adjacency:
 
 @dataclass(frozen=True)
 class _SectionExpansion:
-    """The part of a hit's section that is returned, and the section's real size.
+    """The part of a hit's section that is returned, and the section's real length.
 
-    ``size`` describes the section the source holds, whether or not all of it was
-    returned, so a bounded answer is visible as incomplete; ``chunks`` carries the
-    returned part of it, in reading order. A size of zero is a hit whose placement
-    could not be established, which is returned as no section rather than as a
-    guessed one.
+    ``text`` is the document's own characters over ``start..end``, which is the
+    range it was sliced from: a section is the document as the source stored it,
+    not the chunks it was cut into, so a caller renders a passage rather than
+    splicing pieces back together and can find the same passage again by slicing
+    the document itself at the reported range. Both offsets are counted in the
+    document's characters from its first one.
+
+    ``size`` is how long the whole section really is, whether or not all of it was
+    returned, measured on the document rather than on the nodes: the width of the
+    smallest range covering the run. An expansion whose ``end - start`` is smaller
+    than ``size`` is part of a longer section, which is how a caller tells a
+    truncated answer from a whole one. A hit whose section could not be established
+    --- a source with no recorded range to place the run by, or none to slice the
+    document at --- is returned as no section rather than as a guessed one.
     """
 
+    text: str
+    start: int
+    end: int
     size: int
-    chunks: list[dict]
+
+    def as_response(self) -> dict[str, object]:
+        """The section as a caller receives it, in the shape the schema names."""
+        return {"text": self.text, "start": self.start, "end": self.end, "size": self.size}
 
 
-# A hit's place in its source: the source's key, the record describing it, and the
-# position the hit holds within it. Established once per hit by `search` and handed
-# to every walk that needs it, because reading it costs a store query.
-_Placement = tuple[str, SourceRecord, int]
+@dataclass(frozen=True)
+class _Placement:
+    """Where a hit sits in its source, and what its source's map holds.
+
+    Established once per hit by `search` and handed to every walk that needs it,
+    because reading it costs a store query, and a walk taking its own copy would
+    pay for a value the other walk already has. ``record`` describes the source and
+    ``position`` is the place the hit holds in it; ``positions`` is the source's
+    whole position map, which is what the section walk reads the hit's run and that
+    run's span from rather than the nodes themselves.
+    """
+
+    source_key: str
+    record: SourceRecord
+    position: int
+    positions: dict[str, NodePosition]
 
 
 def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 2)
 
 
-def _section_window(first: int, last: int, position: int, ceiling: int) -> tuple[int, int]:
-    """Which part of the section ``first..last`` one expansion returns.
+def _section_window(
+    section_start: int, section_end: int, hit_start: int, hit_end: int, ceiling: int
+) -> tuple[int, int]:
+    """Which part of a section's range one expansion returns, counted in characters.
 
-    The section's own ends bound the window and the hit is kept inside it: a
+    The window is half-open -- ``document[start:end]`` -- because that is what
+    slicing a document means, so an unclamped window is exactly ``ceiling`` wide.
+    The section's own ends bound it and the hit's own text is kept inside it: a
     caller that asked for a section receives the part of it its hit is in, never a
     window from one end that the hit happens not to fall inside. The window is
-    centred on the hit where the section allows, and filled from the other side
+    centred on the hit where the section allows, and filled towards the other end
     where an end cuts it short, so a bounded expansion returns the ceiling's worth
-    of chunks wherever the section holds that many.
+    of the document wherever the section holds that much.
+
+    A ceiling below the hit's own length returns the hit's own range rather than a
+    passage that cuts off the text the caller searched for: the bound is on the
+    answer, and an answer that does not contain the hit is not an answer to the
+    question that was asked.
     """
-    if last - first + 1 <= ceiling:
-        return first, last
-    start = max(first, position - (ceiling - 1) // 2)
-    end = min(last, start + ceiling - 1)
-    return min(start, end - ceiling + 1), end
+    if section_end - section_start <= ceiling:
+        return section_start, section_end
+    hit_width = hit_end - hit_start
+    width = max(ceiling, hit_width)
+    start = max(section_start, hit_start - (width - hit_width) // 2)
+    end = min(section_end, start + width)
+    return min(start, end - width), end
 
 
 def _node_id(source_key: str, position: int) -> str:
@@ -246,10 +324,21 @@ _HEADING_LINE = re.compile(r"^#{1,6}\s+\S")
 
 @dataclass(frozen=True)
 class _Unit:
-    """One unit of a document: a paragraph of prose, or a run of table rows."""
+    """One unit of a document: a paragraph of prose, or a run of table rows.
+
+    ``start`` and ``end`` are the offsets this unit occupies in the markdown it
+    was split from, so anything built from it can say where in the document its
+    text came from. ``markdown[start:end]`` is the unit's own text, which is why
+    the offsets are measured here rather than recovered later by searching the
+    finished text for it: a node the floor merges joins two units with a
+    separator the document may not contain, and a table's separator row is
+    stored shortened, so neither could be found by a search.
+    """
 
     kind: str
     text: str
+    start: int
+    end: int
 
 
 @dataclass(frozen=True)
@@ -258,6 +347,24 @@ class _Section:
 
     heading: str | None
     units: tuple[_Unit, ...]
+    heading_start: int | None
+
+
+@dataclass(frozen=True)
+class _NodeText:
+    """A candidate node's text, with the span of its source document it came from.
+
+    The span is what makes a node's origin a measurement rather than a search: the
+    document's characters over ``start:end`` are the node's own text, in the order
+    the node reads them. It is carried rather than recomputed because the text does
+    not always survive as a slice of the document -- a merge joins two texts with a
+    separator the document may not contain, a table part repeats a header row -- and
+    because two nodes may hold identical text, which leaves nothing to search for.
+    """
+
+    text: str
+    start: int
+    end: int
 
 
 def _is_heading_line(line: str) -> bool:
@@ -285,6 +392,20 @@ def _leading_heading(text: str) -> str | None:
     return None
 
 
+def _heading_key(text: str) -> str:
+    """The heading a node's text opens with, as the key its section is walked by.
+
+    `_leading_heading`'s answer with its absence made a key of its own. The
+    heading-less section -- the content before a source's first heading -- is a
+    section like any other, walked by the same rule as one that carries a
+    heading, so the nodes belonging to it share an empty key rather than each
+    standing alone with no key. That is what keeps an empty key a recorded
+    answer, and the absence of a key (a row written before any of this was
+    recorded) the thing a source is re-ingested for.
+    """
+    return _leading_heading(text) or ""
+
+
 def _split_sections(markdown: str) -> list[_Section]:
     """Split markdown into the document's own sections, each with its units.
 
@@ -304,34 +425,53 @@ def _split_sections(markdown: str) -> list[_Section]:
     there would store half a code block. Table detection is deliberately left
     unguarded by the fence: the table path is not what this split changes, and a
     fenced run of pipes reaching `_table_parts` is the behaviour it has always had.
+
+    Every unit and every section carries the offsets it occupies in *markdown*,
+    and the text it carries is that slice of the document. These are the offsets a
+    node's range is later built from, so they are measured in the document the
+    source was converted into -- the same text `GET /sources/content` reads back
+    for it -- rather than in the bytes it was uploaded as or in the text a node
+    ended up holding. A heading's own line is not part of any unit -- the heading
+    is a section's, and `_section_nodes` is what decides to lead a node with it --
+    so a section's units begin after the heading line whose offset the section
+    reports.
     """
     sections: list[_Section] = []
     heading: str | None = None
+    heading_start: int | None = None
     units: list[_Unit] = []
-    lines: list[str] = []
+    lines: list[tuple[int, str]] = []
     kind: str | None = None
     fenced = False
 
     def flush_unit() -> None:
         if kind is not None and lines:
-            units.append(_Unit(kind, "\n".join(lines)))
+            # The unit's text is exactly this slice of the document: consecutive
+            # lines of the split, rejoined by the newlines that separated them.
+            start = lines[0][0]
+            end = lines[-1][0] + len(lines[-1][1])
+            units.append(_Unit(kind, "\n".join(line for _, line in lines), start, end))
         lines.clear()
 
     def flush_section() -> None:
         nonlocal kind
         flush_unit()
         if heading is not None or units:
-            sections.append(_Section(heading, tuple(units)))
+            sections.append(_Section(heading, tuple(units), heading_start))
         units.clear()
         kind = None
 
+    offset = 0
     for line in markdown.split("\n"):
+        start = offset
+        offset += len(line) + 1
         stripped = line.strip()
         if stripped.startswith("```"):
             fenced = not fenced
         elif not fenced and _is_heading_line(stripped):
             flush_section()
             heading = stripped
+            heading_start = start
             continue
         if not stripped:
             flush_unit()
@@ -341,7 +481,7 @@ def _split_sections(markdown: str) -> list[_Section]:
         if line_kind != kind:
             flush_unit()
             kind = line_kind
-        lines.append(line)
+        lines.append((start, line))
     flush_section()
     return sections
 
@@ -582,12 +722,12 @@ def _without_repeated_heading(earlier: str, later: str) -> str:
 
 
 def _merge_below_floor(
-    texts: Sequence[str],
+    texts: Sequence[_NodeText],
     floor: int,
     ceiling: int,
     count: Callable[[str], int],
     origins: Sequence[int] | None = None,
-) -> tuple[list[str], int, int]:
+) -> tuple[list[_NodeText], int, int]:
     """Fold nodes too small to carry information into a neighbour.
 
     A node below *floor* is joined to the node before it. The first node of a
@@ -615,8 +755,12 @@ def _merge_below_floor(
     A document whose entire content is below the floor is left as the single node
     it is rather than merged away.
 
-    Returns the surviving texts, how many nodes were merged away, and how many
-    fragments no merge was legal for.
+    A merged node's span is the two texts' spans together, because its text is both
+    of them: the document's characters over that span still carry the node's own
+    words in the order it reads them.
+
+    Returns the surviving texts with their spans, how many nodes were merged away,
+    and how many fragments no merge was legal for.
     """
     surviving = list(texts)
     # The section each text came from, carried alongside it and shrunk in the same
@@ -628,7 +772,7 @@ def _merge_below_floor(
     while index < len(surviving):
         if len(surviving) == 1:
             break
-        if count(surviving[index]) >= floor:
+        if count(surviving[index].text) >= floor:
             index += 1
             continue
         # The preceding node keeps reading order; the first node of a document
@@ -639,10 +783,13 @@ def _merge_below_floor(
             # sort is stable, so neighbours of one section keep reading order.
             neighbours.sort(key=lambda other: sections[other] != sections[index])
         for other in neighbours:
-            joined = _join_text(surviving[min(index, other)], surviving[max(index, other)])
+            earlier, later = surviving[min(index, other)], surviving[max(index, other)]
+            joined = _join_text(earlier.text, later.text)
             if count(joined) > ceiling:
                 continue
-            surviving[max(index, other)] = joined
+            surviving[max(index, other)] = _NodeText(
+                joined, min(earlier.start, later.start), max(earlier.end, later.end)
+            )
             del surviving[min(index, other)]
             if sections is not None:
                 # The merged node sits where the earlier of the two did, and
@@ -659,7 +806,7 @@ def _merge_below_floor(
     return surviving, merges, refusals
 
 
-def _dedupe_texts(texts: Sequence[str]) -> tuple[list[str], int]:
+def _dedupe_texts(texts: Sequence[_NodeText]) -> tuple[list[_NodeText], int]:
     """Keep one node per distinct text, reporting how many were dropped.
 
     Applied only to the nodes of a single document. Two sources holding the same
@@ -667,18 +814,56 @@ def _dedupe_texts(texts: Sequence[str]) -> tuple[list[str], int]:
     is located by document identity: a node both sources claimed would be removed
     on behalf of one of them and taken away from the other.
 
-    Returns the surviving texts and how many were removed as repeated.
+    The occurrence kept is the first, so the span that survives locates that
+    occurrence and not the one dropped -- which is the one the node's text reads as.
+
+    Returns the surviving texts with their spans and how many were removed as
+    repeated.
     """
-    distinct: list[str] = []
+    distinct: list[_NodeText] = []
     seen: set[str] = set()
     duplicates = 0
     for text in texts:
-        if text in seen:
+        if text.text in seen:
             duplicates += 1
             continue
-        seen.add(text)
+        seen.add(text.text)
         distinct.append(text)
     return distinct, duplicates
+
+
+def _ranges_within(
+    document: str, spans: Sequence[_NodeText], source_key: str
+) -> list[tuple[int, int] | None]:
+    """Each node's range in *document*, or ``None`` where the span it was built from does not fit.
+
+    These offsets are the pipeline's own arithmetic -- the document is split, the
+    units and the parts carry the positions they were read at, and a node inherits
+    theirs -- so a range reaching outside the document it was measured in is a
+    fault in that arithmetic rather than anything a caller can cause. It is
+    reported rather than recorded, because a range pointing at text its node does
+    not read cannot be told apart from a good one by anything downstream: a
+    section sliced at it would be someone else's words, spoken as though they were
+    the hit's. The node is left carrying no range, which is a state the rest of the
+    service already answers for -- a source holding no range for a node reports no
+    section for a hit in it rather than one located by a guess.
+    """
+    ranges: list[tuple[int, int] | None] = []
+    for position, span in enumerate(spans):
+        if 0 <= span.start <= span.end <= len(document):
+            ranges.append((span.start, span.end))
+            continue
+        logger.error(
+            "Node %d of source %s was built from a span (%d:%d) outside its %d-character "
+            "document, so it is stored without a range.",
+            position,
+            source_key,
+            span.start,
+            span.end,
+            len(document),
+        )
+        ranges.append(None)
+    return ranges
 
 
 def _content_below_heading(text: str) -> str:
@@ -764,6 +949,159 @@ def _chunking_outcome(
     }
 
 
+@dataclass(frozen=True)
+class _OcrBox:
+    """One box a recogniser returned for an OCR region, in that region's own pixels.
+
+    ``top``, ``bottom`` and ``left`` are measured over the box's own corner points,
+    so the order the recogniser happens to list those points in does not matter.
+    ``result`` is the recogniser's own tuple for the box -- its points, its text and
+    its confidence -- carried through untouched, because the conversion stores the
+    recogniser's characters and only their order is ours to decide.
+    """
+
+    top: float
+    bottom: float
+    left: float
+    result: tuple
+
+
+def _reading_order(results: Sequence[tuple]) -> list[tuple]:
+    """Put the boxes one OCR region returned into the page's reading order.
+
+    Docling hands each layout region to the recogniser as its own image and takes the
+    boxes back in the order the recogniser lists them, which is not the order the page
+    reads. EasyOCR groups boxes into lines by their vertical centres, and a box whose
+    centre falls outside the line it sits beside starts a group of its own that is
+    emitted after the lines below it -- so a right-margin word is stored at the end of
+    the paragraph after its own. Measured on the scan this change was made against: the
+    line the page prints as ``Tiễn con trai lên thành phố học, ông bố thân mật nói:`` was
+    stored as ``Tiễn con trai lên thành phố ông bố thân mật nói: học,``.
+
+    Boxes are grouped into the lines they read on -- a box joins a line when the two
+    vertical extents overlap by at least half the shorter of them -- and both the lines
+    and the boxes within them are then ordered by position: lines by their top edge,
+    boxes by their left edge. The overlap test is the recogniser's own grouping
+    criterion (EasyOCR's ``ycenter_ths``, half a box height) rather than a tolerance of
+    ours: which boxes share a line is the recogniser's to decide, and it decides it
+    well; only the order it emits them in is not the page's. Both sorts are stable, so
+    boxes this cannot separate keep the order the recogniser returned them in.
+
+    A rule that moved only a region's trailing boxes back into place was rejected: a box
+    at a line's right margin and a box that genuinely ends the region look alike in the
+    recogniser's list, and only the boxes' own positions tell them apart.
+
+    Only the order changes. Each box is carried exactly as the recogniser returned it,
+    so the region's characters -- every one of them, spaces and punctuation included --
+    are the ones that get stored, and no character is added, dropped or rewritten.
+    """
+    boxes = [
+        _OcrBox(
+            top=min(point[1] for point in result[0]),
+            bottom=max(point[1] for point in result[0]),
+            left=min(point[0] for point in result[0]),
+            result=result,
+        )
+        for result in results
+    ]
+
+    # A region holds tens of boxes at most, so each line's extent is measured from its
+    # own boxes as they are needed rather than tracked beside them.
+    lines: list[list[_OcrBox]] = []
+    for box in boxes:
+        for line in lines:
+            top = min(entry.top for entry in line)
+            bottom = max(entry.bottom for entry in line)
+            overlap = min(box.bottom, bottom) - max(box.top, top)
+            shorter = min(box.bottom - box.top, bottom - top)
+            if overlap >= shorter / 2:
+                line.append(box)
+                break
+        else:
+            lines.append([box])
+
+    ordered: list[tuple] = []
+    for line in sorted(lines, key=lambda line: min(entry.top for entry in line)):
+        ordered.extend(entry.result for entry in sorted(line, key=lambda entry: entry.left))
+    return ordered
+
+
+class _ReadingOrderReader:
+    """A recogniser, answering ``readtext`` in the page's reading order.
+
+    Docling builds the recogniser and owns it; this stands in the one place Docling
+    calls it -- ``readtext``, once per layout region -- and orders what comes back.
+    Everything else about the recogniser is the recogniser's, so every other attribute
+    and call goes straight through to it, and a Docling version that asks it for
+    something new gets the answer it would have got.
+    """
+
+    def __init__(self, reader: object) -> None:
+        self._reader = reader
+
+    def readtext(self, image) -> list[tuple]:
+        return _reading_order(self._reader.readtext(image))
+
+    def __getattr__(self, name: str):
+        return getattr(self._reader, name)
+
+
+class _ReadingOrderEasyOcrOptions(EasyOcrOptions):
+    """EasyOCR options naming the model that stores its boxes in reading order.
+
+    The kind stays EasyOCR's own. What changes here is which *model* the OCR factory
+    builds for these options, not which engine reads the page: the engine this
+    deployment declares, the language it is configured with and the version Docling
+    constrains are all left as they are, so nothing about the environment or the
+    recognition changes with it.
+    """
+
+
+class _ReadingOrderEasyOcrModel(EasyOcrModel):
+    """EasyOCR, with each region it recognises stored in the page's reading order.
+
+    The reader Docling's own model builds is wrapped rather than replaced, because the
+    order of what the recogniser returns is decided where the recogniser is called and
+    nowhere later: by the time the boxes are cells, they have been rescaled, offset
+    through the crop they came from and numbered, and a page that carried its own text
+    has been through the same cells.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.enabled:
+            self.reader = _ReadingOrderReader(self.reader)
+
+    @classmethod
+    def get_options_type(cls) -> type[EasyOcrOptions]:
+        return _ReadingOrderEasyOcrOptions
+
+
+def _register_reading_order_engine(options: ThreadedPdfPipelineOptions) -> None:
+    """Have Docling's OCR factory build the reading-order model for these options.
+
+    Docling resolves the OCR model by the exact type of the options it is given, and
+    asks the OCR factory for it at conversion time -- not at construction -- so the
+    model has to be registered on the factory before any page is converted. The factory
+    is one per process *and per* ``allow_external_plugins`` value (it is cached), and
+    the pipeline asks the one matching its own options: registering on that same one is
+    what makes the lookup find it.
+
+    Registering an options type twice is an error rather than a no-op, and a process
+    builds more than one converter -- the suite does, and so does a reload -- so the
+    registration is made only where it is absent.
+    """
+    factory = get_ocr_factory(allow_external_plugins=options.allow_external_plugins)
+    if _ReadingOrderEasyOcrOptions in factory.classes:
+        return
+
+    factory.register(
+        _ReadingOrderEasyOcrModel,
+        plugin_name=__name__,
+        plugin_module_name=__name__,
+    )
+
+
 def _pdf_format_options(languages: Sequence[str]) -> dict[InputFormat, PdfFormatOption]:
     """Docling's options for the PDF pipeline, with OCR in *languages*.
 
@@ -772,6 +1110,14 @@ def _pdf_format_options(languages: Sequence[str]) -> dict[InputFormat, PdfFormat
     diacritics are the word, not decoration. Measured on a 162-page scan, that was
     57% of the diacritics lost, so the pages no longer matched a query for their
     own wording. Naming the language is what fixes it.
+
+    The options name this service's own EasyOCR model rather than Docling's, which is
+    what makes each layout region's recognised boxes be put into the page's reading
+    order before the page's text is assembled (see ``_reading_order``). It is done
+    here, at the engine's own output, because that is where the order is still a
+    question: the order is read from the boxes' positions, and by the time the text is
+    markdown those positions are gone, while the engine's characters have to reach the
+    document as they are.
 
     Two fields are deliberately left alone:
 
@@ -791,7 +1137,8 @@ def _pdf_format_options(languages: Sequence[str]) -> dict[InputFormat, PdfFormat
     pipeline, which would quietly slow every PDF down.
     """
     pipeline_options = ThreadedPdfPipelineOptions()
-    pipeline_options.ocr_options = EasyOcrOptions(lang=list(languages))
+    pipeline_options.ocr_options = _ReadingOrderEasyOcrOptions(lang=list(languages))
+    _register_reading_order_engine(pipeline_options)
     return {InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
 
 
@@ -918,6 +1265,9 @@ class IndexPipeline:
         self._max_input_tokens = _embedding_input_limit(self._embedding_model)
         self._tokenizer = _embedding_tokenizer(self._embedding_model)
         self._chunk_size = self._resolve_chunk_size(app_settings.chunk_size)
+        self._max_section_characters = self._resolve_max_section_characters(
+            app_settings.max_section_characters
+        )
         self._min_chunk_tokens = app_settings.min_chunk_tokens
 
         LlamaSettings.embed_model = self._embedding_model
@@ -1047,6 +1397,11 @@ class IndexPipeline:
     def chunk_size(self) -> int:
         return self._chunk_size
 
+    @property
+    def max_section_characters(self) -> int:
+        """How many characters one section expansion may return, resolved."""
+        return self._max_section_characters
+
     def is_current(self, address: str, digest: str, collections: Sequence[str]) -> bool:
         """Whether the index already holds *address* just as it is being offered.
 
@@ -1102,6 +1457,40 @@ class IndexPipeline:
         with self._index_lock:
             return self._store.document(address) is not None
 
+    def has_ranges(self, address: str) -> bool:
+        """Whether every node of *address* carries a recorded range.
+
+        The third half of the question startup asks about each corpus source,
+        beside `is_current` and `has_document`. A source can be current and hold a
+        document and still hold no ranges: its nodes were written before the
+        catalog recorded where their text came from, so a section read can place
+        no run of them and answers with no section. Skipping such a source would
+        leave it readable only as chunks, which is the state this asks about, so
+        it is ingested again and its ranges are recorded then.
+
+        The answer is whether the source holds nodes and every one of them has
+        both ends of its range. A node with no range says nothing about where its
+        text sits, and one such node leaves the whole source unable to answer a
+        section -- not only itself -- because the walk that would place a run
+        refuses to invent a range.
+
+        A source the store holds no entries for answers no, which is the same
+        answer a store that cannot be asked gives, and it is the safe one:
+        re-ingesting unchanged content costs only the work this exists to save,
+        while skipping a source whose nodes carry no range leaves it unreadable
+        until something else happens to ingest it.
+
+        Read from the store under the index lock rather than from this process's
+        snapshot, for the reason `has_document` gives: what another instance wrote
+        is in the store and not here, and this question is asked to decide whether
+        that work still needs doing.
+        """
+        with self._index_lock:
+            positions = self._store.positions(address)
+        return bool(positions) and all(
+            row.start is not None and row.end is not None for row in positions.values()
+        )
+
     def refresh(self) -> None:
         """Re-read what the store holds into what this process reports.
 
@@ -1139,6 +1528,22 @@ class IndexPipeline:
             )
         return configured
 
+    def _resolve_max_section_characters(self, configured: int | None) -> int:
+        """How many characters one section expansion may return.
+
+        An unset setting is the passage the chunk-count cap used to return: the
+        chunks it allowed times the chunk size in use. That count is kept as the
+        basis of the default rather than replaced by a character count of its own,
+        because the two measure the same thing -- an operator's answer to "how much
+        of a section do I get" -- and a chunk size that moved with the model would
+        otherwise leave the ceiling behind. A configured value is taken as given:
+        the cap bounds one answer, and a deployment whose sections are longer than
+        the default says so itself.
+        """
+        if configured is not None:
+            return configured
+        return DEFAULT_SECTION_CHUNKS * self._chunk_size
+
     def _identify_nodes(self, nodes: Sequence[BaseNode], source_key: str) -> None:
         """Give every node an identity derived from its source and its position."""
         for position, node in enumerate(nodes):
@@ -1162,7 +1567,7 @@ class IndexPipeline:
 
     def _chunk(
         self, markdown: str, source_key: str, metadata: dict
-    ) -> tuple[list[BaseNode], dict[str, int | None]]:
+    ) -> tuple[list[BaseNode], dict[str, int | None], list[tuple[int, int] | None]]:
         """Split markdown into the nodes this source will store.
 
         The document's own structure decides the boundaries: a heading opens a
@@ -1178,9 +1583,17 @@ class IndexPipeline:
         any embedding is computed, so what is reported and what is embedded
         describe the same nodes. Positions are numbered after all three, so the
         surviving nodes stay contiguous and identity remains source and position.
+
+        The spans come back beside the nodes, one per node and in the same order,
+        each saying where in *markdown* that node's text was built from. They are
+        the second half of what the store records for a node: the position is where
+        the node sits among its source's nodes, and the span is where its text sits
+        in the document. A node whose span does not fit *markdown* is reported and
+        comes back with no range rather than with one (`_ranges_within`), so a
+        range the store receives is one the document it names truly holds.
         """
         count = _token_count(self._tokenizer)
-        texts: list[str] = []
+        texts: list[_NodeText] = []
         # Which section each node came from, in the same order, so the floor can
         # prefer a neighbour it does not have to cross a heading to reach.
         origins: list[int] = []
@@ -1200,8 +1613,12 @@ class IndexPipeline:
         )
         texts, duplicate_nodes = _dedupe_texts(texts)
 
-        nodes = [self._build_node(text, source_key, metadata) for text in texts]
+        nodes = [self._build_node(text.text, source_key, metadata) for text in texts]
         self._identify_nodes(nodes, source_key)
+        # Checked against the document here, where each node is written and beside
+        # the position it is about to be stored at, rather than at search time
+        # where a wrong range would already read as an answer.
+        ranges = _ranges_within(markdown, texts, source_key)
         chunking = _chunking_outcome(
             nodes,
             self._tokenizer,
@@ -1211,11 +1628,11 @@ class IndexPipeline:
             structural_nodes=structural,
             divided_nodes=divided,
         )
-        return nodes, chunking
+        return nodes, chunking, ranges
 
     def _section_nodes(
         self, section: _Section, source_key: str, metadata: dict, count: Callable[[str], int]
-    ) -> tuple[list[str], int, int]:
+    ) -> tuple[list[_NodeText], int, int]:
         """The nodes one section produces, and how their boundaries were chosen.
 
         A unit the document offers is stored as the node it is: a paragraph the
@@ -1231,8 +1648,20 @@ class IndexPipeline:
         wide to fit, offers the document's own boundaries no more than that, and a
         sentence boundary is the last resort rather than the first tool.
 
-        Returns the node texts, how many nodes were bounded by the document's own
-        structure, and how many had to be divided because one unit exceeded it.
+        Each node comes back with the span of the document its text was built from,
+        beginning at the heading's own line when the node carries one, so that a
+        node -- and through it the section it belongs to -- can be located in the
+        document rather than in another node's text. A node that is a whole unit
+        spans that unit; a node that is part of one spans the part, located inside
+        its unit from where the part before it ended, and falls back to the whole
+        unit's span when it cannot be located there (`part_nodes`). The document is
+        the one the source was converted into, which is the text its content is
+        read back as, so a range measured here is one a caller holding that
+        document can slice.
+
+        Returns the node texts with their spans, how many nodes were bounded by the
+        document's own structure, and how many had to be divided because one unit
+        exceeded it.
         """
         heading = section.heading
         cap = self._chunk_size
@@ -1240,11 +1669,43 @@ class IndexPipeline:
         # than added on top, or a node packed to the cap and then given its
         # heading would sit over the cap by exactly the heading's own cost.
         budget = max(cap - _heading_cost(heading, count), 1)
+        # Where a node carrying this section's heading begins. The heading's line is
+        # nobody's unit -- `_split_sections` left it out -- so it is the section's
+        # own offset that says where the node reading under it starts.
+        lead = section.heading_start if heading else None
 
         def node_text(units: Sequence[str]) -> str:
             return "\n\n".join(([heading] if heading else []) + list(units))
 
-        texts: list[str] = []
+        def part_nodes(parts: Sequence[str], unit: _Unit) -> list[_NodeText]:
+            """The nodes *parts* of *unit* produce, each with the span it came from.
+
+            A part is located inside its unit's own text, sequentially from where the
+            part before it ended, so a sentence the splitter repeated between two
+            overlapping parts is placed at the occurrence following the last one
+            rather than at the first. A part that cannot be located -- a table part,
+            which repeats its header and separator rows and is therefore not a slice
+            of the document, or a piece cut by tokens off a boundary -- falls back to
+            the whole unit's span: the extent stays right and only the node's own
+            anchor within it is coarser, which is a smaller lie than a range pointing
+            at text the node does not read.
+            """
+            located: list[_NodeText] = []
+            cursor = 0
+            for part in parts:
+                offset = unit.text.find(part, cursor)
+                if offset < 0:
+                    start, end = unit.start, unit.end
+                else:
+                    start = unit.start + offset
+                    end = start + len(part)
+                    cursor = offset + len(part)
+                located.append(
+                    _NodeText(node_text([part]), lead if lead is not None else start, end)
+                )
+            return located
+
+        texts: list[_NodeText] = []
         structural = 0
         divided = 0
         splitter: SentenceSplitter | None = None
@@ -1255,18 +1716,18 @@ class IndexPipeline:
                 if len(parts) == 1:
                     # A table is a unit of the document's own making, stored
                     # whole, so it is structurally bounded like any paragraph.
-                    texts.append(node_text(parts))
+                    texts.extend(part_nodes(parts, unit))
                     structural += 1
                 else:
                     # Too wide to fit: its rows are the only boundary it has left.
-                    texts.extend(node_text([part]) for part in parts)
+                    texts.extend(part_nodes(parts, unit))
                     divided += len(parts)
                 continue
             if count(node_text([unit.text])) <= cap:
                 # It fits as it stands, so the document's own boundary is the
                 # node's boundary and the cap has no boundary to add: joining it
                 # to its neighbour would make one node of two thoughts.
-                texts.append(node_text([unit.text]))
+                texts.extend(part_nodes([unit.text], unit))
                 structural += 1
                 continue
             # A single unit wider than the cap with no paragraph break left inside
@@ -1287,7 +1748,7 @@ class IndexPipeline:
                 # A backstop for a single sentence wider than the budget, which is
                 # no sentence boundary at all: it is cut by tokens to fit.
                 pieces.extend(_bounded_parts(node.get_content(), budget, count, self._tokenizer))
-            texts.extend(node_text([piece]) for piece in pieces)
+            texts.extend(part_nodes(pieces, unit))
             divided += len(pieces)
         return texts, structural, divided
 
@@ -1296,6 +1757,7 @@ class IndexPipeline:
         source_key: str,
         nodes: Sequence[BaseNode],
         *,
+        ranges: Sequence[tuple[int, int] | None],
         name: str,
         source_type: str,
         document: str,
@@ -1333,6 +1795,15 @@ class IndexPipeline:
         process's own ingest and search threads apart, so the catalog snapshot
         published at the end is read from a store no other thread is writing to.
         It is not what protects a reader on another instance; the transaction is.
+
+        Each node is recorded with the range *ranges* measured for it as the
+        document was split, and with the heading key it opens with, which is the
+        key a section read groups its nodes by (`_heading_key`). Both are written
+        with the position rather than left to be recovered later: the map is
+        replaced whole by this same write, so a re-ingestion leaves the newer
+        document's ranges and none of the older one's, and a section walk reads
+        the map rather than loading each chunk's text to ask it what heading it
+        began with.
         """
         with self._index_lock:
             # The replacement is one write, and the catalog snapshot is published
@@ -1347,11 +1818,20 @@ class IndexPipeline:
                     collections=collections,
                     chunk_count=len(nodes),
                     content_hash=content_hash,
-                    # Written from the same nodes the index is about to store, so
-                    # a source's recorded order describes what the store holds and
-                    # a re-ingestion replaces it rather than leaving positions from
-                    # the content before.
-                    positions={node.node_id: position for position, node in enumerate(nodes)},
+                    # Written from the same nodes the index is about to store, and
+                    # from the ranges those nodes were built with, so a source's
+                    # recorded order and its ranges describe what the store holds
+                    # and a re-ingestion replaces both rather than leaving either
+                    # from the content before.
+                    positions={
+                        node.node_id: NodePosition(
+                            position=position,
+                            start=ranges[position][0] if ranges[position] else None,
+                            end=ranges[position][1] if ranges[position] else None,
+                            heading=_heading_key(node.get_content()),
+                        )
+                        for position, node in enumerate(nodes)
+                    },
                 )
                 # Written after the record, which is the write that claims the
                 # source's row, and inside this transaction, so that a source's
@@ -1403,7 +1883,7 @@ class IndexPipeline:
         }
 
         chunk_start = time.perf_counter()
-        nodes, chunking = self._chunk(markdown, source_key, metadata)
+        nodes, chunking, ranges = self._chunk(markdown, source_key, metadata)
         timings["chunk_ms"] = _elapsed_ms(chunk_start)
 
         embed_start = time.perf_counter()
@@ -1415,6 +1895,7 @@ class IndexPipeline:
         self._replace_source(
             source_key,
             nodes,
+            ranges=ranges,
             name=filename,
             source_type="file",
             document=markdown,
@@ -1521,7 +2002,7 @@ class IndexPipeline:
         }
 
         chunk_start = time.perf_counter()
-        nodes, chunking = self._chunk(markdown, source_key, metadata)
+        nodes, chunking, ranges = self._chunk(markdown, source_key, metadata)
         timings["chunk_ms"] = _elapsed_ms(chunk_start)
 
         embed_start = time.perf_counter()
@@ -1533,6 +2014,7 @@ class IndexPipeline:
         self._replace_source(
             source_key,
             nodes,
+            ranges=ranges,
             name=url,
             source_type="url",
             document=markdown,
@@ -1625,12 +2107,12 @@ class IndexPipeline:
                 # copy would pay twice for a value the two already agree on.
                 placement = self._placement(chunk)
                 adjacency = self._adjacency(chunk, neighbours, placement)
-                # An empty expansion is the answer a caller that did not ask for
-                # one receives, and it is also what an unplaced hit reports.
+                # No section is the answer a caller that did not ask for one
+                # receives, and it is also what an unplaced hit reports.
                 expansion = (
-                    self._section(chunk, self._settings.max_section_chunks, placement)
+                    self._section(chunk, self._max_section_characters, placement)
                     if section
-                    else _SectionExpansion(0, [])
+                    else None
                 )
                 results.append(
                     {
@@ -1649,8 +2131,7 @@ class IndexPipeline:
                         "neighbours_before": adjacency.before,
                         "neighbours_after": adjacency.after,
                         "neighbours": adjacency.neighbours,
-                        "section": expansion.chunks,
-                        "section_size": expansion.size,
+                        "section": (expansion.as_response() if expansion is not None else None),
                     }
                 )
         return results
@@ -1697,14 +2178,17 @@ class IndexPipeline:
 
         A chunk whose placement cannot be established is reported as unplaced
         rather than guessed at, so an unknown is never shown as context that
-        exists.
+        exists. The whole map is carried out rather than the hit's own row alone:
+        it is one read however much of it is used, and the section walk needs the
+        rows around the hit to find the run the hit belongs to.
         """
         source_key = chunk.ref_doc_id
         record = self._source_records.get(source_key)
-        position = self._store.positions(source_key).get(chunk.node_id)
-        if position is None or record is None:
+        positions = self._store.positions(source_key)
+        placed = positions.get(chunk.node_id)
+        if placed is None or record is None:
             return None
-        return source_key, record, position
+        return _Placement(source_key, record, placed.position, positions)
 
     def _adjacency(self, chunk: BaseNode, count: int, placement: _Placement | None) -> _Adjacency:
         """Collect the neighbours *count* asks for, for a hit at *placement*.
@@ -1720,7 +2204,8 @@ class IndexPipeline:
         """
         if placement is None:
             return _Adjacency(0, 0, 0, [])
-        source_key, record, position = placement
+        record = placement.record
+        position = placement.position
         # A neighbour is the node the same id function names at an adjacent
         # position, which is what makes it the source's own next chunk rather than
         # whatever else the store holds: nothing outside this source is reachable
@@ -1730,7 +2215,7 @@ class IndexPipeline:
             for place in (position - offset, position + offset):
                 if 0 <= place < record.chunk_count:
                     adjacent = self._index.docstore.get_node(
-                        _node_id(source_key, place), raise_error=False
+                        _node_id(placement.source_key, place), raise_error=False
                     )
                     if adjacent is not None:
                         neighbours.append({"text": adjacent.get_content(), "position": place})
@@ -1747,66 +2232,105 @@ class IndexPipeline:
 
     def _section(
         self, chunk: BaseNode, ceiling: int, placement: _Placement | None
-    ) -> _SectionExpansion:
-        """The run of chunks *chunk* belongs to, and how long that run really is.
+    ) -> _SectionExpansion | None:
+        """The document's own text over the run of chunks *chunk* belongs to.
 
-        The run is the chunks of the hit's own source whose text begins with the
-        same heading line as the hit's, taken outwards from the hit in reading
-        order until a chunk begins with a different heading or the source ends. A
-        chunk beginning with no heading line belongs to the heading-less section,
-        which is the content before a document's first heading, and that section is
-        walked by the same rule: none matches none.
+        The run is the nodes of the hit's own source whose recorded heading key is
+        the hit's, taken outwards from the hit in reading order until a node's key
+        differs or the source ends. A node whose key is empty belongs to the
+        heading-less section, which is the content before a document's first
+        heading, and that section is walked by the same rule: none matches none.
+
+        The walk reads the source's position map rather than the nodes, so a node's
+        membership is decided by what it recorded about itself when it was written
+        -- its heading key, its place in the source -- and no node's text is read to
+        decide whether it belongs. Nothing of the run's text is read from the
+        docstore at all: what the answer carries is the document's own characters
+        over the run, which is one read of the document the source was converted
+        into rather than one read per chunk returned.
+
+        The run's span is the smallest range of the converted document covering
+        every node in it, from its first node's first character to its last node's
+        last, and its true length is that span's width: the section as the document
+        holds it, rather than as the pieces it was cut into. That length travels in
+        the answer beside the part actually returned, which the ceiling bounds and
+        which is taken around the hit so the hit's own text is always inside it.
+
+        A section that cannot be established comes back as no section rather than a
+        guessed one: a node of the run carrying no recorded range says nothing about
+        where the section sits, and a source whose document was not captured holds
+        no characters to slice. Both are answered as no section, because a range is
+        not something to invent and empty text at an invented range is worse than an
+        absent section.
 
         Both ends are walked rather than stopping at the ceiling, because the
-        ceiling bounds what is *returned* and the section's real size is what tells
-        a caller whether the answer is complete. What comes back is the part of the
-        section around the hit -- never less than the hit itself -- and the size of
-        the whole run it was taken from.
-
-        The caller holds ``_index_lock``, so a walk of a long section holds it for
-        as many docstore reads as the section has chunks. The ceiling bounds the
-        returned part, not the walk. *placement* is where the hit sits in its
-        source, established once by the caller and shared with the adjacency walk,
-        so one hit reads its source's position map once rather than once per walk;
-        a hit whose placement could not be established reports no section rather
-        than a guessed one.
+        ceiling bounds what is *returned* and the section's real length is what tells
+        a caller whether the answer is complete. The caller holds ``_index_lock``;
+        *placement* is the hit's place in its source, established once by the caller
+        and shared with the adjacency walk, so one hit reads its source's position
+        map once rather than once per walk. A hit whose placement could not be
+        established reports no section rather than a guessed one.
         """
         if placement is None:
-            return _SectionExpansion(0, [])
-        source_key, record, position = placement
-        heading = _leading_heading(chunk.get_content())
+            return None
+        positions = placement.positions
+        hit = positions.get(chunk.node_id)
+        # A row written before the map carried heading keys says nothing about which
+        # section the node belongs to, and a run cannot be walked from an unknown.
+        if hit is None or hit.heading is None:
+            return None
 
-        def belonging_text(place: int) -> str | None:
-            """The stored text at *place*, or None when it is not the section's."""
-            node = self._index.docstore.get_node(_node_id(source_key, place), raise_error=False)
-            if node is None:
+        def belongs(place: int) -> NodePosition | None:
+            """The map's row for the node at *place*, when it is the section's own."""
+            row = positions.get(_node_id(placement.source_key, place))
+            if row is None or row.heading != hit.heading:
                 return None
-            text = node.get_content()
-            return text if _leading_heading(text) == heading else None
+            return row
 
-        before: list[dict] = []
-        first = position
+        before: list[NodePosition] = []
+        first = placement.position
         while first > 0:
-            text = belonging_text(first - 1)
-            if text is None:
+            row = belongs(first - 1)
+            if row is None:
                 break
             first -= 1
-            before.append({"text": text, "position": first})
-        after: list[dict] = []
-        last = position
-        while last + 1 < record.chunk_count:
-            text = belonging_text(last + 1)
-            if text is None:
+            before.append(row)
+        after: list[NodePosition] = []
+        last = placement.position
+        while last + 1 < placement.record.chunk_count:
+            row = belongs(last + 1)
+            if row is None:
                 break
             last += 1
-            after.append({"text": text, "position": last})
+            after.append(row)
 
         # Collected outwards on both sides, so the left half reverses to read in
         # the document's order.
         before.reverse()
-        whole = [*before, {"text": chunk.get_content(), "position": position}, *after]
-        start, end = _section_window(first, last, position, ceiling)
-        return _SectionExpansion(last - first + 1, whole[start - first : end - first + 1])
+        run = [*before, hit, *after]
+        if any(row.start is None or row.end is None for row in run):
+            return None
+        # The run is in reading order, so its first node opens the section and its
+        # last one closes it; the extremes are taken over the whole run anyway, so
+        # the span is the section's whatever order the map came back in.
+        section_start = min(row.start for row in run)
+        section_end = max(row.end for row in run)
+
+        document = self._store.document(placement.source_key)
+        # A range that reaches past the document it was measured against is not a
+        # range this service can slice, and a document that was never captured has
+        # nothing to slice: either way the section is not one to report.
+        if document is None or section_end > len(document):
+            return None
+        window_start, window_end = _section_window(
+            section_start, section_end, hit.start, hit.end, ceiling
+        )
+        return _SectionExpansion(
+            text=document[window_start:window_end],
+            start=window_start,
+            end=window_end,
+            size=section_end - section_start,
+        )
 
 
 def _in_process_store(app_settings: Settings, embedding_model: object) -> IndexStore:

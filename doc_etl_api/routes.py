@@ -346,8 +346,8 @@ async def search(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="A search cannot ask for both `neighbours` and an `expand` section. "
-            "Ask for one: a section is the whole run of chunks a result belongs to, and "
-            "neighbours are the chunks beside it.",
+            "Ask for one: a section is the document's own text over the whole run of "
+            "chunks a result belongs to, and neighbours are the chunks beside it.",
         )
 
     top_k = request.top_k or app_settings.default_top_k

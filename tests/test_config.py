@@ -106,27 +106,34 @@ def test_unknown_log_level_is_rejected():
 # --- The section ceiling ----------------------------------------------------
 
 
-def test_the_section_ceiling_defaults_to_a_paragraph_sized_passage():
-    assert Settings().max_section_chunks == 25
+def test_the_section_ceiling_is_unset_until_the_chunk_size_is_known():
+    """Unset means the passage the chunk-count cap returned to an operator.
+
+    The ceiling counts the document's own characters, and the passage to match is
+    a chunk count times the chunk size in use -- a size the embedding model decides.
+    Writing a character count here would be a second number to keep in step with
+    that model, so the default stays unset and `IndexPipeline` resolves it.
+    """
+    assert Settings().max_section_characters is None
 
 
 def test_the_section_ceiling_from_env_is_used():
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("MAX_SECTION_CHUNKS", "3")
+        mp.setenv("MAX_SECTION_CHARACTERS", "3000")
         s = Settings()
 
-    assert s.max_section_chunks == 3
+    assert s.max_section_characters == 3000
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_a_ceiling_that_would_return_nothing_is_rejected(value):
-    """A ceiling below one chunk would expand a hit to no section at all.
+    """A ceiling below one character would expand a hit to no section at all.
 
     Refusing it keeps the bound a limit on an answer rather than a way to receive
     nothing, which is what asking for no expansion is for.
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("MAX_SECTION_CHUNKS", value)
+        mp.setenv("MAX_SECTION_CHARACTERS", value)
         with pytest.raises(ValidationError):
             Settings()
 

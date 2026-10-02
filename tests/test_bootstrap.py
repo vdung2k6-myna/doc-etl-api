@@ -8,6 +8,7 @@ from doc_etl_api.bootstrap import BootstrapState, BootstrapStatus, corpus_files,
 from doc_etl_api.claims import InProcessClaimStore, claim_heartbeat
 from doc_etl_api.config import Settings
 from doc_etl_api.pipeline import IndexPipeline, content_hash
+from doc_etl_api.store import NodePosition
 from tests.stubs import EMBEDDING_MODEL_NAME, StubEmbedding
 from tests.test_pipeline import stub_page
 
@@ -583,6 +584,63 @@ def test_a_current_corpus_source_with_no_document_is_ingested_once_more(corpus_d
     assert parsed == ["alpha.txt"], "a source that already held a document was converted again"
     assert pipeline.has_document("alpha.txt"), "the source was skipped without a document"
     assert pipeline.source_content("alpha.txt")[1] == "alpha"
+
+
+def test_a_current_corpus_source_with_no_ranges_is_ingested_once_more(corpus_dir):
+    """A source from before ranges were recorded is converted again, and only it.
+
+    Its content is current and its document is captured, so those two comparisons
+    on their own would skip it -- and the source would answer no section for as
+    long as it went unedited, because the walk that would place a run of its nodes
+    has no range to place it by. Requiring every node to carry a range is what
+    converts it once more, and what keeps that one conversion from becoming one
+    per source per restart: the file that already carries ranges is still skipped,
+    with its converter never called.
+    """
+    pipeline, settings, parsed = _recording_pipeline(corpus_dir)
+    pipeline.ingest_file(
+        source_id="beta",
+        file=BytesIO((corpus_dir / "beta.txt").read_bytes()),
+        filename="beta.txt",
+    )
+    assert parsed == ["beta.txt"], "the fixture did not ingest beta.txt through the converter"
+
+    # alpha.txt, written the way this service wrote a source before it recorded
+    # ranges: current in content, holding its document, but its node map says
+    # nothing about where each node's text came from.
+    payload = (corpus_dir / "alpha.txt").read_bytes()
+    pipeline.ingest_file(
+        source_id="alpha",
+        file=BytesIO(payload),
+        filename="alpha.txt",
+    )
+    positions = pipeline._store.positions("alpha.txt")
+    assert positions, "the fixture ingested alpha.txt with no nodes"
+    pipeline._store.replace(
+        "alpha.txt",
+        name="alpha.txt",
+        source_type="file",
+        collections=(),
+        chunk_count=len(positions),
+        content_hash=content_hash(payload),
+        positions={
+            node_id: NodePosition(position=row.position, heading=row.heading)
+            for node_id, row in positions.items()
+        },
+    )
+    pipeline.refresh()
+    assert pipeline.is_current("alpha.txt", content_hash(payload), [])
+    assert pipeline.has_document("alpha.txt"), "the fixture left the source without a document"
+    assert not pipeline.has_ranges("alpha.txt"), "the fixture left the source a range"
+
+    parsed.clear()
+    state = BootstrapState()
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert state.failures == []
+    assert parsed == ["alpha.txt"], "a source that already carried its ranges was converted again"
+    assert pipeline.has_ranges("alpha.txt"), "the source was skipped without its ranges"
 
 
 def test_editing_one_corpus_file_re_ingests_that_file_alone(corpus_dir):

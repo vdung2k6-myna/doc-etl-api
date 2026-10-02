@@ -73,6 +73,38 @@ class SourceRecord:
     content_hash: str | None = None
 
 
+@dataclass(frozen=True)
+class NodePosition:
+    """Where one node sits in its source, and where its text came from.
+
+    ``position`` is the node's place among its source's nodes in reading order,
+    which is what the section and neighbour walks step through; ``start`` and
+    ``end`` are the range of the stored document the node's text was built from.
+    The range is measured in the document the source was converted into -- the
+    same text the source's content is read back as -- so a caller holding that
+    document can slice those offsets and receive the node's own words.
+
+    The fields are three facts rather than one, and each can be missing on its
+    own. A node written before ranges were recorded has a position and no range,
+    and such a node carries None in both ``start`` and ``end`` rather than a
+    zero-width range at the document's start, so that "no range was recorded"
+    and "the range begins at zero" stay different answers. ``heading`` is the
+    heading line the node's text begins with, which is what decides the section
+    it belongs to: a node whose text begins with ordinary content belongs to the
+    heading-less section, and that is recorded as an empty string rather than as
+    None, because None is the key that was never recorded at all.
+
+    A source whose nodes carry no range is one this store can place but cannot
+    locate in its document, which is what a section read refuses to answer for
+    rather than answering with a guess.
+    """
+
+    position: int
+    start: int | None = None
+    end: int | None = None
+    heading: str | None = None
+
+
 class DurableStoreError(RuntimeError):
     """The configured durable store could not be established.
 
@@ -117,7 +149,21 @@ class IndexStore(Protocol):
 
     def records(self) -> tuple[SourceRecord, ...]: ...
 
-    def positions(self, address: str) -> dict[str, int]: ...
+    def positions(self, address: str) -> dict[str, NodePosition]:
+        """Each node id *address* holds, mapped to where that node sits and came from.
+
+        A source nothing was written for answers with no entries, which is also
+        what a source written with no nodes answers: the map describes the nodes
+        the store holds, so a source holding none has none to describe.
+
+        The range and the heading key come back with the position rather than
+        from the nodes themselves, because they are what a section read is
+        answered from: the run a hit belongs to is walked out of this map, and
+        the text it returns is sliced from the document, so a walk that has to
+        load and inspect each chunk's text to find its own section pays a read
+        per chunk of the run for facts it was already told.
+        """
+        ...
 
     def document(self, address: str) -> str | None:
         """The document *address* was converted into, or None where none was captured.
@@ -197,8 +243,19 @@ class IndexStore(Protocol):
         collections: Sequence[str],
         chunk_count: int,
         content_hash: str | None,
-        positions: dict[str, int],
-    ) -> None: ...
+        positions: dict[str, NodePosition],
+    ) -> None:
+        """Write *address*'s record and the map of its nodes, replacing what it held.
+
+        The map is written by the same call, in the same transaction, as the
+        record it describes, and it is deleted and rewritten rather than merged.
+        Both are what keep it describing one ingestion rather than two halves of
+        two: a replacement that produced fewer chunks than the one before it
+        would otherwise leave rows past its end pointing at nothing, and one
+        whose chunker divided the document differently would leave the earlier
+        ingestion's ranges beside the new ingestion's nodes.
+        """
+        ...
 
     def close(self) -> None: ...
 
@@ -214,7 +271,7 @@ class InProcessIndexStore:
 
     def __init__(self) -> None:
         self._records: dict[str, SourceRecord] = {}
-        self._positions: dict[str, dict[str, int]] = {}
+        self._positions: dict[str, dict[str, NodePosition]] = {}
         self._documents: dict[str, str] = {}
 
     @property
@@ -236,7 +293,13 @@ class InProcessIndexStore:
     def records(self) -> tuple[SourceRecord, ...]:
         return tuple(self._records[key] for key in sorted(self._records))
 
-    def positions(self, address: str) -> dict[str, int]:
+    def positions(self, address: str) -> dict[str, NodePosition]:
+        """The same map the durable backend keeps, held in a dict rather than a table.
+
+        A copy is returned rather than the dict itself, so a caller's read is of
+        the map as it stood when it asked and not of one a later ingestion is
+        rewriting under it.
+        """
         return dict(self._positions.get(address, {}))
 
     def document(self, address: str) -> str | None:
@@ -282,7 +345,7 @@ class InProcessIndexStore:
         collections: Sequence[str],
         chunk_count: int,
         content_hash: str | None,
-        positions: dict[str, int],
+        positions: dict[str, NodePosition],
     ) -> None:
         self._records[address] = SourceRecord(
             name=name,
@@ -509,6 +572,17 @@ class PostgresIndexStore:
             ),
             sqlalchemy.Column("node_id", sqlalchemy.Text, primary_key=True),
             sqlalchemy.Column("position", sqlalchemy.Integer, nullable=False),
+            # The node's range in its source's document, and the heading key the
+            # section walk groups it by. All three are nullable, and for the same
+            # reason: a row written before this change carries the position it was
+            # written with and nothing here, and a table that predates the columns
+            # is altered to carry them (`_migrate_catalog_tables`). Null is "not
+            # recorded", so it is never read as an offset or as a heading -- the
+            # heading-less section is recorded as an empty string, which is a key
+            # the walk can match, rather than as the null that means no key at all.
+            sqlalchemy.Column("start", sqlalchemy.Integer, nullable=True),
+            sqlalchemy.Column("end", sqlalchemy.Integer, nullable=True),
+            sqlalchemy.Column("heading", sqlalchemy.Text, nullable=True),
         )
         # The document each source was converted into, one row per source, keyed
         # like the catalog row it sits beside. A table of its own rather than a
@@ -552,6 +626,47 @@ class PostgresIndexStore:
         # way: one database, one base name, one place the schema is established.
         claims_table(base, metadata)
         metadata.create_all(self._engine)
+        self._migrate_catalog_tables()
+
+    def _migrate_catalog_tables(self) -> None:
+        """Add to an existing catalog table the columns `create_all` will not.
+
+        `create_all` is a create and not an alter: a table that already exists is
+        left exactly as it is, so a collection this service has been writing to
+        since before a column was introduced would open without it and fail on
+        the first read or write that named it. The columns are added here,
+        nullable, so that the rows already in the table -- which say nothing about
+        a range because nothing measured one -- keep meaning what they meant.
+
+        This runs at startup and only at startup, before the store is handed to
+        the pipeline, so no reader and no writer can be holding the old shape
+        while it changes. It is idempotent, which is what lets a database be
+        opened again by an instance that has already migrated it -- and what
+        makes two instances starting at once safe, since each runs this against
+        the same table without knowing about the other.
+        """
+        table = self._positions.name
+        inspector = sqlalchemy.inspect(self._engine)
+        if table not in inspector.get_table_names():
+            return
+        existing = {column["name"] for column in inspector.get_columns(table)}
+        missing = [column for column in self._positions.columns if column.name not in existing]
+        if not missing:
+            return
+        preparer = self._engine.dialect.identifier_preparer
+        # Quoted through the dialect's own preparer rather than formatted in: one
+        # of these columns is named `end`, which is a reserved word, and a name
+        # interpolated without quoting is a syntax error rather than a column.
+        quoted_table = preparer.quote_identifier(table)
+        with self._engine.begin() as connection:
+            for column in missing:
+                declared = column.type.compile(self._engine.dialect)
+                connection.execute(
+                    sqlalchemy.text(
+                        f"ALTER TABLE {quoted_table} ADD COLUMN IF NOT EXISTS "
+                        f"{preparer.quote_identifier(column.name)} {declared}"
+                    )
+                )
 
     def job_store(self) -> "PostgresJobStore":
         """A jobs registry backing over this store's own database and engine.
@@ -687,15 +802,27 @@ class PostgresIndexStore:
             for row in rows
         )
 
-    def positions(self, address: str) -> dict[str, int]:
-        """Each node id this source holds, mapped to its position within it."""
+    def positions(self, address: str) -> dict[str, NodePosition]:
+        """Each node id this source holds, mapped to where it sits and came from."""
         with self._engine.connect() as connection:
             rows = connection.execute(
-                sqlalchemy.select(self._positions.c.node_id, self._positions.c.position).where(
-                    self._positions.c.address == address
-                )
+                sqlalchemy.select(
+                    self._positions.c.node_id,
+                    self._positions.c.position,
+                    self._positions.c.start,
+                    self._positions.c.end,
+                    self._positions.c.heading,
+                ).where(self._positions.c.address == address)
             ).all()
-        return {row.node_id: row.position for row in rows}
+        return {
+            row.node_id: NodePosition(
+                position=row.position,
+                start=row.start,
+                end=row.end,
+                heading=row.heading,
+            )
+            for row in rows
+        }
 
     def document(self, address: str) -> str | None:
         """The stored document, reached by primary key rather than by scan.
@@ -791,9 +918,9 @@ class PostgresIndexStore:
         collections: Sequence[str],
         chunk_count: int,
         content_hash: str | None,
-        positions: dict[str, int],
+        positions: dict[str, NodePosition],
     ) -> None:
-        """Write *address*'s record and positions, replacing what it held.
+        """Write *address*'s record and the map of its nodes, replacing what it held.
 
         The pipeline calls this first inside a replacement's `transaction`, and
         that order is load-bearing rather than incidental: the upsert below takes
@@ -806,10 +933,12 @@ class PostgresIndexStore:
         interface promises a store asked to write one source, and what the
         in-process backend answers by writing its dicts.
 
-        The positions are deleted and rewritten rather than merged, so a source's
+        The map is deleted and rewritten rather than merged, so a source's
         recorded order always describes one ingestion rather than two halves of
         two -- an ingestion that produced fewer chunks than the one before it
-        would otherwise leave positions past its end pointing at nothing.
+        would otherwise leave positions past its end pointing at nothing, and one
+        that measured its nodes against a different document would leave the
+        earlier ingestion's ranges beside the new ingestion's nodes.
         """
         values = {
             "address": address,
@@ -833,8 +962,15 @@ class PostgresIndexStore:
                 connection.execute(
                     self._positions.insert(),
                     [
-                        {"address": address, "node_id": node_id, "position": position}
-                        for node_id, position in positions.items()
+                        {
+                            "address": address,
+                            "node_id": node_id,
+                            "position": node.position,
+                            "start": node.start,
+                            "end": node.end,
+                            "heading": node.heading,
+                        }
+                        for node_id, node in positions.items()
                     ],
                 )
 

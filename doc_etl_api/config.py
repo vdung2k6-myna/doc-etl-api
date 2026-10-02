@@ -82,6 +82,14 @@ DEFAULT_PDF_OCR_LANGUAGES = "vi"
 # language; this rejects a mistyped setting without claiming to know the list.
 OCR_LANGUAGE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
+# How many chunks one section expansion was allowed while the cap counted chunks
+# rather than the document's own characters. Kept as the basis of
+# `max_section_characters`' default rather than replaced by a character count of
+# its own, because it is the passage an operator received: the new default is that
+# same passage. It counts chunks and not text, so it is only ever multiplied by the
+# chunk size in use -- see `IndexPipeline._resolve_max_section_characters`.
+DEFAULT_SECTION_CHUNKS = 25
+
 
 class VectorStoreBackend(str, Enum):
     SIMPLE = "simple"
@@ -152,12 +160,19 @@ class Settings(BaseSettings):
     # node the splitter produces, fragments included.
     min_chunk_tokens: int = Field(default=32, ge=0)
     default_top_k: int = Field(default=5)
-    # How many chunks one section expansion may return. The cap is not a section
-    # size: a document whose headings were dropped upstream has one section that
-    # is the whole source, so the returned part is bounded and the section's true
-    # size is reported beside it, which is how a caller sees a truncated section
-    # rather than mistaking it for the whole one.
-    max_section_chunks: int = Field(default=25, ge=1)
+    # How long a section expansion may be, counted in the document's own characters
+    # rather than in chunks. The cap is not a section size: a document whose headings
+    # were dropped upstream has one section that is the whole source, so the part
+    # returned is bounded and taken around the result, and the section's true length
+    # travels beside it, which is how a caller sees a truncated section rather than
+    # mistaking it for the whole one.
+    #
+    # Unset means the passage the cap returned while it counted chunks:
+    # `DEFAULT_SECTION_CHUNKS` times the chunk size in use. That size is the
+    # embedding model's to decide, so the default is resolved against it by
+    # `IndexPipeline._resolve_max_section_characters` rather than written here,
+    # where it would be a second number to keep in step with the model.
+    max_section_characters: int | None = Field(default=None, ge=1)
 
     max_file_size_mb: int = Field(default=50)
     url_fetch_timeout_seconds: int = Field(default=30)

@@ -2,41 +2,56 @@ import hashlib
 import importlib.util
 import logging
 import re
+import sys
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import requests
 import tiktoken
+from docling.datamodel.accelerator_options import AcceleratorOptions
 from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import EasyOcrOptions, OcrMode
 from docling.document_converter import DocumentConverter
+from docling.models.factories import get_ocr_factory
+from docling_core.types.doc import BoundingBox, CoordOrigin
 from llama_index.core import Document as LlamaDocument
 from llama_index.core import Settings as LlamaSettings
 from llama_index.core.embeddings import MockEmbedding
 from llama_index.core.schema import MetadataMode, TextNode
 
-from doc_etl_api.config import DEFAULT_USER_AGENT, Settings, VectorStoreBackend
+from doc_etl_api.config import (
+    DEFAULT_SECTION_CHUNKS,
+    DEFAULT_USER_AGENT,
+    Settings,
+    VectorStoreBackend,
+)
 from doc_etl_api.pipeline import (
+    _MERGE_SEPARATOR,
     _STORE_BUILDERS,
     DoclingConverter,
     IndexPipeline,
     _content_token_ids,
     _leading_heading,
     _node_id,
+    _reading_order,
+    _ReadingOrderEasyOcrModel,
+    _ReadingOrderEasyOcrOptions,
+    _Section,
     _SectionExpansion,
     _split_oversized_text,
     _split_sections,
     content_hash,
     create_pipeline,
 )
-from doc_etl_api.store import InProcessIndexStore, SourceRecord
+from doc_etl_api.store import InProcessIndexStore, NodePosition, SourceRecord
 from tests.stubs import (
     EMBEDDING_MAX_TOKENS,
     EMBEDDING_MODEL_NAME,
@@ -95,7 +110,13 @@ def _boundary_overlap(earlier: str, later: str) -> int:
     return 0
 
 
-def _stub_pipeline(chunk_size=None, chunk_overlap=10, embedding_model=None, min_chunk_tokens=32):
+def _stub_pipeline(
+    chunk_size=None,
+    chunk_overlap=10,
+    embedding_model=None,
+    min_chunk_tokens=32,
+    max_section_characters=None,
+):
     """A pipeline paired with a double stating its own limit and tokenizer."""
     return IndexPipeline(
         Settings(
@@ -104,6 +125,7 @@ def _stub_pipeline(chunk_size=None, chunk_overlap=10, embedding_model=None, min_
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             min_chunk_tokens=min_chunk_tokens,
+            max_section_characters=max_section_characters,
             default_top_k=5,
         ),
         converter=MagicMock(),
@@ -241,6 +263,168 @@ def test_device_selection_is_left_to_docling(recwarn):
 
     assert options.ocr_options.use_gpu is None
     assert [w for w in recwarn.list if issubclass(w.category, DeprecationWarning)] == []
+
+
+# --- Reading order: what OCR recognises is stored as the page reads it ---------
+#
+# A recogniser returns a region's boxes in its own order, which is not the page's: a
+# box at a line's right margin starts a line of its own and is emitted after the
+# lines below it. The boxes below stand in for the ones measured on the scans the
+# change was made against -- the line the page prints as `Tiễn con trai lên thành
+# phố học, ông bố thân mật nói:` came back with `học,` at the end of the paragraph
+# after it.
+
+
+def ocr_box(text: str, left: int, top: int, width: int = 300, height: int = 12) -> tuple:
+    """One recogniser result: the box's corner points, its text and its confidence."""
+    return (
+        [(left, top), (left + width, top), (left + width, top + height), (left, top + height)],
+        text,
+        0.9,
+    )
+
+
+def recognised(results: Sequence[tuple]) -> list[str]:
+    """The texts of *results*, in the order the conversion would store them."""
+    return [text for _, text, _ in _reading_order(results)]
+
+
+def test_a_right_margin_box_is_read_inside_its_own_line():
+    """A displaced box belongs to the line it sits on, where the page prints it."""
+    opening = ocr_box("Tiễn con trai lên thành phố", left=0, top=100)
+    displaced = ocr_box("học,", left=1200, top=101)
+    following = ocr_box("Thành phố là chốn ăn chơi.", left=0, top=140)
+
+    # As the recogniser returned them: the right-margin box after the line below it.
+    assert recognised([opening, following, displaced]) == [
+        "Tiễn con trai lên thành phố",
+        "học,",
+        "Thành phố là chốn ăn chơi.",
+    ]
+
+
+def test_lines_are_read_top_to_bottom_however_they_were_returned():
+    """The region's lines follow the page, not the recogniser's return order."""
+    above = ocr_box("Trên", left=0, top=40)
+    below = ocr_box("Dưới", left=0, top=80)
+
+    assert recognised([below, above]) == ["Trên", "Dưới"]
+
+
+def test_boxes_the_rule_cannot_separate_keep_the_recognisers_order():
+    """Two boxes in the same place are left in the order the recogniser gave them."""
+    one = ocr_box("một", left=0, top=10)
+    two = ocr_box("hai", left=0, top=10)
+
+    assert recognised([one, two]) == ["một", "hai"]
+    assert recognised([two, one]) == ["hai", "một"]
+
+
+def test_the_reading_order_stores_the_same_text_it_was_given():
+    """Ordering moves a region's characters; it makes and loses none of them."""
+    results = [
+        ocr_box(f"câu {index}", left=index * 200, top=100 + (index % 3) * 4) for index in range(9)
+    ]
+
+    assert sorted(recognised(results)) == sorted(text for _, text, _ in results)
+
+
+def test_the_engine_answers_a_regions_boxes_in_reading_order(monkeypatch):
+    """The seam: a page run through Docling's own model is stored in reading order.
+
+    The model is Docling's, driven through Docling's own ``__call__``, on a page whose
+    region holds boxes the recogniser returned out of order. This is the test that
+    fails if Docling moves the attribute it keeps its recogniser in or changes the call
+    it makes on it: the rule would still be correct and the converter would still be
+    configured, and every page would quietly go back to the recogniser's own order.
+    """
+    opening = ocr_box("Tiễn con trai lên thành phố", left=0, top=100)
+    displaced = ocr_box("học,", left=1200, top=101)
+    following = ocr_box("Thành phố là chốn ăn chơi.", left=0, top=140)
+
+    class StubReader:
+        """EasyOCR's reader, without the model download or the recognition."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def readtext(self, image):
+            return [opening, following, displaced]
+
+    # `easyocr` is imported inside the model, so the stub is installed where that
+    # import looks -- no EasyOCR, and no torch, is loaded to run this.
+    monkeypatch.setitem(sys.modules, "easyocr", SimpleNamespace(Reader=StubReader))
+
+    model = _ReadingOrderEasyOcrModel(
+        enabled=True,
+        artifacts_path=None,
+        options=_ReadingOrderEasyOcrOptions(lang=["vi"]),
+        accelerator_options=AcceleratorOptions(),
+    )
+    # The recogniser Docling asked for is the one it got, with its own settings.
+    assert model.reader.kwargs["lang_list"] == ["vi"]
+
+    # One region, the size of the page, so the page needs no layout of its own: the
+    # ordering under test is the region's, not the layout model's.
+    page = MagicMock()
+    page.cells = []
+    page._backend.get_page_image.return_value = np.zeros((10, 10, 3), dtype=np.uint8)
+    model.get_ocr_rects = lambda page: [
+        BoundingBox(l=0, t=0, r=100, b=100, coord_origin=CoordOrigin.TOPLEFT)
+    ]
+
+    list(model(conv_res=MagicMock(), page_batch=[page]))
+
+    assert [cell.text for cell in page.parsed_page.textline_cells] == [
+        "Tiễn con trai lên thành phố",
+        "học,",
+        "Thành phố là chốn ăn chơi.",
+    ]
+
+
+def test_the_converter_is_configured_to_store_recognised_text_in_reading_order(monkeypatch):
+    """The PDF pipeline names the ordering model, in the languages it was configured with."""
+    monkeypatch.setattr("doc_etl_api.pipeline.settings", Settings(pdf_ocr_languages="en, vi"))
+
+    options = _pdf_options(DoclingConverter()).ocr_options
+
+    assert isinstance(options, _ReadingOrderEasyOcrOptions)
+    assert options.lang == ["en", "vi"]
+    # Still EasyOCR: a different model for the engine, not a different engine.
+    assert options.kind == "easyocr"
+
+
+def test_docling_builds_the_ordering_model_for_those_options():
+    """The factory Docling asks at conversion time resolves the options to our model.
+
+    Docling looks the model up by the options' exact type, which is why the options
+    class -- not the model class -- is what selects it, and why the default EasyOCR
+    options still reach Docling's own model rather than this one.
+    """
+    DoclingConverter()
+
+    factory = get_ocr_factory(allow_external_plugins=False)
+
+    def build(options):
+        return factory.create_instance(
+            options=options,
+            enabled=False,
+            artifacts_path=None,
+            accelerator_options=AcceleratorOptions(),
+        )
+
+    assert isinstance(build(_ReadingOrderEasyOcrOptions(lang=["vi"])), _ReadingOrderEasyOcrModel)
+    plain = build(EasyOcrOptions(lang=["vi"]))
+    assert not isinstance(plain, _ReadingOrderEasyOcrModel)
+
+
+def test_a_process_building_more_than_one_converter_still_resolves_the_model():
+    """Registering an options type twice is an error, and a process builds several."""
+    first = _pdf_options(DoclingConverter()).ocr_options
+    second = _pdf_options(DoclingConverter()).ocr_options
+
+    assert isinstance(first, _ReadingOrderEasyOcrOptions)
+    assert isinstance(second, _ReadingOrderEasyOcrOptions)
 
 
 def test_docling_converter_file(settings, tmp_path):
@@ -1814,6 +1998,160 @@ def test_a_comment_inside_a_fenced_code_block_does_not_open_a_section():
     assert [unit.text.splitlines()[0] for unit in sections[0].units] == ["```python", PARA_ALPHA]
 
 
+def test_every_unit_carries_the_span_it_was_split_from():
+    """A unit's span is measured as the document is split, not searched for afterwards.
+
+    A node's range is the span of the units it was built from, so it is only as
+    sound as these offsets. Measuring beats searching because a node's text is not
+    always a slice of the document: a merge joins two units with a separator the
+    document may not contain, and a table's separator row is stored shortened. A
+    search for such a text would be a guess that reports a range confidently and
+    wrongly, which is worse than no range at all.
+    """
+    markdown = PARAGRAPH_GAP.join(
+        [PARA_ALPHA, HEADING_ONE, PARA_BRAVO, INFOBOX, HEADING_TWO, PARA_CHARLIE]
+    )
+
+    sections = _split_sections(markdown)
+
+    assert [section.heading for section in sections] == [None, HEADING_ONE, HEADING_TWO]
+    assert [unit.kind for unit in sections[1].units] == ["prose", "table"], (
+        "the fixture must hold a table for its span to be measured as well"
+    )
+    for section in sections:
+        if section.heading is None:
+            assert section.heading_start is None, (
+                "a section with no heading reported an offset into the document"
+            )
+        else:
+            assert markdown[section.heading_start :].startswith(section.heading), (
+                "a section's heading offset does not point at its heading line"
+            )
+        for unit in section.units:
+            assert markdown[unit.start : unit.end] == unit.text, (
+                f"a unit's span does not slice its own text out of the document: {unit.text!r}"
+            )
+
+
+def test_every_node_carries_the_range_it_was_built_from():
+    """A node's range is threaded through whatever built it, not searched for at the end.
+
+    The document is one section holding the three shapes a node can come in, and
+    each is a way a search for the finished text would go wrong. A node reading
+    under a heading begins at the heading's own line -- which the node repeats
+    rather than the range reaching it again. A node the floor merged spans both
+    the texts it joined, which the document may not hold side by side. A node
+    divided out of a paragraph wider than the cap spans the part it holds, located
+    inside its unit from where the part before it ended. What every range does
+    have to be is tight at its end and in the document's own order: it finishes
+    where the node's last line finishes, and the nodes follow the document rather
+    than the order the floor and the deduplicator happened to leave them in.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    markdown = PARAGRAPH_GAP.join([HEADING_ONE, SENTENCE_DOC, PARA_ALPHA, FRAGMENT, PARA_BRAVO])
+    assert _model_tokens(SENTENCE_DOC) > 128, (
+        "the fixture must hold a unit wider than the cap for this test to bite"
+    )
+    assert _model_tokens(PARA_ALPHA) > 32 and _model_tokens(FRAGMENT) < 32, (
+        "the fixture must hold both a unit that stands alone and one the floor acts on"
+    )
+
+    nodes, _, ranges = pipeline._chunk(markdown, "page.txt", {})
+    placed = list(zip(nodes, ranges, strict=True))
+    assert all(span is not None for _, span in placed), (
+        "every span of this fixture is inside the document it was measured in"
+    )
+
+    # The three shapes really are on the table, or the assertions below are vacuous.
+    texts = [node.get_content() for node, _ in placed]
+    assert sum(1 for text in texts if _MERGE_SEPARATOR in text) == 1, (
+        "the fragment below the floor must fold into exactly one node"
+    )
+    parts = [
+        text.removeprefix(f"{HEADING_ONE}\n\n")
+        for text in texts
+        if text.removeprefix(f"{HEADING_ONE}\n\n") in SENTENCE_DOC
+    ]
+    assert len(parts) > 1, "the paragraph wider than the cap must be divided for this test to bite"
+
+    for node, span in placed:
+        assert span is not None
+        start, end = span
+        text = node.get_content()
+        assert markdown.startswith(HEADING_ONE, start), (
+            "a node reading under a heading does not begin at the heading's own line"
+        )
+        # The document's characters over the range carry the node's own lines in
+        # order. Lines rather than the whole text, because the heading is one the
+        # node repeats and the merge separator is the floor's own character: the
+        # range holds both, so neither is a character the range fails to reach.
+        window = markdown[start:end]
+        cursor = 0
+        for line in text.splitlines():
+            if not line.strip() or line == HEADING_ONE:
+                continue
+            at = window.find(line, cursor)
+            assert at >= 0, (
+                f"a node's range does not carry its own text: {line!r} is not in {window!r}"
+            )
+            cursor = at + len(line)
+        # And the range is tight where it ends, however wide it had to start.
+        last = [line for line in text.splitlines() if line.strip()][-1]
+        assert markdown[:end].endswith(last), (
+            f"a node's range ends past its own last line: {last!r}"
+        )
+
+    starts = [span[0] for _, span in placed if span is not None]
+    assert starts == sorted(starts), "the nodes' ranges do not follow the document's order"
+    assert placed[-1][1] is not None and placed[-1][1][1] == len(markdown), (
+        "the last node's range stops short of the end of the document it reads"
+    )
+
+
+def test_a_span_outside_the_document_is_reported_and_its_node_carries_no_range(monkeypatch, caplog):
+    """A range the document does not hold is a fault in the pipeline, and is not recorded.
+
+    The offsets are the pipeline's own arithmetic -- a unit's span comes from the
+    split, a part's from where it was found inside its unit -- so a range reaching
+    outside the document is a bug in that arithmetic rather than anything a caller
+    caused. Recording it anyway is the one outcome that must not happen: a range
+    pointing at text its node does not read cannot be told apart from a good one
+    downstream, and a section sliced at it would be another passage's words spoken
+    as the hit's. So the node carries no range and the fault is reported, which is
+    a state a search already answers for -- a source with no range for a node
+    returns no section for a hit in it rather than one located by a guess.
+    """
+    markdown = f"{PARA_ALPHA}\n\n{PARA_BRAVO}"
+
+    def beyond_the_document(text: str) -> list[_Section]:
+        """The document's own sections, with the last unit reading from before its start."""
+        sections = _split_sections(text)
+        last = sections[-1]
+        units = (*last.units[:-1], replace(last.units[-1], start=-1))
+        return [*sections[:-1], replace(last, units=units)]
+
+    monkeypatch.setattr("doc_etl_api.pipeline._split_sections", beyond_the_document)
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+
+    nodes, _, ranges = pipeline._chunk(markdown, "doc.txt", {})
+
+    assert len(ranges) == 2, "the fixture must store both paragraphs for this test to bite"
+    assert ranges[0] is not None, (
+        "a span inside the document was thrown away with the one outside it"
+    )
+    assert ranges[1] is None, "a range the document does not hold was recorded anyway"
+
+    with caplog.at_level(logging.ERROR, logger="doc_etl_api.pipeline"):
+        caplog.clear()
+        chunking = _ingest_markdown(pipeline, markdown, filename="doc.txt")
+
+    assert chunking["nodes"] == 2, "the fault must not cost the source its content"
+    assert len(caplog.records) == 1, f"the fault was reported {len(caplog.records)} times"
+    assert "doc.txt" in caplog.text and "without a range" in caplog.text, (
+        f"the report must name the source and say what happened to the node: {caplog.text}"
+    )
+
+
 def test_each_paragraph_of_a_fitting_section_becomes_its_own_node():
     """The document's boundaries are the nodes', however much smaller than the cap.
 
@@ -2557,14 +2895,45 @@ def test_blank_lines_before_a_chunks_first_line_do_not_hide_its_heading():
 def test_readme_documents_the_section_ceiling():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert "| `MAX_SECTION_CHUNKS` |" in readme, (
-        "the setting is missing from the configuration table"
+    assert f"| `MAX_SECTION_CHARACTERS` | `{DEFAULT_SECTION_CHUNKS} × CHUNK_SIZE` |" in readme, (
+        "the setting is missing from the configuration table, or its default is wrong"
     )
     assert "truncated section from a complete one" in readme, (
         "what the ceiling bounds, and how a bounded answer is told from a whole one, "
         "is not documented"
     )
-    assert Settings().max_section_chunks == 25
+
+
+def test_the_section_ceiling_default_tracks_the_chunk_size():
+    """An unset MAX_SECTION_CHARACTERS is the passage the chunk-count cap returned.
+
+    The cap it replaced counted chunks and this one counts the document's own
+    characters, so the two are held in step by the only setting that converts one
+    into the other: the chunk size in use. A default written as a literal would go
+    stale the moment the embedding model changed that size, so the ceiling is
+    measured at two sizes rather than one -- a single size cannot tell a ceiling
+    that follows the chunk size from one that happens to equal it.
+    """
+    model = StubEmbedding(embed_dim=8)
+
+    derived = _stub_pipeline(chunk_size=None, embedding_model=model)
+    stated = _stub_pipeline(chunk_size=128, embedding_model=model)
+
+    assert derived.chunk_size == model.max_length, "the fixture must derive from the model"
+    assert stated.chunk_size != derived.chunk_size, "the two sizes must differ"
+    assert derived.max_section_characters == DEFAULT_SECTION_CHUNKS * derived.chunk_size
+    assert stated.max_section_characters == DEFAULT_SECTION_CHUNKS * stated.chunk_size
+
+
+def test_a_configured_section_ceiling_is_used_as_it_stands():
+    """A configured ceiling is the deployment's own answer, not a multiple.
+
+    The cap bounds one answer, and a deployment whose sections are longer than a
+    chunk-count-sized passage says so by configuring it.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, max_section_characters=3000)
+
+    assert pipeline.max_section_characters == 3000
 
 
 # --- Section expansion: the run of chunks a hit belongs to ---------------------
@@ -2607,9 +2976,32 @@ def _positions_of(pipeline: IndexPipeline, name: str, heading: str | None) -> li
     ]
 
 
+def _extent_of(pipeline: IndexPipeline, name: str, positions: list[int]) -> tuple[int, int]:
+    """The smallest range of the document covering those nodes.
+
+    A section is the document's own characters over its run, so the range to
+    compare the walk's answer against is measured from the same recorded ranges
+    the walk reads rather than counted in nodes.
+    """
+    placed = pipeline.store.positions(name)
+    rows = [placed[_node_id(name, position)] for position in positions]
+    return min(row.start for row in rows), max(row.end for row in rows)
+
+
+def _span_of(pipeline: IndexPipeline, name: str, positions: list[int]) -> int:
+    """The width of the smallest range of the document covering those nodes."""
+    start, end = _extent_of(pipeline, name, positions)
+    return end - start
+
+
+def _document_of(pipeline: IndexPipeline, name: str) -> str:
+    """The document one source was converted into, as the service stores it."""
+    return pipeline.store.document(name)
+
+
 def _section_at(
     pipeline: IndexPipeline, name: str, position: int, ceiling: int
-) -> _SectionExpansion:
+) -> _SectionExpansion | None:
     """One stored chunk's section, placed the way a search places it.
 
     A search establishes each hit's placement once and hands the same one to the
@@ -2620,14 +3012,134 @@ def _section_at(
 
 
 def test_a_section_is_the_run_of_chunks_that_share_the_hits_heading(settings):
+    """The section is the document's text over the run, at the range it reports."""
     pipeline = _sectioned_pipeline(settings)
     alpha = _positions_of(pipeline, "sections.txt", HEADING_ONE)
     assert len(alpha) > 2, "the fixture must hold a section with a chunk on each side of a hit"
 
-    section = _section_at(pipeline, "sections.txt", alpha[1], 25)
+    section = _section_at(pipeline, "sections.txt", alpha[1], 100000)
+    assert section is not None
 
-    assert section.size == len(alpha)
-    assert [chunk["position"] for chunk in section.chunks] == alpha
+    assert (section.start, section.end) == _extent_of(pipeline, "sections.txt", alpha), (
+        "the section's range is not the span the run covers"
+    )
+    assert section.text == _document_of(pipeline, "sections.txt")[section.start : section.end], (
+        "the section is not the document's own characters over the range it reports"
+    )
+    assert section.size == _span_of(pipeline, "sections.txt", alpha), (
+        "the section's size is not the span the run covers"
+    )
+
+
+def test_deciding_a_sections_run_reads_no_chunk_text(settings):
+    """The run is decided from the recorded heading keys, and its text read once.
+
+    A walk that decided membership by reading text would read every node it walked
+    over; one that reads the position map reads nothing to decide, and reads the
+    document once for the answer rather than a node per chunk of it. The two are
+    told apart by counting node reads around the walk while it returns a section
+    longer than any window of nodes.
+    """
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    middle = alpha[len(alpha) // 2]
+    assert len(alpha) > 3, "the fixture must hold a run longer than the ceiling below"
+
+    docstore = pipeline.index.docstore
+    real = docstore.get_node
+    read: list[str] = []
+
+    def counting(node_id, *args, **kwargs):
+        read.append(node_id)
+        return real(node_id, *args, **kwargs)
+
+    # Counted around the walk alone: the hit itself and its placement are read
+    # outside the count, because what is being told apart is the text the run is
+    # decided by from the text the answer carries. The ceiling is a fraction of the
+    # run so a walk that read its way to the run's edges would be caught out.
+    chunk = _chunk_at(pipeline, name, middle)
+    placement = pipeline._placement(chunk)
+    ceiling = _span_of(pipeline, name, alpha) // 2
+    docstore.get_node = counting
+    try:
+        section = pipeline._section(chunk, ceiling, placement)
+    finally:
+        docstore.get_node = real
+
+    assert section is not None
+    assert read == [], "the walk read node text to find or to carry the section"
+    assert section.size == _span_of(pipeline, name, alpha), (
+        "the run found is not the hit's own section"
+    )
+    assert section.size > section.end - section.start, (
+        "the section is not longer than the bounded part returned"
+    )
+
+
+def test_a_bounded_section_is_a_slice_of_the_document_containing_the_hit(settings):
+    """A bounded expansion holds the hit's own text and is the document's own slice."""
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    middle = alpha[len(alpha) // 2]
+    ceiling = _span_of(pipeline, name, alpha) // 2
+    assert ceiling > 0
+
+    section = _section_at(pipeline, name, middle, ceiling)
+    assert section is not None
+    placed = pipeline.store.positions(name)[_node_id(name, middle)]
+
+    assert placed.start >= section.start and placed.end <= section.end, (
+        "the bounded section excludes the result's own text"
+    )
+    assert section.text == _document_of(pipeline, name)[section.start : section.end]
+    assert section.size > section.end - section.start, (
+        "a bounded section did not report the section as longer than the part returned"
+    )
+
+
+def test_a_source_whose_nodes_carry_no_range_reports_no_section(settings):
+    """A source indexed before ranges were recorded is answered with no section.
+
+    Its positions and its document are there, but nothing says where its chunks
+    came from, so there is no run to place and no range to slice the document at.
+    A section invented from either would be a passage that is not the hit's
+    section, which reads as one; absence is the answer that does not.
+    """
+    pipeline = _sectioned_pipeline(settings)
+    name = "sections.txt"
+    placed = pipeline.store.positions(name)
+    record = next(record for record in pipeline.source_catalog if record.name == name)
+    assert _document_of(pipeline, name), "the fixture must have a document to slice at a range"
+
+    # The shape a store written before ranges existed holds: the same nodes in the
+    # same places, with the heading key they were written with and no range.
+    pipeline.store.replace(
+        name,
+        name=record.name,
+        source_type=record.source_type,
+        collections=list(record.collections),
+        chunk_count=record.chunk_count,
+        content_hash=record.content_hash,
+        positions={
+            node_id: NodePosition(row.position, None, None, row.heading)
+            for node_id, row in placed.items()
+        },
+    )
+
+    assert _section_at(pipeline, name, 0, 100000) is None, (
+        "a run with no recorded range was answered with a section"
+    )
+    hits = [
+        item
+        for item in pipeline.search("content", top_k=50, section=True)
+        if item["address"] == name
+    ]
+    assert hits, "the fixture must be searchable without ranges"
+    assert all(item["section"] is None for item in hits), (
+        "a result from a source with no recorded range carried a section"
+    )
 
 
 def test_a_section_stops_where_the_heading_changes_on_either_side(settings):
@@ -2638,11 +3150,20 @@ def test_a_section_stops_where_the_heading_changes_on_either_side(settings):
     elsewhere = _positions_of(pipeline, name, None) + _positions_of(pipeline, name, HEADING_TWO)
     assert elsewhere, "the fixture must hold chunks outside the hit's section"
 
+    expected = _extent_of(pipeline, name, alpha)
     for hit in (alpha[0], alpha[-1]):
-        section = _section_at(pipeline, name, hit, 25)
-        returned = {chunk["position"] for chunk in section.chunks}
-        assert returned == set(alpha)
-        assert returned.isdisjoint(elsewhere), "a chunk from another heading was returned"
+        section = _section_at(pipeline, name, hit, 100000)
+        assert section is not None
+        assert (section.start, section.end) == expected, (
+            "the section is not the run under the hit's own heading"
+        )
+        # The text a neighbouring section holds is not inside the range, so the
+        # boundary is where the heading changes rather than where the hit sits.
+        for other in elsewhere:
+            row = pipeline.store.positions(name)[_node_id(name, other)]
+            assert not (section.start <= row.start and row.end <= section.end), (
+                "a chunk from another heading lies inside the section's range"
+            )
 
 
 def test_a_section_is_bounded_by_the_source_it_is_in(settings):
@@ -2656,13 +3177,15 @@ def test_a_section_is_bounded_by_the_source_it_is_in(settings):
         "the fixture must close with the section under the second heading"
     )
 
-    opening = _section_at(pipeline, name, preamble[0], 25)
-    last = _section_at(pipeline, name, closing[-1], 25)
+    opening = _section_at(pipeline, name, preamble[0], 100000)
+    last = _section_at(pipeline, name, closing[-1], 100000)
 
-    assert [chunk["position"] for chunk in opening.chunks] == preamble
-    assert opening.chunks[0]["position"] == 0
-    assert [chunk["position"] for chunk in last.chunks] == closing
-    assert last.chunks[-1]["position"] == closing[-1]
+    assert (opening.start, opening.end) == _extent_of(pipeline, name, preamble)
+    assert opening.start == 0, "the first section does not begin at the document's first character"
+    assert (last.start, last.end) == _extent_of(pipeline, name, closing)
+    assert last.end == len(_document_of(pipeline, name)), (
+        "the last section does not end at the document's last character"
+    )
 
 
 def test_a_run_of_headingless_chunks_is_a_section_of_its_own(settings):
@@ -2677,60 +3200,99 @@ def test_a_run_of_headingless_chunks_is_a_section_of_its_own(settings):
     preamble = _positions_of(pipeline, name, None)
     assert len(preamble) > 1, "the fixture must hold more than one heading-less chunk"
 
-    section = _section_at(pipeline, name, preamble[1], 25)
+    section = _section_at(pipeline, name, preamble[1], 100000)
 
-    assert section.size == len(preamble)
-    assert [chunk["position"] for chunk in section.chunks] == preamble
+    assert (section.start, section.end) == _extent_of(pipeline, name, preamble)
+    assert section.size == _span_of(pipeline, name, preamble)
 
 
 def test_a_section_longer_than_the_ceiling_returns_a_bounded_part_of_it(settings):
-    """The ceiling bounds what is returned, not the size the caller is told.
+    """The ceiling bounds what is returned, not the length the caller is told.
 
     What comes back is the part of the section the hit is in, so a bounded answer
-    still carries the chunk that was ranked.
+    still carries the chunk that was ranked and still reports the section's own
+    length rather than the bounded one.
     """
     pipeline = _sectioned_pipeline(settings)
     name = "sections.txt"
     alpha = _positions_of(pipeline, name, HEADING_ONE)
     middle = alpha[len(alpha) // 2]
-    assert len(alpha) > 3, "the fixture must hold a section longer than the ceiling below"
+    ceiling = _span_of(pipeline, name, alpha) // 2
+    assert ceiling > 0, "the fixture must hold a section longer than the ceiling below"
 
-    section = _section_at(pipeline, name, middle, 3)
+    section = _section_at(pipeline, name, middle, ceiling)
+    placed = pipeline.store.positions(name)[_node_id(name, middle)]
 
-    assert section.size == len(alpha), "the section's own size was reported as the bounded one"
-    assert [chunk["position"] for chunk in section.chunks] == [middle - 1, middle, middle + 1]
+    assert placed.start >= section.start and placed.end <= section.end, (
+        "the bounded part does not carry the chunk that was ranked"
+    )
+    # The ceiling bounds the part returned, but never below the hit's own range: a
+    # node carrying its section's heading records a range that begins at that
+    # heading, so a hit late in its section holds more than the ceiling and the
+    # answer is taken to the end of it rather than cut short of the hit.
+    assert section.end - section.start <= max(ceiling, placed.end - placed.start), (
+        "the part returned is longer than the ceiling or the hit's own text allows"
+    )
+    assert section.size == _span_of(pipeline, name, alpha), (
+        "the section's own length was reported as the bounded one"
+    )
 
 
-def test_a_bounded_window_slides_to_keep_a_hit_at_a_sections_end(settings):
+def test_a_bounded_window_is_taken_around_the_hit_and_slides_at_the_sections_end(settings):
     """A hit near an end still receives the ceiling's worth of its section.
 
     The window is centred on the hit where the section has the room, but centring
     a hit that sits at an end would push half the window past the section and
-    return fewer chunks than the ceiling allows. So the window is filled from the
-    other side -- without dropping the chunk that was ranked, which is the chunk
-    the caller asked about.
+    return fewer characters than the ceiling allows. So the window is filled from
+    the other side -- without dropping the hit's own text, which is the text the
+    caller asked about.
+
+    The ranges are handed to the store the way an ingestion writes them: one node
+    per hundred characters under one heading. A real ingestion's ranges overlap --
+    a node carrying its section's heading begins at that heading, so every node of
+    a section starts where the section does -- which leaves the window's own rule,
+    the centring and the filling from the other end, reachable on its own here.
     """
-    pipeline = _sectioned_pipeline(settings)
-    name = "sections.txt"
-    alpha = _positions_of(pipeline, name, HEADING_ONE)
-    assert len(alpha) > 3, "the fixture must hold a section longer than the ceiling below"
+    pipeline = _collections_pipeline(settings)
+    document = "\n\n".join([HEADING_ONE, *PARAGRAPHS[:3]])
+    pipeline.converter.convert_file.side_effect = lambda _file, filename: document
+    pipeline.ingest_file(source_id="s", file=BytesIO(b"x"), filename="three.txt")
 
-    for hit, window in ((alpha[0], alpha[:3]), (alpha[-1], alpha[-3:])):
-        section = _section_at(pipeline, name, hit, 3)
-        positions = [chunk["position"] for chunk in section.chunks]
+    name = "three.txt"
+    record = next(record for record in pipeline.source_catalog if record.name == name)
+    pipeline.store.replace(
+        name,
+        name=record.name,
+        source_type=record.source_type,
+        collections=list(record.collections),
+        chunk_count=3,
+        content_hash=record.content_hash,
+        positions={
+            _node_id(name, place): NodePosition(place, place * 100, place * 100 + 100, HEADING_ONE)
+            for place in range(3)
+        },
+    )
 
-        assert section.size == len(alpha), "the section's true size was not reported"
-        assert positions == window, "the window is not the ceiling's length in reading order"
-        assert hit in positions, "the chunk that was ranked is not in its own section"
+    # A hundred characters either side of the hit's own hundred.
+    middle = _section_at(pipeline, name, 1, 150)
+    assert (middle.start, middle.end) == (75, 225), "the window is not centred on the hit"
+    assert middle.size == 300, "the section's own length was not reported"
+    assert middle.text == document[middle.start : middle.end]
+
+    # Half the window would fall past the section's end, so it fills from the other.
+    last = _section_at(pipeline, name, 2, 150)
+    assert (last.start, last.end) == (150, 300), "the window did not slide off the section's end"
+    assert last.text == document[150:300]
 
 
 def test_a_ceiling_of_one_returns_the_ranked_chunk_alone(settings):
     """The smallest ceiling the setting admits still returns a section: the hit.
 
     A ceiling below one would make asking for a section and asking for none the
-    same request, which is why the setting refuses it. At one, every position of
-    the section returns just the chunk that was ranked, and the section's own size
-    still travels with it rather than being reported as the bounded one.
+    same request, which is why the setting refuses it. A ceiling narrower than the
+    hit's own text returns that text and no more -- the bound is on the answer, and
+    an answer that cut the hit off would not answer the question that was asked --
+    while the section's own length still travels with it.
     """
     pipeline = _sectioned_pipeline(settings)
     name = "sections.txt"
@@ -2739,9 +3301,14 @@ def test_a_ceiling_of_one_returns_the_ranked_chunk_alone(settings):
 
     for hit in alpha:
         section = _section_at(pipeline, name, hit, 1)
+        placed = pipeline.store.positions(name)[_node_id(name, hit)]
 
-        assert [chunk["position"] for chunk in section.chunks] == [hit]
-        assert section.size == len(alpha), "the section's own size was reported as the bounded one"
+        assert (section.start, section.end) == (placed.start, placed.end), (
+            "the smallest ceiling did not return the ranked chunk's own text"
+        )
+        assert section.size == _span_of(pipeline, name, alpha), (
+            "the section's own length was reported as the bounded one"
+        )
 
 
 def test_a_result_can_carry_its_whole_section(settings):
@@ -2758,12 +3325,22 @@ def test_a_result_can_carry_its_whole_section(settings):
 
     results = pipeline.search("Under Bravo", top_k=3, section=True)
     middle = next(item for item in results if item["position"] == 1)
+    section = middle["section"]
 
-    assert [chunk["position"] for chunk in middle["section"]] == [0, 1, 2]
-    assert middle["section_size"] == 3
-    assert [chunk["text"] for chunk in middle["section"]] == [
-        _chunk_at(pipeline, "three.txt", place).get_content() for place in range(3)
-    ], "the section is not the stored chunks in reading order"
+    assert (section["start"], section["end"]) == _extent_of(pipeline, "three.txt", [0, 1, 2])
+    assert section["size"] == _span_of(pipeline, "three.txt", [0, 1, 2])
+    assert section["text"] == document[section["start"] : section["end"]], (
+        "the section is not the document sliced at the range it reports"
+    )
+    # The hit's own text is the document's characters over its own range, and the
+    # section is the document over a range that covers it -- so the hit's text is
+    # inside the section even where the stored chunk repeats the heading its
+    # section holds once.
+    placed = pipeline.store.positions("three.txt")[_node_id("three.txt", 1)]
+    assert placed.start >= section["start"] and placed.end <= section["end"], (
+        "the section excludes the result's own text"
+    )
+    assert document[placed.start : placed.end] in section["text"]
 
 
 class _CountingStore:
@@ -2781,7 +3358,7 @@ class _CountingStore:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    def positions(self, address: str) -> dict[str, int]:
+    def positions(self, address: str) -> dict[str, NodePosition]:
         self.positions_reads += 1
         return self._inner.positions(address)
 
@@ -2808,11 +3385,13 @@ def test_a_section_expansion_reads_each_hits_placement_once(settings):
     )
 
 
-def test_a_section_chunk_carries_its_text_and_position_and_no_score(settings):
-    """A section chunk was not ranked against the query, so it has no relevance.
+def test_a_section_carries_the_documents_text_and_the_range_it_came_from(settings):
+    """A section is a passage and its range, with no relevance of its own.
 
-    The hit's own text is one of the section's chunks, repeated rather than
-    referenced, so a caller can render the passage without splicing two shapes.
+    The text was not ranked against the query, so it carries no score; it was
+    sliced out of the source's document, so it carries the offsets to slice it
+    again. Nothing else is in the shape, which is what keeps one answer to "what
+    is this hit's section".
     """
     pipeline = _collections_pipeline(settings)
     document = "\n\n".join([HEADING_ONE, *PARAGRAPHS[:3]])
@@ -2821,11 +3400,12 @@ def test_a_section_chunk_carries_its_text_and_position_and_no_score(settings):
 
     results = pipeline.search("Under Bravo", top_k=3, section=True)
     middle = next(item for item in results if item["position"] == 1)
+    section = middle["section"]
 
-    for chunk in middle["section"]:
-        assert set(chunk) == {"text", "position"}, chunk
-    assert middle["section"][1]["text"] == middle["text"], (
-        "the hit's own chunk is not in its section"
+    assert set(section) == {"text", "start", "end", "size"}, section
+    assert section["text"] == document[section["start"] : section["end"]]
+    assert section["size"] == section["end"] - section["start"], (
+        "a section that fits its ceiling is not reported as whole"
     )
 
 
@@ -2844,7 +3424,9 @@ def test_a_search_that_does_not_ask_for_a_section_carries_none(settings):
     ranked = pipeline.search("Under Bravo", top_k=3)
     widened = pipeline.search("Under Bravo", top_k=3, section=True)
 
-    assert all(item["section"] == [] and item["section_size"] == 0 for item in ranked)
+    assert all(item["section"] is None for item in ranked), (
+        "a search that asked for no section carried one"
+    )
     assert [(item["position"], item["score"]) for item in widened] == [
         (item["position"], item["score"]) for item in ranked
     ], "asking for a section changed the ranking"
@@ -2856,20 +3438,35 @@ def test_a_section_longer_than_the_configured_ceiling_is_bounded_and_sized(setti
     The section's own size is what the source holds, so a caller can tell the
     bounded answer it received from the whole section it asked for.
     """
-    pipeline = _sectioned_pipeline(settings.model_copy(update={"max_section_chunks": 3}))
+    # The fixture is ingested twice over to measure the ceiling first: the ranges
+    # depend on the document rather than on the ceiling, so the second pipeline
+    # holds the same source at the same offsets.
     name = "sections.txt"
-    alpha = _positions_of(pipeline, name, HEADING_ONE)
+    measured = _sectioned_pipeline(settings)
+    alpha = _positions_of(measured, name, HEADING_ONE)
+    ceiling = _span_of(measured, name, alpha) // 2
+    assert ceiling > 0, "the fixture must hold a section longer than the configured ceiling"
+
+    pipeline = _sectioned_pipeline(settings.model_copy(update={"max_section_characters": ceiling}))
     middle = alpha[len(alpha) // 2]
-    assert len(alpha) > 3, "the fixture must hold a section longer than the configured ceiling"
 
     hit = next(
         item
         for item in pipeline.search("content", top_k=50, section=True)
         if item["position"] == middle
     )
+    section = hit["section"]
+    placed = pipeline.store.positions(name)[_node_id(name, middle)]
 
-    assert [chunk["position"] for chunk in hit["section"]] == [middle - 1, middle, middle + 1]
-    assert hit["section_size"] == len(alpha)
+    assert placed.start >= section["start"] and placed.end <= section["end"], (
+        "the configured ceiling cut the ranked chunk out of its own section"
+    )
+    assert section["size"] == _span_of(pipeline, name, alpha), (
+        "the section's own length was reported as the bounded one"
+    )
+    assert section["size"] > section["end"] - section["start"], (
+        "the configured ceiling did not bound the part returned"
+    )
 
 
 # --- The catalog's per-source record ----------------------------------------
@@ -2943,17 +3540,17 @@ def test_the_catalog_a_reader_holds_cannot_change_underneath_it(settings):
     assert pipeline.source_catalog[0].collections == ("dotnet",)
 
 
-def _recorded_positions(pipeline: IndexPipeline) -> dict[str, int]:
-    """Every node id the store recorded a position for, and that position.
+def _recorded_positions(pipeline: IndexPipeline) -> dict[str, NodePosition]:
+    """Every node id the store recorded a position for, and where that node sits.
 
     Read from the store rather than from a snapshot the pipeline publishes: the
     published catalog carries the sources, and this is the other half of what the
     store holds about them.
     """
     return {
-        node_id: position
+        node_id: placed
         for record in pipeline.source_catalog
-        for node_id, position in pipeline._store.positions(record.address).items()
+        for node_id, placed in pipeline._store.positions(record.address).items()
     }
 
 
@@ -2977,13 +3574,15 @@ def test_the_recorded_order_describes_what_the_source_holds(settings):
     wide = _recorded_positions(pipeline)
     assert wide, "the fixture stored nothing to place"
     assert set(wide) == _ids_in_store(pipeline), "the recorded ids are not the stored ones"
-    assert sorted(wide.values()) == list(range(len(wide))), "positions do not run from zero"
+    assert sorted(placed.position for placed in wide.values()) == list(range(len(wide))), (
+        "positions do not run from zero"
+    )
 
     # The position has to be the one the id was derived from, not merely some
     # numbering: the id is what a hit arrives carrying, so a position that does
     # not hash back to that id would name a different node as the hit.
     for node in _stored_nodes(pipeline):
-        assert _node_id("doc.txt", wide[node.node_id]) == node.node_id, (
+        assert _node_id("doc.txt", wide[node.node_id].position) == node.node_id, (
             "a recorded position does not hash back to the id it is recorded against"
         )
 
@@ -2995,6 +3594,90 @@ def test_the_recorded_order_describes_what_the_source_holds(settings):
     assert set(narrow) == _ids_in_store(pipeline), (
         "positions recorded for the replaced content survived the replacement"
     )
+
+
+def test_the_default_backend_records_a_range_and_a_heading_key_for_every_node():
+    """The in-memory map holds what the durable one holds, so both answer alike.
+
+    Both backends are read by the same section walk, so a fact one records and
+    the other does not is a section that works on one deployment and not on the
+    other -- and the in-memory backend is the default, the one a run without a
+    database meets first. The map is read back rather than the range list the
+    chunker returned, because the map is what a walk actually finds.
+
+    Both of the heading key's sides are asserted, on one document: a node under
+    the heading and a node above it. The empty key is an answer -- this node
+    belongs to the heading-less section -- and is not the null a row written
+    before the key existed holds, so a backend that dropped one for the other
+    would still place every node while grouping them all wrongly.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    markdown = PARAGRAPH_GAP.join([PARA_ALPHA, HEADING_ONE, PARA_BRAVO])
+    _ingest_markdown(pipeline, markdown, filename="doc.txt")
+
+    placed = _recorded_positions(pipeline)
+    assert placed, "the ingestion recorded no map to read back"
+    assert {item.heading for item in placed.values()} == {"", HEADING_ONE}, (
+        "the document holds a headed and a heading-less section, and the map must say which"
+    )
+    for node_id, item in placed.items():
+        assert item.start is not None and item.end is not None, (node_id, item)
+        assert 0 <= item.start < item.end <= len(markdown), (node_id, item)
+        text = markdown[item.start : item.end]
+        if item.heading:
+            assert text.startswith(item.heading), (node_id, text[:60])
+        else:
+            assert not text.startswith("#"), "a node recorded under no heading begins at one"
+
+
+def test_re_ingesting_a_source_replaces_the_ranges_it_recorded_before():
+    """A re-ingestion leaves the newer document's ranges, and none of the older one's.
+
+    A node id is its source and its position hashed, so the same position in two
+    ingestions names the same node -- and a map that merged rather than replaced
+    would keep an earlier ingestion's range *on the id the newer node now holds*,
+    which is a section pointing at characters the node no longer reads. Nothing
+    about the id can tell one document's position zero from the other's, so the
+    map has to be replaced whole rather than written into.
+
+    The first of the two documents holds more nodes than the second, which is what
+    makes both halves of that visible at once: the positions the second ingestion
+    stopped writing have to go rather than stay, and the ones it shares have to
+    carry its own measurements rather than the earlier ones.
+    """
+    pipeline = _stub_pipeline(chunk_size=128, chunk_overlap=0)
+    _ingest_markdown(pipeline, f"{HEADING_ONE}\n\n{PARAGRAPHS_JOINED}", filename="doc.txt")
+    earlier = _recorded_positions(pipeline)
+    assert len(earlier) > 2, "the fixture must shrink its source, or nothing is superseded"
+
+    replacement = PARAGRAPH_GAP.join([PARA_ALPHA, HEADING_ONE, PARA_BRAVO])
+    _ingest_markdown(pipeline, replacement, filename="doc.txt")
+
+    placed = _recorded_positions(pipeline)
+    assert placed, "the second ingestion recorded nothing"
+    assert set(placed) == _ids_in_store(pipeline), (
+        "a node id recorded for the replaced content survived the replacement"
+    )
+    # Position zero names a headed paragraph under the first document and the
+    # heading-less one under the second, so this single id carries the whole
+    # claim for the positions the two ingestions share: a map that merged would
+    # still answer with the first document's key here.
+    first = _node_id("doc.txt", 0)
+    assert earlier[first].heading == HEADING_ONE
+    assert placed[first].heading == "", (
+        "the replaced ingestion's heading key survived on the id the new node now holds"
+    )
+    texts = {node.node_id: node.get_content() for node in _stored_nodes(pipeline)}
+    for node_id, item in placed.items():
+        assert item.start is not None and item.end is not None, (node_id, item)
+        assert item.end <= len(replacement), (
+            f"the range recorded for {node_id} reaches past the document it is in"
+        )
+        # And it begins where this node's own text begins, which a range measured
+        # in the earlier document would not -- that document's offsets name other
+        # characters here, or none at all.
+        first_line = next(line for line in texts[node_id].splitlines() if line.strip())
+        assert replacement[item.start : item.end].startswith(first_line), (node_id, first_line)
 
 
 def test_recording_a_position_does_not_reach_the_stored_node(settings):

@@ -481,10 +481,11 @@ def test_the_requested_neighbours_reach_the_response_inside_the_hit(client):
 
 
 def test_the_requested_section_reaches_the_response_inside_the_hit(client):
-    """A section is returned attached to its hit, with the size of the whole run.
+    """A section is returned attached to its hit, with the range and the run's length.
 
-    The chunks carry no score and this result's own text is among them, so a caller
-    renders the passage without a second shape to splice.
+    The passage carries no score and reports the section as longer than the part
+    returned, so a caller can tell a truncated section from a whole one and can
+    slice the source's content at the same range itself.
     """
     client.app.state.pipeline.search.return_value = [
         {
@@ -496,12 +497,7 @@ def test_the_requested_section_reaches_the_response_inside_the_hit(client):
             "position": 1,
             "neighbours_before": 1,
             "neighbours_after": 1,
-            "section": [
-                {"text": "chunk one", "position": 0},
-                {"text": "chunk two", "position": 1},
-                {"text": "chunk three", "position": 2},
-            ],
-            "section_size": 9,
+            "section": {"text": "chunk one\n\nchunk two", "start": 4, "end": 25, "size": 40},
         }
     ]
 
@@ -510,11 +506,32 @@ def test_the_requested_section_reaches_the_response_inside_the_hit(client):
     assert response.status_code == 200
     body = response.json()
     hit = body["results"][0]
-    assert [chunk["position"] for chunk in hit["section"]] == [0, 1, 2]
-    assert hit["section_size"] == 9, "the bounded section's own size did not reach the caller"
-    for chunk in hit["section"]:
-        assert set(chunk) == {"text", "position"}, chunk
-    assert hit["section"][1]["text"] == hit["text"], "the hit's own text is not in its section"
+    assert hit["section"] == {"text": "chunk one\n\nchunk two", "start": 4, "end": 25, "size": 40}
+    assert set(hit["section"]) == {"text", "start", "end", "size"}, hit["section"]
+    assert "section_size" not in hit, "the response still carries the dropped field"
+
+
+def test_a_result_that_asked_for_no_section_carries_none(client):
+    """Absence is reported as absence: null rather than an empty section."""
+    client.app.state.pipeline.search.return_value = [
+        {
+            "text": "chunk",
+            "score": 0.5,
+            "source_id": "s1",
+            "source_type": "file",
+            "source_name": "report.pdf",
+            "position": 0,
+            "neighbours_before": 0,
+            "neighbours_after": 0,
+            "section": None,
+        }
+    ]
+
+    response = client.post("/search", json={"query": "test", "top_k": 1})
+
+    assert response.status_code == 200
+    hit = response.json()["results"][0]
+    assert hit["section"] is None, "no section was reported as something other than none"
 
 
 def test_the_neighbour_count_is_bounded(client):
@@ -551,8 +568,7 @@ def test_the_routing_fields_default_rather_than_being_required():
 
     assert result.address == ""
     assert result.collections == []
-    assert result.section == []
-    assert result.section_size == 0
+    assert result.section is None
 
 
 def test_the_search_documentation_names_every_field_the_route_serves():

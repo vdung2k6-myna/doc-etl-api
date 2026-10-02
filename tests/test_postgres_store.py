@@ -39,7 +39,13 @@ from doc_etl_api.claims import claim_heartbeat
 from doc_etl_api.config import Settings, VectorStoreBackend
 from doc_etl_api.main import create_app
 from doc_etl_api.pipeline import IndexPipeline, _node_id, content_hash, create_pipeline
-from doc_etl_api.store import DurableStoreError, IndexStore, InProcessIndexStore, PostgresIndexStore
+from doc_etl_api.store import (
+    DurableStoreError,
+    IndexStore,
+    InProcessIndexStore,
+    NodePosition,
+    PostgresIndexStore,
+)
 from tests.stubs import EMBEDDING_MODEL_NAME, StubEmbedding
 
 DATABASE_URL = os.environ.get("DOC_ETL_API_TEST_POSTGRES_URL", "")
@@ -67,7 +73,9 @@ print(
             "address": record.address,
             "digest": record.content_hash,
             "collections": list(record.collections),
-            "positions": sorted(pipeline._store.positions("docs.txt").values()),
+            "positions": sorted(
+                placed.position for placed in pipeline._store.positions("docs.txt").values()
+            ),
             "document": document,
         }
     )
@@ -101,6 +109,14 @@ BRAVO_DOC = "\n\n".join(
         PARAGRAPH.replace("every chunk", "BRAVOMARK all chunks"),
     ]
 )
+
+# One document holding both kinds of section, which is what the heading key has
+# two sides for: LONG_DOC sits before any heading and belongs to the heading-less
+# section, and the paragraph under HEADING opens with that heading. Every
+# paragraph is well above the chunk floor, so none of them merges into a
+# neighbour across the heading and the two sections stay apart.
+HEADING = "# A Later Section"
+HEADED_DOC = "\n\n".join([LONG_DOC, HEADING, PARAGRAPH.replace("index", "catalog")])
 
 _COLLECTIONS = itertools.count(1)
 
@@ -985,6 +1001,116 @@ def test_a_second_process_reads_what_this_one_ingested(collection):
     )
 
 
+@needs_database
+def test_a_nodes_range_and_heading_key_are_read_back_by_the_next_instance(durable, collection):
+    """A node's range and heading key are the store's, not the writer's.
+
+    Written by one instance and read by the next, which is what makes them
+    durable rather than values the writer happened to keep in hand: the section a
+    restart reports is answered from these two, so a column that was never
+    written, or one that came back hollow, would show up as a section no instance
+    can locate after a restart rather than as a failure here.
+
+    The heading key is asserted on both of its sides rather than on one, because
+    those are different rows rather than one row with two spellings: a node under
+    the document's heading carries that heading, and a node above it carries the
+    empty key that says it belongs to the heading-less section. The null a
+    position written before this change holds is a third thing, and asserting
+    only one side would not tell the empty key from it.
+    """
+    _ingest(durable, "docs.txt", HEADED_DOC)
+    written = durable._store.positions("docs.txt")
+    assert written, "the fixture recorded no positions to read back"
+    durable._store.close()
+
+    reader = _create(_settings(table=collection))
+    try:
+        read_back = reader._store.positions("docs.txt")
+        _, document = reader.source_content("docs.txt")
+    finally:
+        reader._store.close()
+
+    assert document == HEADED_DOC
+    assert read_back == written, "a range or heading key read back is not the one written"
+    assert {placed.heading for placed in read_back.values()} == {"", HEADING}, (
+        "the document holds a headed and a heading-less section, and the map must say which"
+    )
+    for placed in read_back.values():
+        assert placed.start is not None and placed.end is not None, placed
+        assert 0 <= placed.start < placed.end <= len(document), placed
+        text = document[placed.start : placed.end]
+        # A node carrying its section's heading begins at that heading line, which
+        # is what ties a range to the key recorded beside it rather than leaving
+        # the two as unrelated columns.
+        if placed.heading:
+            assert text.startswith(placed.heading), (placed, text[:60])
+
+
+def _positions_table_without_ranges(table: str) -> None:
+    """Turn a collection's position map into the table it was before ranges.
+
+    The columns are dropped from a table that already holds rows rather than
+    never created, because that is the table the migration is for: one somebody
+    has been writing to since before the columns existed, holding positions
+    recorded when there was nothing beside them to record.
+    """
+    engine = sqlalchemy.create_engine(DATABASE_URL, poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            for column in ("start", "end", "heading"):
+                connection.execute(
+                    sqlalchemy.text(f'ALTER TABLE "{table}_positions" DROP COLUMN "{column}"')
+                )
+    finally:
+        engine.dispose()
+
+
+@needs_database
+def test_a_position_map_written_before_ranges_still_opens(durable, collection):
+    """A collection this service has been writing to since before ranges opens.
+
+    `create_all` is a create and not an alter, so a table that already exists is
+    left exactly as it is: without a migration, the first read or write of this
+    collection's map would name a column the database does not have, and the
+    service would fail at startup rather than at an ingestion that could have put
+    it right.
+
+    The rows already there have to survive that, carrying the position they were
+    written with and nothing about a range -- which is the state the bootstrap
+    looks for when it decides a source has to be ingested again. A migration that
+    rebuilt the table instead would leave the source looking complete while its
+    sections answered nothing.
+    """
+    _ingest(durable, "docs.txt", LONG_DOC)
+    before = durable._store.positions("docs.txt")
+    assert before, "the fixture stored nothing to migrate"
+    durable._store.close()
+    _positions_table_without_ranges(collection)
+
+    reopened = _create(_settings(table=collection))
+    try:
+        carried = reopened._store.positions("docs.txt")
+        assert sorted(placed.position for placed in carried.values()) == sorted(
+            placed.position for placed in before.values()
+        ), "the columns arrived at the cost of the rows that were already there"
+        assert all(
+            placed.start is None and placed.end is None and placed.heading is None
+            for placed in carried.values()
+        ), "a row written before the columns existed claims a range it never recorded"
+
+        # And the table the migration produced is one a replacement can write to
+        # in full, so the source gains exactly the ranges the bootstrap would
+        # re-ingest it for.
+        _ingest(reopened, "docs.txt", LONG_DOC)
+        after = reopened._store.positions("docs.txt")
+        assert after and all(
+            placed.start is not None and placed.end is not None and placed.heading is not None
+            for placed in after.values()
+        ), "the migrated table did not take a new ingestion's ranges"
+    finally:
+        reopened._store.close()
+
+
 def _committed_state(engine, table: str, address: str) -> tuple[int, int, int]:
     """What one committed instant says about a source: recorded, held, positioned.
 
@@ -1395,7 +1521,9 @@ def test_a_document_commits_only_with_the_replacement_it_is_written_in(durable, 
             collections=["csharp"],
             chunk_count=chunks,
             content_hash="digest",
-            positions={f"node-{position}": position for position in range(chunks)},
+            positions={
+                f"node-{position}": NodePosition(position=position) for position in range(chunks)
+            },
         )
         store.store_document(address, document)
 

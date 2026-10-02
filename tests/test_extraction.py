@@ -274,7 +274,7 @@ def chunk(markdown: str) -> list:
         converter=MagicMock(),
         embedding_model=StubEmbedding(embed_dim=8),
     )
-    nodes, _ = pipeline._chunk(markdown, "page.html", {})
+    nodes, _, _ = pipeline._chunk(markdown, "page.html", {})
     return nodes
 
 

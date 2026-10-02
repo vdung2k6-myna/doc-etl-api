@@ -293,12 +293,18 @@ def ingest_corpus(
         def ingest_file(target: Path = path, tag: list[str] = file_tag) -> None:
             # Read whole before deciding, and read only: nothing is parsed,
             # chunked or embedded for a file the index holds as it now stands.
-            # Both halves of that -- the content is current, and its document was
-            # captured -- are asked, because a source ingested before this service
-            # stored documents is current and has none, and the parse this skips is
-            # the one that would capture it.
+            # All three halves of that are asked -- the content is current, its
+            # document was captured, and every node carries a recorded range --
+            # because each is a state the parse this skips would repair: a source
+            # ingested before this service stored documents is current and has
+            # none, and one ingested before ranges were recorded is current and
+            # holds a document yet answers no section.
             payload, digest = file_content(target)
-            if pipeline.is_current(target.name, digest, tag) and pipeline.has_document(target.name):
+            if (
+                pipeline.is_current(target.name, digest, tag)
+                and pipeline.has_document(target.name)
+                and pipeline.has_ranges(target.name)
+            ):
                 skip(target.name)
                 return
             pipeline.ingest_file(
@@ -352,11 +358,15 @@ def ingest_corpus(
             # for it, then compared before anything parses it. The fetch is the
             # cost this cannot avoid; the conversion is the cost it saves -- and
             # it is saved only for a source that holds a document as well as
-            # current content, so a page the index holds from before this service
-            # stored documents is fetched, converted and captured once more.
+            # current content, and whose every node carries a recorded range, so a
+            # page the index holds from before this service stored documents, or
+            # from before ranges were recorded, is fetched, converted and captured
+            # once more.
             body, digest, final_url = url_content(target)
-            if pipeline.is_current(final_url, digest, collections) and pipeline.has_document(
-                final_url
+            if (
+                pipeline.is_current(final_url, digest, collections)
+                and pipeline.has_document(final_url)
+                and pipeline.has_ranges(final_url)
             ):
                 skip(target)
                 return

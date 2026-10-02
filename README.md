@@ -194,6 +194,20 @@ it — OCR applies where there is no text to read — so a digital PDF is not
 re-typed by a recogniser. Only PDFs are affected; DOCX, HTML, XLSX and the other
 formats behave as they did.
 
+What a page's recognition returns is stored in that page's own reading order: the
+lines of a region from top to bottom, and the boxes within a line from left to
+right, rather than in the order the recogniser lists them. A recogniser groups
+boxes into lines by their vertical centres and returns a box at a line's right
+margin after the lines below it, which on a scanned book stored the sentence
+`Tiễn con trai lên thành phố học, ông bố thân mật nói:` as `Tiễn con trai lên thành
+phố ông bố thân mật nói: học,`. Only the order is decided here — the characters
+stored are the ones the recogniser read, none added or dropped — so a lost `đ`
+stroke or a wrong diacritic is stored as the recogniser read it. Where a paragraph
+breaks is Docling's own reading of the text, so a paragraph boundary can fall on a
+different word once the words are in order; the words and characters themselves are
+unchanged. A source already indexed keeps the text it was stored with until it is
+ingested again.
+
 Recognition runs through EasyOCR. The engine arrives with the project's declared
 dependencies — `docling` is installed with its `easyocr` extra — and declaring
 the extra rather than the package keeps the engine's version constrained to what
@@ -510,7 +524,8 @@ Response:
       "neighbours": [
         {"text": "Headings survive as markdown headings...", "position": 3},
         {"text": "Tables become markdown tables...", "position": 5}
-      ]
+      ],
+      "section": null
     }
   ]
 }
@@ -526,8 +541,7 @@ Response:
 | `position` | Where the chunk sits in its source: counted from 0, in reading order. |
 | `neighbours_before`, `neighbours_after` | How many chunks the source holds on each side of this one, whether or not any were returned. Zero at the source's first or last chunk. |
 | `neighbours` | The adjacent chunks themselves, in reading order, when the request asked for them; empty when it did not. |
-| `section` | The chunks of the hit's own section, in reading order, when the request asked for a section expansion; empty when it did not. The hit's own text is one of them, repeated rather than referenced, so the passage renders from these chunks alone. |
-| `section_size` | How many chunks the section really holds, whether or not every one of them was returned. Larger than the number of `section` chunks when the expansion was bounded, which is how a truncated section is told from a complete one. Zero when no section was asked for. |
+| `section` | The hit's own section when the request asked for one: an object carrying the document's own text over the run of chunks the hit belongs to, with the range `text` was taken from — `{text, start, end, size}`. `text` is a passage of the source's document, not chunks joined, so a heading every chunk of the run repeats appears in it once and nothing the chunker dropped between them is missing. `start` and `end` are character offsets into that document, counted from its first character and end-exclusive, so the content `GET /sources/content` returns sliced at `[start, end)` is `text` itself. `size` is how long the whole section is, so a bounded expansion reports a `size` larger than `end - start`. `null` when no section was asked for, and `null` for a hit whose section cannot be established — a source that holds no range to place the run by. See [Sections](#sections). |
 
 Both routing fields are read off the chunk the search already returned, so a
 search that reports them costs the same retrieval as one that does not: no second
@@ -588,46 +602,80 @@ curl -X POST "http://localhost:8000/search" \
   -d '{"query": "the story about the son who asks for money to repair a gun", "top_k": 3, "expand": "section"}'
 ```
 
+The response carries each hit's section as an object:
+
+```json
+{
+  "results": [
+    {
+      "text": "## ĐÃ CÓ THÂN ĐÂY A\n\nve quấy nhiễu. Vua không hài quay ra hỏi quan cận thần: ngoài",
+      "score": 0.72,
+      "source_name": "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.pdf",
+      "address": "101-Truyen-Cuoi-Dan-Gian-Viet-Nam.pdf",
+      "collections": ["truyen-cuoi"],
+      "position": 185,
+      "section": {
+        "text": "## ĐÃ CÓ THÂN ĐÂY A\n\nNgày hè Vua dang ngồi hóng mát sân thì bị một dàn ruồi lòng ve quấy nhiễu. Vua không hài quay ra hỏi quan cận thần: [...]",
+        "start": 35746,
+        "end": 36692,
+        "size": 946
+      }
+    }
+  ]
+}
+```
+
 - **A section is the run of chunks that open with the same heading line.** Every
   chunk of a section is stored with that section's heading prefixed to it, so the
   heading a chunk begins with is the section it came from. The walk runs outwards
   from the hit within its own source, in reading order, and stops at the first chunk
   that begins with a different heading, or at the source's end.
+- **What comes back is the document's own text over that run**, not the chunks
+  joined: the passage is sliced out of the document the source was converted into,
+  so a heading the run's chunks each repeat appears once, and anything the chunker
+  left between them is not missing. The section is the passage as the document reads
+  it rather than as the index stored it.
+- **`start` and `end` are character offsets, and they locate the passage.** Both are
+  counted from the document's first character, and `end` is exclusive, so
+  `content[start:end]` is exactly the `text` returned. Fetching the source's content
+  and slicing it at that range reproduces the passage rather than a near copy.
 - **Content before a document's first heading is a section with no heading**, and
   its chunks are matched against each other, so a title page comes back with the text
   it introduces rather than alone.
-- **A section is not a document.** What comes back is the run of stored chunks the
-  hit belongs to, not the file, and a section ends where its heading ends rather than
-  where a page does. The document those chunks were cut from is stored too, and
-  fetching it is how a caller reads on past a bounded section.
+- **A section is not a document.** A section ends where its heading ends rather than
+  where a page does, and the offsets are into the document the chunks were cut from.
+  The document is stored too, and fetching it is how a caller reads on past a bounded
+  section.
 - **Only the heading a chunk begins with decides membership.** A chunk that swallowed
   a very short section beneath it carries that section's heading inside its text, and
   a rule that looked for a heading anywhere in the chunk would place it in the section
   it swallowed.
-- **A section chunk carries no score**, and the hit's own text is among them: the
-  section repeats it rather than referring to it, so the passage renders from the
-  section alone. Each chunk's `position` says where it sits in the source instead.
 - **The section attaches to the result; it does not join the results.** The ranked
   list is the list the same search returns without `expand`, in the same order, so
-  `top_k` still counts ranked hits and an unranked section chunk never spends a slot.
-- **The response says how big the section really is.** One expansion returns at most
-  `MAX_SECTION_CHUNKS` chunks, taken around the hit so the ranked chunk is always
-  among them, and `section_size` reports the whole run. Compare the two to see whether
-  the passage is complete:
+  `top_k` still counts ranked hits.
+- **`size` says how long the whole section is.** One expansion returns at most
+  `MAX_SECTION_CHARACTERS` characters, taken around the hit so the ranked chunk's own
+  text is always inside the passage, and `size` reports the section's true length as
+  the document holds it. Compare the two to see whether the passage is complete:
 
   ```python
   section = hit["section"]
-  if len(section) == hit["section_size"]:
-      render(section)  # the whole section
+  if section["size"] == section["end"] - section["start"]:
+      render(section["text"])  # the whole section
   else:
-      render(section)  # the part of it that was returned
-      missing = hit["section_size"] - len(section)
+      render(section["text"])  # the part of it that was returned
+      missing = section["size"] - (section["end"] - section["start"])
   ```
 
-  Nothing today returns only the rest of a truncated section: `GET /sources/content`
-  returns the whole document the source was converted into, which is the text those
-  chunks were cut from, so a caller that needs to read on fetches it rather than
-  asking for a second section.
+  A caller that needs the rest reads on from the document itself: `GET
+  /sources/content` returns the whole document the source was converted into, and
+  slicing it at `[section["end"], section["end"] + n)` continues the passage from
+  exactly where the returned text stopped. Nothing today returns only the rest of a
+  truncated section.
+- **A hit whose section cannot be established reports no section at all** — `section`
+  is `null`, not an empty one. A source whose nodes carry no recorded range is the
+  case: there is no range to place the run by, so there is nothing to return rather
+  than nothing in it.
 - **They stop at the source boundary**, and inside a collection filter: a section
   never spans two sources, and a scoped search takes sections only from sources in the
   requested collections.
@@ -636,7 +684,8 @@ curl -X POST "http://localhost:8000/search" \
   the caller renders both or picks one.
 - **The ceiling is a limit, not a section size.** A document whose headings were
   dropped upstream has one section that is the whole source, so the bound is what
-  keeps a request from fetching a 549-chunk document to answer one question.
+  keeps a request from fetching a 549-chunk document's whole text to answer one
+  question.
 
 ## Configuration
 
@@ -651,13 +700,13 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `POSTGRES_DATABASE` | *(empty)* | Database name. Required by the durable backend. |
 | `POSTGRES_USER` | *(empty)* | User the service connects as. Required by the durable backend. Under `docker compose` this is the container's superuser, which is what lets the store create the `vector` extension. |
 | `POSTGRES_PASSWORD` | *(empty)* | That user's password. Required by the durable backend. Special characters are escaped when the connection URL is built, so a password containing `@`, `:` or `/` needs no quoting. |
-| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, this service's own catalog, each job's record, and the corpus claims. The catalog is what holds a source's record, the position each of its chunks holds in it, the document it was converted into, and the embedding model the collection was built with. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
+| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, this service's own catalog, each job's record, and the corpus claims. The catalog is what holds a source's record, where each of its chunks sits and where its text came from, the document it was converted into, and the embedding model the collection was built with. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Hugging Face embedding model name. |
 | `CHUNK_SIZE` | the embedding model's input limit | Bounds a node rather than placing its boundary, in the embedding model's tokens, special tokens included. A node's boundaries are the document's own — a heading opens a section, a paragraph break ends a unit — and a unit that fits is stored as itself; only a unit wider than this is divided further, at sentence boundaries, or at row boundaries with the header repeated if it is a table. Unset derives it from the model (256 for the default model), so it tracks the model rather than going stale against it; an explicit value larger than the model's limit is rejected at startup, because such chunks would be truncated before they were embedded. Measured on the corpus this was tuned on, it is a bound rather than a lever: lowering it from 8,192 to 512 moved the node count only from 386 to 404, because all but 10 of the 577 units were already smaller than 512. Set it only to go smaller. |
 | `CHUNK_OVERLAP` | `50` | Overlap, in the same tokens as `CHUNK_SIZE`, applied only where a unit had to be divided at sentence boundaries — the one case where no boundary of the document's own was left to divide on. A node separated from its neighbour at a heading or paragraph boundary therefore repeats nothing: the seam is where the source changed subject, and repeating text across it would store the same text twice. Overlap is quantized to whole sentences, so the achieved overlap can be lower than this, and is zero when a single sentence exceeds the budget. |
 | `MIN_CHUNK_TOKENS` | `32` | Minimum node size, in the same tokens as `CHUNK_SIZE` and measured the same way — on the node's text as the model reads it, the heading it carries included. A node smaller than this is merged into a neighbour of its own section in preference to one beyond a heading, so satisfying the minimum does not join two topics into one node; a merge that would take the neighbour past the embedding model's input limit is refused and the node kept, so the model's window is never traded away for the minimum. A merged node carries the heading its texts share once rather than once per text, since it opens with it already and the copies say nothing new. The default follows the measured noise floor: the corpus this was tuned on stored 9–14 token scraps that outranked real passages. Setting it to `0` stores every unit of the document as a node of its own, merging nothing. |
 | `DEFAULT_TOP_K` | `5` | Default number of search results. |
-| `MAX_SECTION_CHUNKS` | `25` | How many chunks one section expansion may return — see [Sections](#sections). The cap is a limit on the answer, not a section size: a document whose headings were dropped upstream has one section that is the whole source, so the returned part is bounded and the section's true size is reported beside it as `section_size`, which is how a caller tells a truncated section from a complete one. The bound matters because the walk reads each chunk from the index under the same lock an ingestion takes, and a document in the corpus this was measured on holds 549 chunks in one section. A value below `1` is rejected as the settings are built: a ceiling that would return nothing leaves nothing for asking for no expansion to mean. |
+| `MAX_SECTION_CHARACTERS` | `25 × CHUNK_SIZE` | How long one section expansion may be, counted in the document's own characters rather than in chunks — see [Sections](#sections). The cap is a limit on the answer, not a section size: a document whose headings were dropped upstream has one section that is the whole source, so the part returned is bounded and taken around the result, and the section's true length is reported beside it as `size`, which is how a caller tells a truncated section from a complete one. Left unset it is the passage the chunk-count cap used to return — `25` chunks of the chunk size in use — resolved against `CHUNK_SIZE` as the service starts, so it follows the embedding model instead of going stale against it. The bound matters because the walk reads chunks from the index under the same lock an ingestion takes, and a document in the corpus this was measured on holds 549 chunks in one section. A value below `1` is rejected as the settings are built: a ceiling that would return nothing leaves nothing for asking for no expansion to mean. |
 | `MAX_FILE_SIZE_MB` | `50` | Maximum uploaded file size in MB. |
 | `URL_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for fetching URLs. |
 | `JOB_ORPHAN_THRESHOLD_SECONDS` | `300` | How long a job may go without its owning instance reporting progress before `GET /jobs/{job_id}` reports it `failed`, naming that instance, rather than leaving it `pending` forever. Each job's record carries the instance that owns it and when it last advanced, and a running ingestion advances it every 30 seconds, so this bounds silence rather than how long an ingestion may take: a slow parse keeps reporting. It is read on either backend, but it is the durable one it is for: with `simple` a job's record dies with the process that would have to report it, so a stopped instance leaves nothing to call failed, and what is left for the threshold to catch is an ingestion that stalled inside a process that is still running. Raise it if an instance may be paused long enough to miss several beats; lowering it narrows how long a job whose instance stopped is shown as running, at the cost of calling a healthy but briefly stalled one failed. |
@@ -720,11 +769,16 @@ index is not one table:
   hit's text, which is the neighbours and the section around it. Both writes are
   kept on for the durable backend deliberately, and they are two statements rather
   than one transaction: a chunk costs its text twice over.
-- **This service's own catalog** — the sources, the chunk position of each node
-  for reading order and for neighbours, the document each source was converted
-  into, and the embedding model the collection was built with. The document sits
-  in a table of its own rather than as a column of the source's record, so the
-  catalog answers what the index holds without reading the content it holds.
+- **This service's own catalog** — the sources, and for each node of each source
+  both where it sits and where it came from: its position in the source, which is
+  reading order and what a hit's neighbours are read by, and the range of the
+  converted document its own text was built from — its start and end, counted in
+  characters — with the heading that text opens with, recorded as the empty key
+  when it opens with no heading. Also the document each source was converted into,
+  and the embedding model the collection was built with. A node written before the
+  map carried ranges answers with none. The document sits in a table of its own
+  rather than as a column of the source's record, so the catalog answers what the
+  index holds without reading the content it holds.
 - **Each job's record** — its status, result, error, timings, the instance that
   owns it and when that instance last advanced it. Small, but the part of the
   service a caller polling a load-balanced address depends on: it is what lets a
@@ -738,9 +792,11 @@ index is not one table:
   see [The startup corpus, across several
   instances](#the-startup-corpus-across-several-instances).
 
-At startup the service connects, enables the extension, creates what is missing
-and validates what it found. It stops rather than serve from a store it cannot
-trust:
+At startup the service connects, enables the extension, creates the tables that
+are missing, adds to an existing catalog table the columns a newer version of the
+service introduced — so a collection written before the position map carried
+ranges opens rather than failing on a column it does not have — and validates what
+it found. It stops rather than serve from a store it cannot trust:
 
 - **The database is unreachable** — startup stops, naming the configured backend
   and the host, port and database it could not reach, never the password.
@@ -763,6 +819,17 @@ differently. A corpus that has not changed is therefore neither parsed nor
 embedded again at the second startup, which is what makes a durable backend
 worth its startup cost: without this, the service would parse and embed the same
 documents into a database that already had them, every time it started.
+
+A source is held as it now stands only when all three of these are true: its
+content is current, its converted document is stored, and every one of its nodes
+carries a recorded range — where in that document its text came from. Each is a
+state the parse this skips would repair, so any one of them missing is what
+re-ingests the source: a source ingested before this service stored documents is
+current and holds none, and one ingested before ranges were recorded is current
+and holds a document yet can answer no section, because the walk that would place
+a run of its nodes has no range to place it by. All three are checked before the
+parse, and reading the source's bytes and digest is the only work a skip still
+costs.
 
 Editing one corpus file re-ingests that file and leaves the rest alone, and so
 does editing what a corpus URL serves — the page is fetched once and compared,

@@ -55,9 +55,11 @@ class SearchRequest(BaseModel):
         description="Return each result's whole section rather than a fixed number of "
         "adjacent chunks. A section is the run of chunks in the result's own source whose "
         "text begins with the same heading line as the result's, taken outwards until the "
-        "heading changes or the source ends, and every result carries the chunks returned "
-        "and the section's true size. Omit for no section. `section` cannot be combined "
-        "with `neighbours`: stating both is rejected.",
+        "heading changes or the source ends; what comes back is the source's own text over "
+        "that run, with the range it was taken from and the section's true length, and it is "
+        "bounded around the result rather than returned whole however long it is. Omit for "
+        "no section. `section` cannot be combined with `neighbours`: stating both is "
+        "rejected.",
     )
 
 
@@ -65,6 +67,46 @@ class NeighbourChunk(BaseModel):
     text: str = Field(..., description="Chunk text")
     position: int = Field(
         ..., description="Zero-based position this chunk holds in its source, in reading order"
+    )
+
+
+class SectionExpansion(BaseModel):
+    """The part of a result's section this response carries.
+
+    A section is the document's own text, not the chunks it was cut into, so what
+    is returned is a passage of that document and the range it was taken from: a
+    caller can render `text` as it stands, or slice the same source's content at
+    `start` up to `end` and receive the same passage. `size` is how long the whole
+    section is, so an expansion bounded by the service reports a `size` larger than
+    the text it carries rather than looking like the whole section.
+    """
+
+    text: str = Field(
+        ...,
+        description="The document's own characters over the section's run of chunks: the "
+        "part of the section this result carries, taken around the result's own text so "
+        "that text is always inside it. It is a passage of the source's document, not "
+        "chunks joined together, so nothing is repeated or elided inside it.",
+    )
+    start: int = Field(
+        ...,
+        description="Where the returned text begins in the source's document, counted in "
+        "characters from the document's first character. Slice the source's content from "
+        "this offset to `end` to receive the same passage.",
+    )
+    end: int = Field(
+        ...,
+        description="Where the returned text ends in the source's document, counted in "
+        "characters from the document's first character and exclusive, so that "
+        "`content[start:end]` is the returned text.",
+    )
+    size: int = Field(
+        ...,
+        description="How long this result's whole section is, in characters, whether or not "
+        "all of it was returned: the width of the range of its source's document that the "
+        "section covers. It is the section as the document holds it rather than a count of "
+        "the chunks it was cut into, so `size` larger than `end - start` means the section "
+        "was truncated; `size` equal to it means the section is whole.",
     )
 
 
@@ -108,22 +150,12 @@ class SearchResult(BaseModel):
         "in reading order, up to the neighbour count the request asked for. Empty when it "
         "asked for none. They carry no score because they were not ranked against the query.",
     )
-    section: list[NeighbourChunk] = Field(
-        default_factory=list,
-        description="The chunks of this result's own section, in reading order, when the "
-        "request asked for a section expansion; empty when it did not. This result's own "
-        "text is one of them, repeated rather than referenced, so the passage can be "
-        "rendered from these chunks alone. They carry no score because they were not ranked "
-        "against the query, and they are bounded: `section_size` says how many chunks the "
-        "section really holds.",
-    )
-    section_size: int = Field(
-        0,
-        description="The number of chunks this result's section really holds, whether or "
-        "not every one of them was returned. It is larger than the number of `section` "
-        "chunks when the expansion was bounded, which is how a caller tells a truncated "
-        "section from a complete one. Zero when no section was asked for, or when the "
-        "result's place in its source could not be established.",
+    section: SectionExpansion | None = Field(
+        default=None,
+        description="This result's own section when the request asked for one: the "
+        "document's own text over the run of chunks the result belongs to, with the range "
+        "it was taken from. Null when no section was asked for, and null for a result whose "
+        "section cannot be established — a source holding no range to place the run by.",
     )
 
 
