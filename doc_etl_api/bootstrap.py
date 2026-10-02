@@ -10,8 +10,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from doc_etl_api.claims import ClaimStore, InProcessClaimStore
-from doc_etl_api.jobs import instance_id
+from doc_etl_api.claims import ClaimStore, InProcessClaimStore, claim_heartbeat
+from doc_etl_api.jobs import HEARTBEAT_INTERVAL_SECONDS, instance_id
 from doc_etl_api.pipeline import content_hash
 
 if TYPE_CHECKING:
@@ -86,25 +86,23 @@ def _hold_claim(
     stale_after: float,
     poll_seconds: float = CLAIM_POLL_SECONDS,
 ) -> bool:
-    """Take the claim on *address*, or report that it could not be taken.
+    """Take the claim on *address*, or report that this instance waited it out.
 
     A refusal is another instance loading the same source, and the answer is to
     wait rather than to load it a second time: that wait is the whole point of
-    the claim. It ends either way within the ownership threshold, because a
-    claim older than that is granted to whoever asks for it -- so an instance
-    waiting on one whose owner has stopped takes it over and loads the source
-    rather than waiting for an instance that is not coming back.
+    the claim. It ends when the holder releases the claim -- that instance's
+    ingestion is finished -- or when the claim goes stale, which is a holder
+    that stopped saying it is alive, and is taken over here.
 
-    An owner that is merely slow past the threshold is treated as one that
-    stopped, which costs a duplicate ingestion; that is the same trade the
-    ownership threshold makes for jobs, and it is affordable here for the same
-    reason -- the replacement the second ingestion performs is atomic, so the
-    index ends holding one of the two copies rather than a splice of both.
-
-    The threshold is also the longest wait, which is what an instance that never
-    gets the claim reports: a source this instance did not load and could not
-    confirm is one the bootstrap must not call complete, and the deadline is
-    what keeps that from being forever.
+    A holder that is merely slow is not that: it advances its claim while it
+    loads, so its claim stays younger than the threshold however long the source
+    takes, and this keeps waiting. What the wait does not do is wait forever,
+    because a holder that is stuck -- a beat thread alive and the work never
+    returning -- cannot be told from a slow one by age, and waiting on it would
+    hold a deferring instance's bootstrap open for as long as the stuck process
+    lives. So the wait is bounded, and its expiry is answered with a question
+    about the index rather than with an assumption about the holder: see
+    `_run_claimed`.
     """
     deadline = time.monotonic() + stale_after + poll_seconds
     while True:
@@ -122,21 +120,53 @@ def _run_claimed(
     label: str,
     address: str,
     ingest: Callable[[], object],
+    present: Callable[[], bool],
+    skip: Callable[[str], None],
     *,
     owner: str,
     stale_after: float,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     """Load one corpus source, with one instance doing the work for all of them.
 
     The claim is taken before the source is read, so an instance that loses the
     race contributes nothing rather than contributing the same parse and embed
-    as the winner. What it does contribute is the wait, and what it must not
-    contribute is a wrong answer about the source: it re-reads the store once it
-    holds the claim, so the currency check it is about to make is against what
-    the index holds -- including what another instance wrote while this one
-    waited -- rather than against this process's own last known state.
+    as the winner.
+
+    The wait has two endings and they are answered differently. Taking the claim
+    is the ending where this instance loads the source: it re-reads the store
+    first, so the currency check it is about to make is against what the index
+    holds -- including what another instance wrote while this one waited --
+    rather than against this process's own last known state.
+
+    Running out of wait is the ending where the holder still has it, and then
+    the answer has to come from the index rather than from the work. *present*
+    asks whether the source is there now, reading it only far enough to compare
+    it -- the holder may have finished while this instance was still waiting,
+    which is the ordinary case when this instance is the one that deferred. A
+    source that is present is reported the way any source the index already
+    holds is, and one that is absent is recorded as a failure naming it: this
+    instance waited the threshold out and the source is still not there.
+
+    *present* is its own callable rather than a second call to *ingest*, because
+    ingesting a source another instance may be working on is the duplication
+    this change removes -- and because the digest the comparison needs is the
+    read or fetch, not the parse. The two share that read: the callers that
+    supply them compute the digest once, in one place, and hand both the same
+    one.
+
+    The ingestion is held under a beat, so the claim does not go stale while the
+    source is still loading -- which is what keeps a slow source from being
+    treated as one whose instance has stopped.
     """
     if not _hold_claim(claims, address, owner, stale_after=stale_after):
+        # Re-read before asking, so the answer is about what the index holds --
+        # including what the holder wrote while this instance waited -- rather
+        # than about this process's own last known state.
+        pipeline.refresh()
+        if present():
+            skip(label)
+            return
         _record_failure(
             state,
             label,
@@ -145,11 +175,13 @@ def _run_claimed(
         return
     try:
         pipeline.refresh()
-        _ingest_one(state, label, ingest)
+        with claim_heartbeat(claims, address, owner, interval=heartbeat_interval):
+            _ingest_one(state, label, ingest)
     finally:
         # Released even when the ingestion failed, because a claim held by an
         # instance that has given up is a source no one will touch again until
-        # it goes stale.
+        # it goes stale. The beat is stopped before this, so no refresh lands on
+        # a claim that is already gone.
         claims.release(address, owner)
 
 
@@ -159,6 +191,7 @@ def ingest_corpus(
     state: BootstrapState,
     claims: ClaimStore | None = None,
     owner: str | None = None,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     """Ingest the configured corpus, isolating the failure of each source.
 
@@ -183,6 +216,18 @@ def ingest_corpus(
     attributed to, so two callers sharing a name are one instance as far as the
     claims are concerned -- which is what they are, and what a caller running one
     process as several instances has to say otherwise.
+
+    *heartbeat_interval* is how often a held claim is advanced while its source
+    is loaded. It is the job heartbeat's number by default; it is a parameter at
+    all so a lowered ownership threshold can carry a lowered beat with it, which
+    is what keeps the beat inside the threshold rather than the threshold inside
+    the beat.
+
+    An instance that takes a claim loads the source; one that waits the claim out
+    answers from the index instead. The two endings and what each reports are
+    described on `_run_claimed`, and the read that the second one needs -- the
+    source's own digest -- is built here, beside the ingest callable that
+    computes the same one, so neither is a second way to answer it.
     """
     corpus_path = app_settings.knowledge_corpus_path
     corpus_urls = app_settings.knowledge_corpus_url_list
@@ -229,11 +274,27 @@ def ingest_corpus(
         ingested.add(path.name)
         file_tag = file_collections.get(path.name, collections)
 
+        def file_content(target: Path = path) -> tuple[bytes, str]:
+            """The file's bytes and their digest, read and computed once.
+
+            Both questions this source is asked start here -- is the index
+            holding it, and then load it -- so the file is read once per
+            question that has to be asked, and the digest is computed in one
+            place rather than twice.
+            """
+            payload = target.read_bytes()
+            return payload, content_hash(payload)
+
+        def file_present(target: Path = path, tag: list[str] = file_tag) -> bool:
+            """Whether the index holds this file, asked without ingesting it."""
+            _, digest = file_content(target)
+            return pipeline.is_current(target.name, digest, tag)
+
         def ingest_file(target: Path = path, tag: list[str] = file_tag) -> None:
             # Read whole before deciding, and read only: nothing is parsed,
             # chunked or embedded for a file the index holds as it now stands.
-            payload = target.read_bytes()
-            if pipeline.is_current(target.name, content_hash(payload), tag):
+            payload, digest = file_content(target)
+            if pipeline.is_current(target.name, digest, tag):
                 skip(target.name)
                 return
             pipeline.ingest_file(
@@ -250,8 +311,11 @@ def ingest_corpus(
             str(path),
             path.name,
             ingest_file,
+            file_present,
+            skip,
             owner=owner,
             stale_after=stale_after,
+            heartbeat_interval=heartbeat_interval,
         )
 
     # An entry naming a file the corpus does not ingest -- absent, or of an
@@ -269,12 +333,22 @@ def ingest_corpus(
 
     for url in corpus_urls:
 
+        def url_content(target: str = url) -> tuple[bytes, str, str]:
+            """The page's body, its digest and where it landed, fetched once."""
+            body, final_url = pipeline.fetch_page(target)
+            return body, content_hash(body), final_url
+
+        def url_present(target: str = url) -> bool:
+            """Whether the index holds this page, asked without ingesting it."""
+            _, digest, final_url = url_content(target)
+            return pipeline.is_current(final_url, digest, collections)
+
         def ingest_url(target: str = url) -> None:
             # Fetched, because a page's content cannot be known without asking
             # for it, then compared before anything parses it. The fetch is the
             # cost this cannot avoid; the conversion is the cost it saves.
-            body, final_url = pipeline.fetch_page(target)
-            if pipeline.is_current(final_url, content_hash(body), collections):
+            body, digest, final_url = url_content(target)
+            if pipeline.is_current(final_url, digest, collections):
                 skip(target)
                 return
             pipeline.ingest_page(
@@ -298,8 +372,11 @@ def ingest_corpus(
             url,
             url,
             ingest_url,
+            url_present,
+            skip,
             owner=owner,
             stale_after=stale_after,
+            heartbeat_interval=heartbeat_interval,
         )
 
     state.status = BootstrapStatus.FAILED if state.failures else BootstrapStatus.COMPLETE

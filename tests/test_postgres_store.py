@@ -35,6 +35,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 
 from doc_etl_api.bootstrap import BootstrapState, BootstrapStatus, ingest_corpus
+from doc_etl_api.claims import claim_heartbeat
 from doc_etl_api.config import Settings, VectorStoreBackend
 from doc_etl_api.main import create_app
 from doc_etl_api.pipeline import IndexPipeline, _node_id, content_hash, create_pipeline
@@ -1087,13 +1088,19 @@ def test_a_replacement_that_fails_leaves_the_earlier_content_in_place(
 # --- A corpus, and the several instances that start from it -------------------
 
 
-def _corpus_pipeline(settings: Settings, contents: dict[str, str], parsed: list[str]):
+def _corpus_pipeline(
+    settings: Settings, contents: dict[str, str], parsed: list[str], delay: float = 0.0
+):
     """A pipeline over *contents* as a corpus directory, counting every parse.
 
     The conversion is the stage the claim exists to keep to one instance, so it
     is the call that has to be countable. Each file is converted to its own text,
     so what lands in the index is the file that was read rather than one fixed
     document for all of them.
+
+    *delay* holds each conversion open for that long, which is how a test gives a
+    source that outlasts an ownership threshold: the threshold is lowered to a
+    second or two rather than the source made to clear the five-minute default.
     """
     pipeline = _create(settings)
     pipeline.converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
@@ -1102,6 +1109,8 @@ def _corpus_pipeline(settings: Settings, contents: dict[str, str], parsed: list[
     def convert_file(file, name):
         with lock:
             parsed.append(name)
+        if delay:
+            time.sleep(delay)
         return contents[name]
 
     pipeline.converter.convert_file.side_effect = convert_file
@@ -1238,6 +1247,209 @@ def test_a_claim_left_by_a_stopped_instance_is_taken_up(tmp_path, collection):
         assert any("STAR" in hit["text"] for hit in hits), "the source is absent from the index"
     finally:
         survivor._store.close()
+
+
+@needs_database
+def test_a_source_outlasting_the_threshold_is_loaded_by_one_instance(tmp_path, collection):
+    """A source that takes longer than the threshold is loaded once, all the same.
+
+    The heartbeat is the only thing that separates an instance still loading a
+    source from one that has stopped, so the source here takes longer to load
+    than the ownership threshold and the beat runs well inside it. Without the
+    beat the second instance would find the claim stale *while the first was
+    still loading*, take it over, and load the source a second time -- the
+    duplication the claim exists to remove, which the parse count catches.
+
+    The threshold is driven down through the setting rather than the source made
+    to clear the default: at one second against a two-second conversion, a claim
+    that is refreshed and one that is not are unambiguously different, and the
+    test costs seconds rather than minutes. The beat is driven down with it, for
+    the same reason it is inside the threshold in production.
+
+    The instance that waits is asserted to end with a failure naming the source.
+    That is the bounded wait's own outcome rather than a fault here: its wait ran
+    out while the holder still had the source and the index did not hold it yet,
+    so the only answer left to it is that it could not report the source. The two
+    halves are asserted together because they are one behaviour: waiting a live
+    owner out costs a report, while taking the source from it would have cost a
+    second parse.
+    """
+    contents = {"slow.txt": "# Slow\n\nThe STAR method structures behavioural answers."}
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, text in contents.items():
+        (corpus / name).write_bytes(text.encode())
+
+    threshold = 1
+    settings = _settings(
+        table=collection,
+        knowledge_corpus_dir=str(corpus),
+        job_orphan_threshold_seconds=threshold,
+    )
+    parsed: list[str] = []
+    # Both are slow, so whichever instance takes the source has it for longer than
+    # the threshold -- and the other one, waiting, is the instance the beat keeps
+    # from concluding the first has stopped.
+    first = _corpus_pipeline(settings, contents, parsed, delay=threshold * 2)
+    second = _corpus_pipeline(settings, contents, parsed, delay=threshold * 2)
+    claims = first.store.claim_store()
+    states = [BootstrapState(), BootstrapState()]
+
+    try:
+        threads = [
+            threading.Thread(
+                target=ingest_corpus,
+                args=(pipeline, settings, state, claims, f"instance-{index}"),
+                kwargs={"heartbeat_interval": threshold / 10},
+                name=f"bootstrap-{index}",
+            )
+            for index, (pipeline, state) in enumerate(zip((first, second), states, strict=True))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads), (
+            "an instance's bootstrap did not finish"
+        )
+
+        assert sorted(state.status for state in states) == sorted(
+            (BootstrapStatus.COMPLETE, BootstrapStatus.FAILED)
+        ), [(state.status, state.failures) for state in states]
+        assert parsed == ["slow.txt"], (
+            f"the slow source was parsed {len(parsed)} times rather than once"
+        )
+        failures = [failure for state in states for failure in state.failures]
+        assert len(failures) == 1, failures
+        # Named the way a corpus file is named in a report, which is its path.
+        assert (
+            "slow.txt: claimed by another instance that did not report it ingested" in failures[0]
+        ), failures
+        assert claims.held("slow.txt") is None, "the claim outlived the bootstrap"
+    finally:
+        first._store.close()
+        second._store.close()
+
+
+@needs_database
+def test_a_source_present_when_the_wait_ends_is_reported_rather_than_failed(tmp_path, collection):
+    """A wait that ends with the source in the index is not a failure.
+
+    The wait can end while the holder still has the claim, and then the answer
+    has to come from the index rather than from the holder -- the source may
+    already have been loaded, and an instance reporting the corpus failed on top
+    of a present source would misreport a startup that worked.
+
+    The question is asked with the source's own digest, and this is what shows
+    it: the index was written from the same bytes the corpus holds, so a
+    presence question that read or digested the source any other way would find
+    nothing and record the failure this test asserts against. The holder is only
+    what makes the wait run out -- it refreshes a claim throughout, which is an
+    owner that has not stopped and so cannot be waited out by age.
+    """
+    contents = {"guide.txt": "# Guide\n\nThe STAR method structures behavioural answers."}
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, text in contents.items():
+        (corpus / name).write_bytes(text.encode())
+
+    threshold = 1
+    settings = _settings(
+        table=collection,
+        knowledge_corpus_dir=str(corpus),
+        job_orphan_threshold_seconds=threshold,
+    )
+
+    # Loaded first, on a pipeline of its own, so what is counted below is what the
+    # deferring instance parsed and not what this test did.
+    seed = _create(settings)
+    try:
+        _ingest(
+            seed,
+            "guide.txt",
+            contents["guide.txt"],
+            payload=contents["guide.txt"].encode(),
+        )
+    finally:
+        seed._store.close()
+
+    parsed: list[str] = []
+    deferring = _corpus_pipeline(settings, contents, parsed)
+    claims = deferring.store.claim_store()
+    state = BootstrapState()
+
+    try:
+        assert claims.claim("guide.txt", "instance-holding", float(threshold))
+        with claim_heartbeat(claims, "guide.txt", "instance-holding", interval=threshold / 10):
+            ingest_corpus(
+                deferring,
+                settings,
+                state,
+                claims,
+                "instance-deferring",
+                heartbeat_interval=threshold / 10,
+            )
+
+        assert state.status is BootstrapStatus.COMPLETE, state.failures
+        assert state.failures == []
+        assert parsed == [], "the deferring instance loaded a source the index held"
+        deferring.refresh()
+        assert deferring.is_current("guide.txt", content_hash(contents["guide.txt"].encode()), [])
+    finally:
+        deferring._store.close()
+
+
+@needs_database
+def test_a_source_absent_when_the_wait_ends_is_recorded_as_a_failure(tmp_path, collection):
+    """A wait that ends with the source still absent is reported as one.
+
+    The other outcome of the same question, and the reason it is asked rather
+    than assumed: the index does not hold the source, so there is no answer this
+    instance can report except that the source is missing.
+
+    The parse count is asserted with it because the expiry path must ask about
+    the source without loading it -- loading one that another instance may be
+    working on is the duplication the claim exists to remove.
+    """
+    contents = {"guide.txt": "# Guide\n\nThe STAR method structures behavioural answers."}
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, text in contents.items():
+        (corpus / name).write_bytes(text.encode())
+
+    threshold = 1
+    settings = _settings(
+        table=collection,
+        knowledge_corpus_dir=str(corpus),
+        job_orphan_threshold_seconds=threshold,
+    )
+    parsed: list[str] = []
+    deferring = _corpus_pipeline(settings, contents, parsed)
+    claims = deferring.store.claim_store()
+    state = BootstrapState()
+
+    try:
+        assert claims.claim("guide.txt", "instance-holding", float(threshold))
+        with claim_heartbeat(claims, "guide.txt", "instance-holding", interval=threshold / 10):
+            ingest_corpus(
+                deferring,
+                settings,
+                state,
+                claims,
+                "instance-deferring",
+                heartbeat_interval=threshold / 10,
+            )
+
+        assert state.status is BootstrapStatus.FAILED, state.failures
+        assert len(state.failures) == 1, state.failures
+        # Named the way a corpus file is named in a report, which is its path.
+        assert (
+            "guide.txt: claimed by another instance that did not report it ingested"
+            in state.failures[0]
+        ), state.failures
+        assert parsed == [], "the expiry path loaded a source it was only asked about"
+    finally:
+        deferring._store.close()
 
 
 @needs_database

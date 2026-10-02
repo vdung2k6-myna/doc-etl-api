@@ -19,19 +19,27 @@ threshold `job_orphan_threshold_seconds` configures is one whose owner is gone,
 and it is taken over rather than waited on forever. The same threshold, because
 it answers the same question -- how long may an instance be silent before it is
 treated as stopped -- and a deployment that tunes one and not the other would
-have two answers to it.
+have two answers to it. That question is only answered by silence while the
+holder keeps saying it is alive: an instance still loading a source advances its
+claim the way a running job advances its own record, so a source that takes a
+long time is not mistaken for one whose instance has stopped.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Engine
+
+from doc_etl_api.jobs import HEARTBEAT_INTERVAL_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +61,8 @@ class ClaimStore(Protocol):
     """Where the question "is anyone loading this source" is asked and answered."""
 
     def claim(self, address: str, owner: str, stale_after: float) -> bool: ...
+
+    def refresh(self, address: str, owner: str) -> bool: ...
 
     def release(self, address: str, owner: str) -> None: ...
 
@@ -81,6 +91,22 @@ class InProcessClaimStore:
 
     def claim(self, address: str, owner: str, stale_after: float) -> bool:
         if address in self._held:
+            return False
+        self._held[address] = Claim(address=address, owner=owner, claimed_at=time.time())
+        return True
+
+    def refresh(self, address: str, owner: str) -> bool:
+        """Say the holder is still loading, which here is bookkeeping rather than a race.
+
+        Nothing contends this store, so a refresh never changes who holds what.
+        It answers the way the durable one does all the same, because the
+        deferring path reads that answer, and only the holder's refresh lands --
+        so a claim taken over could not be resurrected here either.
+        """
+        held = self._held.get(address)
+        # The owner is part of the condition, not checked before it, so a beat
+        # that arrives after the claim moved on writes nothing.
+        if held is None or held.owner != owner:
             return False
         self._held[address] = Claim(address=address, owner=owner, claimed_at=time.time())
         return True
@@ -175,6 +201,29 @@ class PostgresClaimStore:
             ).first()
         return row is not None
 
+    def refresh(self, address: str, owner: str) -> bool:
+        """Say the holder is still loading it, which is what keeps it from going stale.
+
+        One statement, and the owner sits in its condition rather than being
+        checked first, for the reason `release` gives: an instance that lost the
+        claim to a takeover -- and is only now finishing -- must not advance a
+        claim that is no longer its own. A refresh that matched no row is exactly
+        that case, so the false it returns is an answer rather than an error, and
+        the row it did not touch still belongs to the successor.
+        """
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                self._table.update()
+                .where(
+                    sqlalchemy.and_(
+                        self._table.c.address == address,
+                        self._table.c.owner == owner,
+                    )
+                )
+                .values(claimed_at=time.time())
+            )
+            return result.rowcount > 0
+
     def release(self, address: str, owner: str) -> None:
         """Give up a claim, but only one this instance holds.
 
@@ -204,3 +253,45 @@ class PostgresClaimStore:
 
     def close(self) -> None:
         """Nothing to hand back: the engine belongs to the index store."""
+
+
+@contextmanager
+def claim_heartbeat(
+    claims: ClaimStore,
+    address: str,
+    owner: str,
+    interval: float = HEARTBEAT_INTERVAL_SECONDS,
+) -> Iterator[None]:
+    """Say a held claim is still being worked on, until the work it covers is done.
+
+    A claim's age is the only thing that separates a source an instance is still
+    loading from one whose instance has stopped, so a source that takes longer
+    than the ownership threshold to load has to keep saying so while it loads.
+    Without this the two are the same row, and the more slowly a source
+    legitimately loads -- a large scanned document, a slow page -- the more
+    certainly another instance would take it over and load it a second time,
+    which is the work the claim exists to keep to one instance.
+
+    The interval is the job heartbeat's rather than a second number, because both
+    beats now answer the same question: how long an instance may stay silent
+    before it is treated as stopped. The margin between interval and threshold is
+    how many beats an instance may miss, and that margin means the same thing on
+    either path.
+
+    The beat is a thread of its own because the work it covers is one long
+    blocking call: an ingestion reports no progress to beat against, and waiting
+    for it to finish is exactly the wait that must not be mistaken for silence.
+    """
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(interval):
+            claims.refresh(address, owner)
+
+    thread = threading.Thread(target=beat, name="claim-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()

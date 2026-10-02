@@ -776,13 +776,23 @@ what the store holds rather than answering from what its own startup ingested �
 until then it reports `pending` or `in_progress`, and never `complete` for a
 corpus nobody has loaded.
 
-A claim is released when its ingestion finishes. An instance that stops
-mid-bootstrap leaves its claim behind, and that claim is taken over once it is
-older than `JOB_ORPHAN_THRESHOLD_SECONDS` — the threshold job ownership uses, so
-a dead instance's source is loaded by a surviving one rather than left out of
-the index. The same threshold bounds how long a waiting instance waits: if it
-never gets the claim it reports that source as a bootstrap failure, rather than
-calling a corpus complete that it could not confirm.
+A claim is refreshed while its ingestion runs, once every 30 seconds — the same
+beat a running job makes — so a claim older than `JOB_ORPHAN_THRESHOLD_SECONDS`
+is one whose holder has stopped, not one whose source is merely slow: a document
+that takes longer to parse than the threshold keeps its claim for as long as it
+is being parsed, and no other instance loads it a second time. An instance that
+stops mid-bootstrap leaves its claim behind, and that claim is taken over once
+it goes stale, so a dead instance's source is loaded by a surviving one rather
+than left out of the index.
+
+The same threshold bounds how long a waiting instance waits. When its wait runs
+out it does not assume the worst: it re-reads the store and reports the source
+present if the index now holds it — the ordinary case, and what makes its
+`/health` report `complete` rather than `failed` for a corpus another instance
+loaded — and records it as a bootstrap failure only when the index still does
+not hold it. Waiting for a holder that never finishes therefore costs a delay
+and a failure naming the source, rather than a corpus silently reported as
+complete that this instance could not confirm.
 
 ## Performance notes
 
