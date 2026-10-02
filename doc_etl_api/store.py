@@ -782,13 +782,13 @@ def _embedding_dimension(embedding_model: BaseEmbedding) -> int:
     if isinstance(declared, int) and declared > 0:
         return declared
     sentence_transformers = getattr(embedding_model, "_model", None)
-    dimension = getattr(sentence_transformers, "get_sentence_embedding_dimension", None)
+    dimension = getattr(sentence_transformers, "get_embedding_dimension", None)
     if callable(dimension):
         width = dimension()
         if isinstance(width, int) and width > 0:
             return width
     raise ValueError(
         f"Embedding model {type(embedding_model).__name__} states no vector width -- "
-        "neither `embed_dim` nor `get_sentence_embedding_dimension` -- so a durable store "
+        "neither `embed_dim` nor `get_embedding_dimension` -- so a durable store "
         "cannot be sized for it."
     )
