@@ -1038,6 +1038,37 @@ def test_re_ingesting_an_edited_source_removes_the_previous_version(searchable_p
     assert not any("Alpha-specific" in text for text in stored), "the superseded version survived"
 
 
+def test_a_sources_converted_document_is_stored_with_it(searchable_pipeline):
+    """What the content route returns is the document, so the document is kept.
+
+    Stored for a file and for a page alike, because neither path has anything the
+    other has not: both hold the markdown the conversion returned, and both drop
+    it today. A page's document is the conversion of its main content, which is
+    what the chunks were cut from rather than the page as it was served.
+    """
+    file_markdown = "# Doc\n\n" + ALPHA_PARAGRAPH
+    page_markdown = "# Page\n\n" + BETA_PARAGRAPH
+    _ingest_text(searchable_pipeline, "doc.txt", file_markdown)
+    stub_page(searchable_pipeline.converter, page_markdown, url="https://example.com/final")
+    searchable_pipeline.ingest_url(source_id="source-page", url="https://example.com/page")
+
+    assert searchable_pipeline._store.document("doc.txt") == file_markdown
+    assert searchable_pipeline._store.document("https://example.com/final") == page_markdown
+
+
+def test_re_ingesting_a_source_replaces_the_document_it_stored(searchable_pipeline):
+    """A document is the conversion of the content the index holds, and no other.
+
+    Keeping the first one would leave the source reporting the document it was
+    before it was edited -- which is the same failure as leaving the replaced
+    chunks in the index, one route over.
+    """
+    _ingest_text(searchable_pipeline, "doc.txt", ALPHA_PARAGRAPH)
+    _ingest_text(searchable_pipeline, "doc.txt", BETA_PARAGRAPH)
+
+    assert searchable_pipeline._store.document("doc.txt") == BETA_PARAGRAPH
+
+
 def test_a_source_that_was_never_indexed_ingests_normally(searchable_pipeline):
     """Replacement removes what is there; on a first ingestion there is nothing
     to remove, which must be a no-op rather than an error."""
@@ -2994,29 +3025,25 @@ def test_recording_a_position_does_not_reach_the_stored_node(settings):
 # --- Reading a source's stored content ---------------------------------------
 
 
-def test_the_stored_content_comes_back_in_reading_order(settings):
-    """The whole source, ordered by the position each chunk was stored at.
+def test_the_stored_content_is_the_document_the_source_was_converted_into(settings):
+    """What comes back is the document, and not the chunks it was cut into.
 
-    The docstore is a dict keyed by node id, so the order its values come out in
-    is incidental; the positions recorded when the nodes were stored are what make
-    the chunks come back as the document reads.
+    The two are not the same text: a heading repeats in every node of its section,
+    a unit below the floor merges into its neighbour, and text repeated inside one
+    source is stored once. So the document is neither the chunks joined nor a
+    substring of them, and keeping the conversion is the only way to return it.
     """
     pipeline = _collections_pipeline(settings)
     pipeline.converter.convert_file.return_value = SENTENCE_DOC
     pipeline.ingest_file(source_id="doc", file=BytesIO(b"x"), filename="doc.txt")
 
-    record, chunks = pipeline.source_content("doc.txt")
+    record, document = pipeline.source_content("doc.txt")
 
-    assert len(chunks) > 1, "the fixture must hold a source with more than one chunk"
-    assert record.chunk_count == len(chunks)
-    assert [chunk["position"] for chunk in chunks] == list(range(len(chunks)))
-    # What comes back is what is stored, not something derived from it.
-    assert {chunk["text"] for chunk in chunks} == {
-        node.get_content() for node in _stored_nodes(pipeline)
-    }
+    assert document == SENTENCE_DOC
+    assert record.chunk_count > 1, "the fixture must hold a source of more than one chunk"
 
 
-def test_a_re_ingested_source_returns_only_its_newer_content(settings):
+def test_a_re_ingested_source_returns_only_its_newer_document(settings):
     pipeline = _collections_pipeline(settings)
     pipeline.converter.convert_file.return_value = "the first wording of this source"
     pipeline.ingest_file(source_id="first", file=BytesIO(b"x"), filename="doc.txt")
@@ -3024,18 +3051,17 @@ def test_a_re_ingested_source_returns_only_its_newer_content(settings):
     pipeline.converter.convert_file.return_value = "the second wording of this source"
     pipeline.ingest_file(source_id="second", file=BytesIO(b"x"), filename="doc.txt")
 
-    _record, chunks = pipeline.source_content("doc.txt")
+    _record, document = pipeline.source_content("doc.txt")
 
-    texts = " ".join(chunk["text"] for chunk in chunks)
-    assert "the second wording of this source" in texts
-    assert "the first wording of this source" not in texts
+    assert document == "the second wording of this source"
 
 
 def test_an_unknown_address_is_not_an_empty_source(settings):
     """An address nothing has, and a source holding nothing, are different answers.
 
     Reporting both as the same would make "you asked for something that is not
-    here" read like "here it is, and it was empty".
+    here" read like "here it is, and it was empty". A source that converted to
+    nothing holds an empty document rather than none.
     """
     pipeline = _collections_pipeline(settings)
 
@@ -3044,13 +3070,39 @@ def test_an_unknown_address_is_not_an_empty_source(settings):
     pipeline.converter.convert_file.return_value = ""
     pipeline.ingest_file(source_id="empty", file=BytesIO(b"x"), filename="empty.txt")
 
-    record, chunks = pipeline.source_content("empty.txt")
+    record, document = pipeline.source_content("empty.txt")
     assert record.name == "empty.txt"
-    assert chunks == []
+    assert document == ""
+
+
+def test_a_source_whose_document_was_not_captured_is_reported_without_one(settings):
+    """A source from before documents were stored is a source, and holds none.
+
+    Reporting it as an unknown address would deny a source the catalog lists;
+    answering with its chunks would be the answer this change replaced.
+    """
+    pipeline = _collections_pipeline(settings)
+    # Written the way this service wrote a source before it stored documents: the
+    # content and its order, and nothing describing what it was converted from.
+    pipeline._store.replace(
+        "old.txt",
+        name="old.txt",
+        source_type="file",
+        collections=[],
+        chunk_count=2,
+        content_hash="digest",
+        positions={},
+    )
+    pipeline.refresh()
+
+    record, document = pipeline.source_content("old.txt")
+
+    assert record.name == "old.txt"
+    assert document is None
 
 
 def test_the_content_read_embeds_nothing(settings, monkeypatch):
-    """The read walks what is stored, so no model is consulted to answer it."""
+    """The read returns what is stored, so no model is consulted to answer it."""
     pipeline = _collections_pipeline(settings)
     pipeline.converter.convert_file.return_value = SENTENCE_DOC
     pipeline.ingest_file(source_id="doc", file=BytesIO(b"x"), filename="doc.txt")
@@ -3059,16 +3111,16 @@ def test_the_content_read_embeds_nothing(settings, monkeypatch):
     exploding.get_text_embedding.side_effect = AssertionError("the content read must not embed")
     monkeypatch.setattr(pipeline, "_embedding_model", exploding)
 
-    _record, chunks = pipeline.source_content("doc.txt")
+    _record, document = pipeline.source_content("doc.txt")
 
-    assert chunks
+    assert document
 
 
 def test_the_content_read_takes_the_index_lock(settings):
-    """A replacement rewrites nodes, records and positions together.
+    """A replacement rewrites the document, records and positions together.
 
-    A reader outside the lock could take one ingestion's nodes against another's
-    positions, so the read holds what the writes hold.
+    A reader outside the lock could take one ingestion's document against another's
+    metadata, so the read holds what the writes hold.
     """
     pipeline = _collections_pipeline(settings)
     pipeline.converter.convert_file.return_value = SENTENCE_DOC

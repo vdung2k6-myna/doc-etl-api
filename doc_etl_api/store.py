@@ -89,7 +89,10 @@ class IndexStore(Protocol):
     """What the pipeline asks of wherever its index lives.
 
     The catalog half -- `records`, `positions` and `replace` -- is what the
-    pipeline reads and writes to describe its sources. `storage_context` is what
+    pipeline reads and writes to describe its sources, and `document` and
+    `store_document` are the text that description is about: what each source was
+    converted into, kept so that a content read can answer with the document
+    itself rather than with the chunks cut from it. `storage_context` is what
     the index is built on, `store_nodes_override` decides whether the docstore
     keeps the text when the vector store also keeps it, and `close` gives the
     pipeline a store-agnostic way to hand resources back.
@@ -115,6 +118,39 @@ class IndexStore(Protocol):
     def records(self) -> tuple[SourceRecord, ...]: ...
 
     def positions(self, address: str) -> dict[str, int]: ...
+
+    def document(self, address: str) -> str | None:
+        """The document *address* was converted into, or None where none was captured.
+
+        The document is the markdown the source was converted into, which is the
+        text its chunks were cut from. The chunks are not it: a heading repeats in
+        every node of its section, a unit below the floor merges into a neighbour,
+        and text repeated inside one source is stored once.
+
+        It is kept beside the catalog rather than in it, because the catalog
+        answers what a collection holds -- the listing, the readiness counts, and
+        whether a source needs ingesting at all -- and none of those reads should
+        carry a document along with the row it is reading.
+
+        None and "" are two different answers, and both are returned as
+        themselves. A source that converted to nothing holds an empty document. A
+        source whose document was never captured holds none -- which is every
+        source ingested before documents were stored, until it is ingested again.
+        Collapsing the two would report a source that converted to nothing as one
+        this service can say nothing about.
+        """
+        ...
+
+    def store_document(self, address: str, text: str) -> None:
+        """Write *address*'s document, replacing whatever it stored before.
+
+        Called inside the same `transaction` as the record and the chunks, and
+        after them: what a source is, what it holds and what it was converted from
+        then commit together or not at all, so no reader can find a document
+        describing an ingestion the index did not receive. The record's write
+        comes first because it is what claims the source's row.
+        """
+        ...
 
     @property
     def index_struct_is_stored(self) -> bool:
@@ -179,6 +215,7 @@ class InProcessIndexStore:
     def __init__(self) -> None:
         self._records: dict[str, SourceRecord] = {}
         self._positions: dict[str, dict[str, int]] = {}
+        self._documents: dict[str, str] = {}
 
     @property
     def storage_context(self) -> StorageContext | None:
@@ -201,6 +238,18 @@ class InProcessIndexStore:
 
     def positions(self, address: str) -> dict[str, int]:
         return dict(self._positions.get(address, {}))
+
+    def document(self, address: str) -> str | None:
+        """Absence and emptiness kept apart, as the protocol requires of both.
+
+        An address never written reads as None and one written empty reads as "",
+        which is the difference between a source whose document was not captured
+        and one that converted to nothing.
+        """
+        return self._documents.get(address)
+
+    def store_document(self, address: str, text: str) -> None:
+        self._documents[address] = text
 
     @property
     def index_struct_is_stored(self) -> bool:
@@ -461,6 +510,29 @@ class PostgresIndexStore:
             sqlalchemy.Column("node_id", sqlalchemy.Text, primary_key=True),
             sqlalchemy.Column("position", sqlalchemy.Integer, nullable=False),
         )
+        # The document each source was converted into, one row per source, keyed
+        # like the catalog row it sits beside. A table of its own rather than a
+        # column on the source row, because the catalog answers what the index
+        # holds -- the listing, the readiness counts, and whether a source needs
+        # ingesting -- and a document carried in that row would be dragged through
+        # every one of those reads. The foreign key is what keeps a document from
+        # outliving the source it describes, and it cascades, so removing a source
+        # removes what it was converted from with it. The text is not nullable:
+        # a stored document is the text that was converted, and a source that
+        # converted to nothing is an empty string rather than an absent row --
+        # which is what keeps "no document was captured" a different answer from
+        # "the document is empty".
+        self._documents = sqlalchemy.Table(
+            f"{base}_documents",
+            metadata,
+            sqlalchemy.Column(
+                "address",
+                sqlalchemy.Text,
+                sqlalchemy.ForeignKey(f"{base}_sources.address", ondelete="CASCADE"),
+                primary_key=True,
+            ),
+            sqlalchemy.Column("document", sqlalchemy.Text, nullable=False),
+        )
         # One row, and it is the collection's own record of which model built it.
         # The width of the vector column is what the database enforces; this row
         # is what lets a mismatch name both models instead of only two numbers.
@@ -624,6 +696,37 @@ class PostgresIndexStore:
                 )
             ).all()
         return {row.node_id: row.position for row in rows}
+
+    def document(self, address: str) -> str | None:
+        """The stored document, reached by primary key rather than by scan.
+
+        One indexed lookup, so a content read costs one row however much the
+        collection holds -- which matters because the documents table is the one
+        table here whose rows are whole documents.
+        """
+        with self._engine.connect() as connection:
+            return connection.execute(
+                sqlalchemy.select(self._documents.c.document).where(
+                    self._documents.c.address == address
+                )
+            ).scalar_one_or_none()
+
+    def store_document(self, address: str, text: str) -> None:
+        """Write *address*'s document, replacing what it stored before.
+
+        An upsert, so a re-ingestion replaces the document rather than adding a
+        second one beside it: what a source was converted into is the conversion
+        of the content the index holds for it, and never the one before.
+        """
+        with self._write_connection() as connection:
+            connection.execute(
+                postgresql.insert(self._documents)
+                .values(address=address, document=text)
+                .on_conflict_do_update(
+                    index_elements=[self._documents.c.address],
+                    set_={"document": text},
+                )
+            )
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:

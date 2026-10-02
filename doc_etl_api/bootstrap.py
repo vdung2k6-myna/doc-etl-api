@@ -293,8 +293,12 @@ def ingest_corpus(
         def ingest_file(target: Path = path, tag: list[str] = file_tag) -> None:
             # Read whole before deciding, and read only: nothing is parsed,
             # chunked or embedded for a file the index holds as it now stands.
+            # Both halves of that -- the content is current, and its document was
+            # captured -- are asked, because a source ingested before this service
+            # stored documents is current and has none, and the parse this skips is
+            # the one that would capture it.
             payload, digest = file_content(target)
-            if pipeline.is_current(target.name, digest, tag):
+            if pipeline.is_current(target.name, digest, tag) and pipeline.has_document(target.name):
                 skip(target.name)
                 return
             pipeline.ingest_file(
@@ -346,9 +350,14 @@ def ingest_corpus(
         def ingest_url(target: str = url) -> None:
             # Fetched, because a page's content cannot be known without asking
             # for it, then compared before anything parses it. The fetch is the
-            # cost this cannot avoid; the conversion is the cost it saves.
+            # cost this cannot avoid; the conversion is the cost it saves -- and
+            # it is saved only for a source that holds a document as well as
+            # current content, so a page the index holds from before this service
+            # stored documents is fetched, converted and captured once more.
             body, digest, final_url = url_content(target)
-            if pipeline.is_current(final_url, digest, collections):
+            if pipeline.is_current(final_url, digest, collections) and pipeline.has_document(
+                final_url
+            ):
                 skip(target)
                 return
             pipeline.ingest_page(

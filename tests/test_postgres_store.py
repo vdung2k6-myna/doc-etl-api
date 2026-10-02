@@ -39,7 +39,7 @@ from doc_etl_api.claims import claim_heartbeat
 from doc_etl_api.config import Settings, VectorStoreBackend
 from doc_etl_api.main import create_app
 from doc_etl_api.pipeline import IndexPipeline, _node_id, content_hash, create_pipeline
-from doc_etl_api.store import DurableStoreError, PostgresIndexStore
+from doc_etl_api.store import DurableStoreError, IndexStore, InProcessIndexStore, PostgresIndexStore
 from tests.stubs import EMBEDDING_MODEL_NAME, StubEmbedding
 
 DATABASE_URL = os.environ.get("DOC_ETL_API_TEST_POSTGRES_URL", "")
@@ -59,7 +59,7 @@ import os
 from tests.test_postgres_store import _create, _settings
 
 pipeline = _create(_settings(table=os.environ["PROBE_TABLE"]))
-record, chunks = pipeline.source_content("docs.txt")
+record, document = pipeline.source_content("docs.txt")
 print(
     json.dumps(
         {
@@ -67,7 +67,8 @@ print(
             "address": record.address,
             "digest": record.content_hash,
             "collections": list(record.collections),
-            "positions": [chunk["position"] for chunk in chunks],
+            "positions": sorted(pipeline._store.positions("docs.txt").values()),
+            "document": document,
         }
     )
 )
@@ -165,6 +166,7 @@ def _drop_collection(table: str) -> None:
         f"data_{table}_docstore",
         f"{table}_sources",
         f"{table}_positions",
+        f"{table}_documents",
         f"{table}_model",
         f"{table}_jobs",
         f"{table}_claims",
@@ -361,10 +363,9 @@ def test_a_rebuilt_pipeline_holds_what_the_last_one_ingested(restarted):
         record.chunk_count for record in restarted.source_catalog
     )
 
-    record, chunks = restarted.source_content("docs.txt")
+    record, document = restarted.source_content("docs.txt")
     assert record.collections == ("csharp",)
-    assert [chunk["position"] for chunk in chunks] == list(range(len(chunks)))
-    assert all(chunk["text"].strip() for chunk in chunks)
+    assert document == LONG_DOC, "the document the source was converted from did not survive"
 
     hits = restarted.search("reading order", top_k=5, neighbours=1)
     assert hits
@@ -433,11 +434,83 @@ def test_re_ingesting_a_source_replaces_it_after_a_restart(collection):
     _ingest(rebuilt, "docs.txt", PARAGRAPH, collections=["csharp"])
 
     assert rebuilt.indexed_sources == 1
-    record, chunks = rebuilt.source_content("docs.txt")
-    assert len(chunks) == record.chunk_count < longest, "the replaced content is still stored"
+    record, document = rebuilt.source_content("docs.txt")
+    assert document == PARAGRAPH, "the replaced content is still stored"
+    assert record.chunk_count < longest
     assert _row_count(f"{rebuilt._store.vector_table_name}") == record.chunk_count
     assert _row_count(f"{collection}_positions") == record.chunk_count
     rebuilt._store.close()
+
+
+# What both backends owe a document, asserted once for each of them. The durable
+# parameter needs the database and is skipped without one; the in-process
+# parameter never does, so the contract is still asserted where none is configured.
+_DOCUMENT_BACKENDS = [
+    pytest.param("in-process", id="in-process"),
+    pytest.param("postgres", id="postgres", marks=needs_database),
+]
+
+
+@pytest.fixture
+def document_store(request) -> Iterator[IndexStore]:
+    """An empty store, one backend at a time.
+
+    Built here rather than through the ``collection`` fixture, which drops tables
+    and so needs the database: the in-process parameter has to run whether or not
+    one is configured.
+    """
+    if request.param == "in-process":
+        yield InProcessIndexStore()
+        return
+
+    name = f"doc_etl_api_test_{next(_COLLECTIONS)}"
+    _drop_collection(name)
+    store = PostgresIndexStore(_settings(table=name), StubEmbedding(embed_dim=8))
+    try:
+        yield store
+    finally:
+        store.close()
+        _drop_collection(name)
+
+
+@pytest.mark.parametrize("document_store", _DOCUMENT_BACKENDS, indirect=True)
+def test_a_document_is_read_back_whole_and_absence_is_not_emptiness(
+    document_store: IndexStore,
+):
+    """A document is stored, replaced and read back, and None is not "".
+
+    Both halves of the answer are the store's, not the backend's. A source that
+    converted to nothing holds an empty document, and a source whose document was
+    never captured holds none: a reader that could not tell those apart would
+    report the second as the first.
+
+    Each source is recorded before its document is written, which is the order the
+    pipeline writes them in -- and, on the durable backend, the order the
+    document's foreign key requires.
+    """
+    for address in ("docs.txt", "empty.md"):
+        document_store.replace(
+            address,
+            name=address,
+            source_type="file",
+            collections=["handbook"],
+            chunk_count=0,
+            content_hash="digest",
+            positions={},
+        )
+
+    document_store.store_document("docs.txt", LONG_DOC)
+    assert document_store.document("docs.txt") == LONG_DOC
+
+    # Storing again replaces what was there rather than adding beside it: the
+    # document a source holds is the conversion of the content the index holds.
+    document_store.store_document("docs.txt", PARAGRAPH)
+    assert document_store.document("docs.txt") == PARAGRAPH
+
+    document_store.store_document("empty.md", "")
+    assert document_store.document("empty.md") == ""
+
+    assert document_store.document("never-ingested.txt") is None
 
 
 # --- Both startup paths together, through the routes --------------------------
@@ -487,8 +560,9 @@ def test_a_restart_keeps_both_an_uploaded_document_and_a_configured_corpus(
     """A restart over a real Postgres, through the routes, with both paths live.
 
     What a restart has to bring back is everything a running service answers
-    from: the search that finds a document, the content endpoint that returns its
-    chunks in reading order, the catalog that reports both sources, and the
+    from: the search that finds a document, the content endpoint that returns the
+    document the upload was converted into, the catalog that reports both
+    sources, and the
     collections that scope a search to one of them. The corpus is configured so
     that the same startup also has to decide what it already holds -- including
     the document a caller uploaded before the restart, which is not in the corpus
@@ -503,8 +577,9 @@ def test_a_restart_keeps_both_an_uploaded_document_and_a_configured_corpus(
     corpus.mkdir()
     contents = {
         "guide.txt": "# Guide\n\nThe STAR method structures behavioural answers.",
-        # Long enough to be stored as several chunks, so the content endpoint's
-        # reading order is an order rather than a single value.
+        # Long enough to be stored as several chunks, so the restart has both a
+        # document and a chunk count to bring back, and a reader can tell a count
+        # that came back from one that was recomputed.
         "handbook.txt": "\n\n".join(
             [
                 "# Handbook",
@@ -568,10 +643,13 @@ def test_a_restart_keeps_both_an_uploaded_document_and_a_configured_corpus(
 
     body = restarted.get("/sources/content", params={"address": "handbook.txt"}).json()
     assert body["name"] == "handbook.txt"
-    positions = [chunk["position"] for chunk in body["chunks"]]
-    assert body["chunks"], "the content endpoint returned no chunks after the restart"
-    assert positions == list(range(len(positions))), "the chunks came back out of order"
-    assert "XYZZY" in " ".join(chunk["text"] for chunk in body["chunks"])
+    # The document comes back whole, exactly as the conversion produced it -- not
+    # reassembled from chunks, whose boundaries and separators a restart would have
+    # had to guess at.
+    assert body["document"] == contents["handbook.txt"], (
+        "the content endpoint did not return the document the upload was converted into"
+    )
+    assert body["chunk_count"] > 2, "the content endpoint lost the source's chunk count"
 
     scoped = restarted.post(
         "/search", json={"query": "conventions", "top_k": 10, "collections": ["csharp"]}
@@ -580,6 +658,171 @@ def test_a_restart_keeps_both_an_uploaded_document_and_a_configured_corpus(
     assert {result["source_name"] for result in scoped} == {"handbook.txt"}
 
     second.state.pipeline._store.close()
+
+
+def _conversion_counting_stub(file_text: str, page_text: str, conversions: list[str]) -> MagicMock:
+    """A converter over one corpus file and one corpus page, counting conversions.
+
+    Both kinds of source are served because a corpus can hold both, and the two
+    reach their document by different routes: a file's bytes are read from disk,
+    while a page's body is fetched and reduced to its main content before it is
+    converted. The count is what a restart is judged by, so only the conversions are
+    recorded -- the fetch is not one.
+    """
+    converter = MagicMock()
+    converter.is_supported_file.return_value = True
+    converter.SUPPORTED_FILE_EXTENSIONS = {".txt"}
+
+    def convert_file(_file, filename):
+        conversions.append(filename)
+        return file_text
+
+    def fetch_page(target, **_kwargs):
+        return b"<html><body><p>Grounding content.</p></body></html>", target
+
+    def convert_page(_body, target):
+        conversions.append(target)
+        return page_text
+
+    converter.convert_file.side_effect = convert_file
+    converter.fetch_page.side_effect = fetch_page
+    converter.convert_page.side_effect = convert_page
+    return converter
+
+
+@needs_database
+def test_a_restart_keeps_a_document_for_a_corpus_file_and_a_corpus_page(
+    monkeypatch, tmp_path, collection
+):
+    """A corpus of a file and a page comes back with both documents, converted once.
+
+    Four observations against one database: the first boot converts each corpus
+    source and stores its document, the content endpoint returns that document for
+    each, the second boot over the unchanged corpus converts neither, and both
+    documents still read back. The two sources are here because they reach the
+    document by different routes -- bytes read from disk against a body fetched and
+    reduced to its main content -- so neither is evidence for the other.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    file_text = "# Guide\n\nThe STAR method structures behavioural answers."
+    (corpus / "guide.txt").write_text(file_text)
+    url = "https://example.com/archive"
+    page_text = "# Archive\n\nGrounding content for the answers."
+
+    app_settings = _settings(
+        table=collection,
+        knowledge_corpus_dir=str(corpus),
+        knowledge_corpus_urls=url,
+    )
+    monkeypatch.setattr("doc_etl_api.main.settings", app_settings)
+
+    first_conversions: list[str] = []
+    first = _started_app(
+        _conversion_counting_stub(file_text, page_text, first_conversions), app_settings
+    )
+    client = TestClient(first)
+    assert isinstance(first.state.pipeline._store, PostgresIndexStore)
+
+    assert _wait_for_bootstrap(client) == "complete"
+    assert sorted(first_conversions) == sorted(["guide.txt", url]), (
+        "the first boot did not convert each corpus source"
+    )
+    assert (
+        client.get("/sources/content", params={"address": "guide.txt"}).json()["document"]
+        == file_text
+    ), "the file's document was not stored"
+    assert client.get("/sources/content", params={"address": url}).json()["document"] == (
+        page_text
+    ), "the page's document was not stored"
+    first.state.pipeline._store.close()
+
+    # The restart: a second application over the same collection, with the same
+    # corpus configured.
+    second_conversions: list[str] = []
+    second = _started_app(
+        _conversion_counting_stub(file_text, page_text, second_conversions), app_settings
+    )
+    restarted = TestClient(second)
+
+    assert _wait_for_bootstrap(restarted) == "complete"
+    assert second_conversions == [], "the second boot converted a corpus it already held"
+    assert (
+        restarted.get("/sources/content", params={"address": "guide.txt"}).json()["document"]
+        == file_text
+    ), "the file's document did not survive the restart"
+    assert restarted.get("/sources/content", params={"address": url}).json()["document"] == (
+        page_text
+    ), "the page's document did not survive the restart"
+    second.state.pipeline._store.close()
+
+
+@needs_database
+def test_a_source_stored_before_documents_were_kept_gains_one_at_the_next_boot(
+    tmp_path, collection
+):
+    """The upgrade path: an index from before this change is brought forward once.
+
+    The source is seeded the way this service left one before it stored documents --
+    ingested in full, with its record, its positions and its nodes, and nothing
+    describing what it was converted from. That state is built by ingesting the
+    source and removing its document rather than by writing a record by hand, so the
+    chunk count and the content hash the capture has to leave alone are ones a real
+    ingestion produced.
+
+    Booting over that corpus ingests the source once more, which is what captures its
+    document, and leaves the rest of the source as it was: the same content converted
+    the same way describes the same chunks.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    text = "# Guide\n\nThe STAR method structures behavioural answers."
+    (corpus / "guide.txt").write_bytes(text.encode())
+    settings = _settings(table=collection, knowledge_corpus_dir=str(corpus))
+
+    seed = _create(settings, markdown=text)
+    try:
+        _ingest(seed, "guide.txt", text, payload=text.encode())
+        seeded = seed.source_content("guide.txt")
+        assert seeded is not None
+        before_record, before_document = seeded
+        assert before_document == text
+        assert before_record.chunk_count > 0, "the fixture stored an empty source"
+
+        engine = _observing_engine()
+        try:
+            with engine.begin() as connection:
+                removed = connection.execute(
+                    sqlalchemy.text(
+                        f'DELETE FROM "{collection}_documents" WHERE address = :address'
+                    ),
+                    {"address": "guide.txt"},
+                ).rowcount
+            assert removed == 1, "the fixture did not remove a document"
+            assert _committed_document(engine, collection, "guide.txt") is None
+        finally:
+            engine.dispose()
+    finally:
+        seed._store.close()
+
+    parsed: list[str] = []
+    boot = _corpus_pipeline(settings, {"guide.txt": text}, parsed)
+    try:
+        state = BootstrapState()
+        ingest_corpus(boot, settings, state)
+
+        assert state.status is BootstrapStatus.COMPLETE, state.failures
+        assert parsed == ["guide.txt"], "the source was not converted again"
+        boot_record, boot_document = boot.source_content("guide.txt")
+        assert boot_document == text, "the capture did not leave the source a document"
+        assert boot_record.chunk_count == before_record.chunk_count, (
+            "the capture changed the chunks the source holds"
+        )
+        assert boot_record.content_hash == before_record.content_hash, (
+            "the capture changed the digest the source is recorded under"
+        )
+    finally:
+        boot._store.close()
 
 
 @needs_database
@@ -665,17 +908,27 @@ def test_a_search_is_answered_while_an_ingestion_writes(monkeypatch, tmp_path, c
         assert answered.status_code == 200, answered.text
         results = answered.json()["results"]
         assert results, "the search returned nothing rather than the corpus it holds"
-        # Every hit has to be a chunk a source holds, whole: a source served while
-        # it was being written would come back as a passage with no source, a
-        # splice of two documents, or a chunk of one that is not in it any more.
-        held = {
-            chunk["text"]
-            for name in contents
-            for chunk in client.get("/sources/content", params={"address": name}).json()["chunks"]
-        }
-        assert len(held) >= len(contents), "the sources were not stored as whole chunks"
+
+        # Every hit has to be a chunk of the document its own source holds: a source
+        # read while it was being written would hand back a passage from another
+        # document, or one document's text spliced into another's. The whole-document
+        # read is what makes that visible -- a chunk list could agree with a
+        # splintered document a piece at a time. Whitespace is compared collapsed,
+        # because a chunk is a section of the markdown with its breaks flattened,
+        # not a byte range of it.
+        def held_by(name: str) -> str:
+            body = client.get("/sources/content", params={"address": name}).json()
+            assert body["document"] is not None, f"{name} came back carrying no document"
+            return " ".join(body["document"].split())
+
+        documents = {name: held_by(name) for name in contents}
+        assert len(set(documents.values())) == len(contents), (
+            "a source holds text belonging to more than one document"
+        )
         for result in results:
-            assert result["text"] in held, "a result came back carrying text no source holds"
+            assert " ".join(result["text"].split()) in documents[result["source_name"]], (
+                "a result came back carrying text the source it names does not hold"
+            )
 
         # Both sources whole and searchable once the job has run, which is what
         # says the two requests overlapped rather than one happening after the
@@ -727,6 +980,9 @@ def test_a_second_process_reads_what_this_one_ingested(collection):
     assert read_back["digest"] == written.content_hash
     assert read_back["collections"] == ["csharp"]
     assert read_back["positions"] == list(range(written.chunk_count))
+    assert read_back["document"] == LONG_DOC, (
+        "the second process did not read the document this one stored"
+    )
 
 
 def _committed_state(engine, table: str, address: str) -> tuple[int, int, int]:
@@ -756,6 +1012,21 @@ def _committed_state(engine, table: str, address: str) -> tuple[int, int, int]:
             {"address": address},
         ).scalar_one()
     return (recorded or 0, held, positioned)
+
+
+def _committed_document(engine, table: str, address: str) -> str | None:
+    """The document one committed instant holds for a source, or None for none.
+
+    Read on a connection of its own, like `_committed_state`: the question it
+    answers is what another instance finds, not what the instance that wrote it
+    has in hand. None here is the store's own absence -- no document was captured
+    for this source -- rather than an empty document, which reads as "".
+    """
+    with engine.connect() as connection:
+        return connection.execute(
+            sqlalchemy.text(f'SELECT document FROM "{table}_documents" WHERE address = :address'),
+            {"address": address},
+        ).scalar_one_or_none()
 
 
 def _observing_engine():
@@ -816,13 +1087,10 @@ def test_two_instances_ingesting_one_filename_end_with_one_copy(collection):
     # writers each hold a catalog snapshot of their own that only their own
     # ingestion refreshed.
     reader = _create(_settings(table=collection), markdown=ALPHA_DOC)
-    record, chunks = reader.source_content("shared.txt")
+    record, document = reader.source_content("shared.txt")
 
     assert record.chunk_count in (alpha_chunks, bravo_chunks), (
         "the source holds a chunk count belonging to neither ingestion"
-    )
-    assert len(chunks) == record.chunk_count, (
-        "the source holds more or fewer chunks than it records"
     )
     assert _committed_state(_observing_engine(), collection, "shared.txt") == (
         record.chunk_count,
@@ -830,9 +1098,11 @@ def test_two_instances_ingesting_one_filename_end_with_one_copy(collection):
         record.chunk_count,
     )
 
-    # And the copy is one document's, whole: only one of the two markers is in it.
-    text = " ".join(chunk["text"] for chunk in chunks)
-    assert ("ALPHAMARK" in text) != ("BRAVOMARK" in text), "the source holds both documents"
+    # And the document is one document's, whole: only one of the two markers is in
+    # it. A document written beside the chunks rather than with them would be read
+    # here as the losing ingestion's text against the winning one's chunk count.
+    assert document is not None
+    assert ("ALPHAMARK" in document) != ("BRAVOMARK" in document), "the source holds both documents"
 
     for pipeline in (alpha, bravo, measured, reader):
         pipeline._store.close()
@@ -931,7 +1201,14 @@ def test_a_search_on_another_instance_never_sees_a_half_replaced_source(collecti
     writer = _create(_settings(table=collection), markdown=ALPHA_DOC)
     _ingest(writer, "shared.txt", ALPHA_DOC)
     reader = _create(_settings(table=collection), markdown=ALPHA_DOC)
-    earlier = {chunk["text"] for chunk in reader.source_content("shared.txt")[1]}
+    earlier_document = reader.source_content("shared.txt")[1]
+    assert earlier_document is not None and "ALPHAMARK" in earlier_document, (
+        "the reader does not serve the earlier copy"
+    )
+    # The set the searches below are compared against comes from a search, the same
+    # way they do, so a search that returned fewer chunks than the source holds
+    # would not read as a source that had changed.
+    earlier = {hit["text"] for hit in reader.search("The index keeps every chunk", 10)}
     assert earlier and any("ALPHAMARK" in text for text in earlier)
 
     original = type(writer._index).insert_nodes
@@ -979,6 +1256,11 @@ def test_a_search_on_another_instance_never_sees_a_half_replaced_source(collecti
     replaced = {hit["text"] for hit in reader.search("The index keeps every chunk", 10)}
     assert any("BRAVOMARK" in text for text in replaced), "the replacement never became searchable"
     assert not (replaced & earlier), "the reader returned what the replacement came for as well"
+    replaced_document = reader.source_content("shared.txt")[1]
+    assert replaced_document is not None and "BRAVOMARK" in replaced_document, (
+        "the replacement's document is not the one the source now holds"
+    )
+    assert "ALPHAMARK" not in replaced_document, "the source holds the copy it replaced"
 
     during = [texts for texts, writing in searches if writing]
     assert during, "no search was served while the replacement was half done"
@@ -1011,15 +1293,17 @@ def test_ingesting_one_document_twice_leaves_the_same_node_ids(durable, collecti
     """
     _ingest(durable, "docs.txt", LONG_DOC)
     first = durable._store.positions("docs.txt")
-    first_chunks = durable.source_content("docs.txt")[1]
+    _, first_document = durable.source_content("docs.txt")
     assert len(first) > 1, "the document was stored as one chunk"
 
     _ingest(durable, "docs.txt", LONG_DOC)
     second = durable._store.positions("docs.txt")
-    second_chunks = durable.source_content("docs.txt")[1]
+    _, second_document = durable.source_content("docs.txt")
 
     assert second == first, "a second ingestion of the same content named different nodes"
-    assert second_chunks == first_chunks, "the replay stored content the first ingestion did not"
+    assert second_document == first_document == LONG_DOC, (
+        "the replay stored a document the first ingestion did not"
+    )
     assert set(first) == {_node_id("docs.txt", position) for position in range(len(first))}
 
     engine = _observing_engine()
@@ -1075,14 +1359,65 @@ def test_a_replacement_that_fails_leaves_the_earlier_content_in_place(
     # answer is what is stored and not what the interrupted ingestion cached.
     reader = _create(_settings(table=collection), markdown=ALPHA_DOC)
     try:
-        record, chunks = reader.source_content("docs.txt")
+        record, document = reader.source_content("docs.txt")
         assert record == before_record, "the interrupted replacement rewrote the record"
-        assert len(chunks) == record.chunk_count, "the source came back short of its record"
-        text = " ".join(chunk["text"] for chunk in chunks)
-        assert "ALPHAMARK" in text, "the earlier document is not in the source"
-        assert "BRAVOMARK" not in text, "the replacement is in the source it failed to be"
+        assert document is not None
+        assert "ALPHAMARK" in document, "the earlier document is not in the source"
+        assert "BRAVOMARK" not in document, "the replacement is in the source it failed to be"
     finally:
         reader._store.close()
+
+
+@needs_database
+def test_a_document_commits_only_with_the_replacement_it_is_written_in(durable, collection):
+    """A document is never published apart from the source it describes.
+
+    The document is written by a call of its own, inside the replacement's
+    transaction, so the ordering that matters is the commit's rather than the
+    calls': a replacement that stops after writing the document and before
+    committing must leave the database holding the earlier document, the earlier
+    record and the earlier positions -- not a document describing content the
+    index never received.
+
+    The write is interrupted at its last possible moment, after every write the
+    replacement makes and before the transaction is allowed to commit, and read
+    back on a second connection, which is where a reader on another instance would
+    arrive.
+    """
+    store = durable._store
+    engine = _observing_engine()
+
+    def write(address: str, *, name: str, document: str, chunks: int) -> None:
+        store.replace(
+            address,
+            name=name,
+            source_type="file",
+            collections=["csharp"],
+            chunk_count=chunks,
+            content_hash="digest",
+            positions={f"node-{position}": position for position in range(chunks)},
+        )
+        store.store_document(address, document)
+
+    try:
+        with store.transaction():
+            write("docs.txt", name="docs.txt", document=ALPHA_DOC, chunks=1)
+        assert _committed_document(engine, collection, "docs.txt") == ALPHA_DOC
+        before = _committed_state(engine, collection, "docs.txt")
+
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                write("docs.txt", name="docs.txt", document=BRAVO_DOC, chunks=2)
+                raise RuntimeError("the replacement was interrupted")
+
+        assert _committed_document(engine, collection, "docs.txt") == ALPHA_DOC, (
+            "the interrupted replacement published a document of its own"
+        )
+        assert _committed_state(engine, collection, "docs.txt") == before, (
+            "the document's write reached the database without the record's"
+        )
+    finally:
+        engine.dispose()
 
 
 # --- A corpus, and the several instances that start from it -------------------

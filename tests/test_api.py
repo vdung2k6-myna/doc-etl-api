@@ -1070,10 +1070,10 @@ def _catalog_record(**overrides) -> SourceRecord:
     return SourceRecord(**fields)
 
 
-def test_a_sources_content_is_returned_with_its_positions(client):
+def test_a_sources_content_is_returned_with_its_catalog_entry(client):
     client.app.state.pipeline.source_content.return_value = (
         _catalog_record(),
-        [{"text": "first chunk", "position": 0}, {"text": "second chunk", "position": 1}],
+        "# Report\n\nThe document as it was converted.",
     )
 
     response = client.get("/sources/content", params={"address": "report.pdf"})
@@ -1083,9 +1083,9 @@ def test_a_sources_content_is_returned_with_its_positions(client):
     assert body["name"] == "report.pdf"
     assert body["source_type"] == "file"
     assert body["collections"] == ["csharp"]
-    assert [chunk["position"] for chunk in body["chunks"]] == [0, 1]
-    assert [chunk["text"] for chunk in body["chunks"]] == ["first chunk", "second chunk"]
-    assert len(body["chunks"]) == body["chunk_count"], "the count does not describe the chunks"
+    assert body["chunk_count"] == 2
+    assert body["document"] == "# Report\n\nThe document as it was converted."
+    assert "chunks" not in body, "the endpoint still reports the chunks it replaced"
     client.app.state.pipeline.source_content.assert_called_once_with("report.pdf")
 
 
@@ -1102,7 +1102,7 @@ def test_a_source_holding_no_chunks_is_returned_empty_rather_than_missing(client
     """A source that stored nothing is a source, not an unknown address."""
     client.app.state.pipeline.source_content.return_value = (
         _catalog_record(name="empty.txt", address="empty.txt", collections=(), chunk_count=0),
-        [],
+        "",
     )
 
     response = client.get("/sources/content", params={"address": "empty.txt"})
@@ -1110,7 +1110,24 @@ def test_a_source_holding_no_chunks_is_returned_empty_rather_than_missing(client
     assert response.status_code == 200
     body = response.json()
     assert body["name"] == "empty.txt"
-    assert body["chunks"] == []
+    assert body["document"] == ""
+
+
+def test_a_source_whose_document_was_not_captured_is_reported_without_one(client):
+    """A source from before documents were stored is reported, without one.
+
+    Not rejected as an unknown address, which would deny a source the catalog
+    lists, and not answered with its chunks, which is the answer this replaced.
+    """
+    client.app.state.pipeline.source_content.return_value = (_catalog_record(), None)
+
+    response = client.get("/sources/content", params={"address": "report.pdf"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "report.pdf"
+    assert body["chunk_count"] == 2
+    assert body["document"] is None
 
 
 async def test_the_content_read_runs_off_the_event_loop(client):
@@ -1120,7 +1137,7 @@ async def test_the_content_read_runs_off_the_event_loop(client):
 
     def record_read(address):
         read_threads.append(threading.get_ident())
-        return (_catalog_record(address=address), [{"text": "chunk", "position": 0}])
+        return (_catalog_record(address=address), "the document")
 
     app.state.pipeline.source_content.side_effect = record_read
 

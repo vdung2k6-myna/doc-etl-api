@@ -425,19 +425,15 @@ Response:
   "source_type": "file",
   "collections": ["handbook"],
   "chunk_count": 3,
-  "chunks": [
-    {"text": "Docling converts documents to structured markdown...", "position": 0},
-    {"text": "Tables become markdown tables...", "position": 1},
-    {"text": "Headings survive as markdown headings...", "position": 2}
-  ]
+  "document": "# Docling\n\nDocling converts documents to structured markdown...\n\nTables become markdown tables..."
 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `name`, `source_type`, `collections` | The source's catalog entry, reported as `/sources` reports it. |
-| `chunk_count` | How many chunks the index stores for the source, equal to the length of `chunks`. |
-| `chunks` | Every stored chunk of the source, in reading order, each as `text` and its zero-based `position`. None carries a score: nothing was ranked. |
+| `chunk_count` | How many chunks the index stores for the source. It is not the length of anything in this response: the document is returned whole, not chunked. |
+| `document` | The markdown the source was converted into, as the conversion produced it — the text the source's chunks were cut from. `null` for a source whose document was not captured. |
 
 `address` is required, and it is the address the catalog reports, which is where
 you find it — see [List indexed sources](#list-indexed-sources). For a file it is
@@ -450,18 +446,29 @@ curl --get "http://localhost:8000/sources/content" \
   --data-urlencode "address=https://example.com/archive/index.html"
 ```
 
-The content is what was chunked and indexed, which is not a copy of the document
-that was submitted: chunking merges a short unit into a neighbour, drops a text a
-merge already stores, and carries a repeated heading once rather than once per
-node. This is the text a search returns, in the order it reads — for the passage
-around a single hit, [Neighbours](#neighbours) is cheaper than fetching the whole
-source.
+The content is the converted document, which is not a copy of what was submitted:
+Docling read the file or page and produced markdown, so the marks of the original
+format are gone and its structure is markdown's. Nor is it the chunks. Chunking
+edits what it stores — it merges a unit too small to carry information into a
+neighbour, drops text a merge already holds, and carries a repeated heading once
+rather than once per node — and those edits belong to the chunks, not to this
+document. What the document holds is the text the chunks were cut from, so a
+passage a search returns is a run of it, sometimes merged with the passage beside
+it.
+
+A search returns chunks; this read returns the document they came from. For the
+passage around a single hit, [Neighbours](#neighbours) is cheaper than fetching the
+whole source.
 
 The read performs no retrieval and no embedding, like `/health`, so it stays
 responsive regardless of index size or search load. An address no indexed source
-has is reported as `404`, naming the address that was asked for. A source that
-stored no chunks is a `200` with an empty `chunks` list: it exists, and is simply
-empty, which is a different answer from an address that names nothing.
+has is reported as `404`, naming the address that was asked for. A source that was
+converted to nothing — a page that held no text, say — is a `200` carrying
+`"document": ""`: the conversion happened and produced an empty document. A source
+whose document was not captured is a `200` carrying `"document": null`, which is the
+source it is, reported without a document: one ingested before this service stored
+documents, and not ingested since. Absent and empty are different answers, and
+neither is a `404`.
 
 ### Search
 
@@ -617,8 +624,9 @@ curl -X POST "http://localhost:8000/search" \
   ```
 
   Nothing today returns only the rest of a truncated section: `GET /sources/content`
-  returns a source's stored chunks in position order, which is how a caller reads on
-  past a bounded expansion.
+  returns the whole document the source was converted into, which is the text those
+  chunks were cut from, so a caller that needs to read on fetches it rather than
+  asking for a second section.
 - **They stop at the source boundary**, and inside a collection filter: a section
   never spans two sources, and a scoped search takes sections only from sources in the
   requested collections.
@@ -642,7 +650,7 @@ All settings are loaded from environment variables or an `.env` file. Copy
 | `POSTGRES_DATABASE` | *(empty)* | Database name. Required by the durable backend. |
 | `POSTGRES_USER` | *(empty)* | User the service connects as. Required by the durable backend. Under `docker compose` this is the container's superuser, which is what lets the store create the `vector` extension. |
 | `POSTGRES_PASSWORD` | *(empty)* | That user's password. Required by the durable backend. Special characters are escaped when the connection URL is built, so a password containing `@`, `:` or `/` needs no quoting. |
-| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, this service's own catalog, and each job's record. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
+| `POSTGRES_TABLE_NAME` | `doc_etl_api_index` | Base name for the tables the durable backend owns — the vectors, the chunk text, this service's own catalog, each job's record, and the corpus claims. The catalog is what holds a source's record, the position each of its chunks holds in it, the document it was converted into, and the embedding model the collection was built with. A lowercase SQL identifier, since it reaches statements as one, and the same database can hold several deployments' tables side by side. |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Hugging Face embedding model name. |
 | `CHUNK_SIZE` | the embedding model's input limit | Bounds a node rather than placing its boundary, in the embedding model's tokens, special tokens included. A node's boundaries are the document's own — a heading opens a section, a paragraph break ends a unit — and a unit that fits is stored as itself; only a unit wider than this is divided further, at sentence boundaries, or at row boundaries with the header repeated if it is a table. Unset derives it from the model (256 for the default model), so it tracks the model rather than going stale against it; an explicit value larger than the model's limit is rejected at startup, because such chunks would be truncated before they were embedded. Measured on the corpus this was tuned on, it is a bound rather than a lever: lowering it from 8,192 to 512 moved the node count only from 386 to 404, because all but 10 of the 577 units were already smaller than 512. Set it only to go smaller. |
 | `CHUNK_OVERLAP` | `50` | Overlap, in the same tokens as `CHUNK_SIZE`, applied only where a unit had to be divided at sentence boundaries — the one case where no boundary of the document's own was left to divide on. A node separated from its neighbour at a heading or paragraph boundary therefore repeats nothing: the seam is where the source changed subject, and repeating text across it would store the same text twice. Overlap is quantized to whole sentences, so the achieved overlap can be lower than this, and is zero when a single sentence exceeds the budget. |
@@ -698,22 +706,24 @@ the service at it:
 VECTOR_STORE_BACKEND=postgres python -m doc_etl_api.main
 ```
 
-Four things live in that database, and it is more than one because a durable
+Five things live in that database, and it is more than one because a durable
 index is not one table:
 
 - **The vectors** — held by pgvector, compared by search.
 - **Each chunk's text and metadata** — held by the docstore, in the same
   database, so a hit and the text it points at cannot disagree after a restart.
   Wiring only the vector store would give a half-durable service: search would
-  return hits, and the content endpoint that shows what they say would find
-  nothing to show. pgvector's table carries each chunk's text too, beside its
-  vector, so the text is stored twice — once for search, once for everything
-  that reads content or a hit's neighbours. Both writes are kept on for the
-  durable backend deliberately, and they are two statements rather than one
-  transaction: a chunk costs its text twice over.
+  return hits, and neither a hit's neighbours nor its section would find anything
+  to show. pgvector's table carries each chunk's text too, beside its vector, so
+  the text is stored twice — once for search, once for everything that reads a
+  hit's text, which is the neighbours and the section around it. Both writes are
+  kept on for the durable backend deliberately, and they are two statements rather
+  than one transaction: a chunk costs its text twice over.
 - **This service's own catalog** — the sources, the chunk position of each node
-  for reading order and for neighbours, and the embedding model the collection
-  was built with.
+  for reading order and for neighbours, the document each source was converted
+  into, and the embedding model the collection was built with. The document sits
+  in a table of its own rather than as a column of the source's record, so the
+  catalog answers what the index holds without reading the content it holds.
 - **Each job's record** — its status, result, error, timings, the instance that
   owns it and when that instance last advanced it. Small, but the part of the
   service a caller polling a load-balanced address depends on: it is what lets a
@@ -721,6 +731,11 @@ index is not one table:
   instance stopped be reported `failed` rather than `pending` for as long as the
   row exists. The threshold that decides when is
   `JOB_ORPHAN_THRESHOLD_SECONDS`.
+- **The corpus claims** — one row per corpus source an instance is loading, keyed
+  by the source's address. Short-lived: a claim is gone once its ingestion is, and
+  it is what keeps instances sharing a database from loading one source at once;
+  see [The startup corpus, across several
+  instances](#the-startup-corpus-across-several-instances).
 
 At startup the service connects, enables the extension, creates what is missing
 and validates what it found. It stops rather than serve from a store it cannot
