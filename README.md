@@ -597,8 +597,9 @@ curl -X POST "http://localhost:8000/search" \
   its chunks are matched against each other, so a title page comes back with the text
   it introduces rather than alone.
 - **A section is not a document.** What comes back is the run of stored chunks the
-  hit belongs to, not the file: the parse is not stored and the submitted bytes are
-  deleted after parsing. A section ends where its heading ends, not where a page does.
+  hit belongs to, not the file, and a section ends where its heading ends rather than
+  where a page does. The document those chunks were cut from is stored too, and
+  fetching it is how a caller reads on past a bounded section.
 - **Only the heading a chunk begins with decides membership.** A chunk that swallowed
   a very short section beneath it carries that section's heading inside its text, and
   a rule that looked for a heading anywhere in the chunk would place it in the section
