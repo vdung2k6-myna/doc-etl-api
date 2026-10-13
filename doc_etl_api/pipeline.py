@@ -1079,6 +1079,29 @@ class IndexPipeline:
             and record.collections == tuple(collections)
         )
 
+    def has_document(self, address: str) -> bool:
+        """Whether the index holds a converted document for *address*.
+
+        The second half of the question startup asks about each corpus source,
+        beside `is_current`. A source can be current -- the index holds its
+        content as the source now stands -- and hold no document: one ingested
+        before this service stored documents, and not ingested since. Skipping
+        such a source would leave it readable only as chunks, so the two answers
+        are asked separately and both are required before a source is skipped.
+
+        A document whose conversion produced nothing is still a document, so the
+        answer is whether the source has one rather than whether it holds text;
+        a store that cannot be asked -- an address no source has -- answers no,
+        which is the answer that leads to the source being ingested.
+
+        Read from the store under the index lock rather than from this process's
+        snapshot, for the reason `refresh` gives: what another instance wrote is
+        in the store and not here, and this question is asked to decide whether
+        that work still needs doing.
+        """
+        with self._index_lock:
+            return self._store.document(address) is not None
+
     def refresh(self) -> None:
         """Re-read what the store holds into what this process reports.
 
@@ -1275,6 +1298,7 @@ class IndexPipeline:
         *,
         name: str,
         source_type: str,
+        document: str,
         collections: Sequence[str] = (),
         content_hash: str | None = None,
     ) -> None:
@@ -1294,7 +1318,12 @@ class IndexPipeline:
         nodes, so what a source belongs to cannot drift from what it holds: a
         re-ingestion is always the whole of what that source is. So is the hash of
         the bytes it was ingested from, which is what a later startup compares to
-        decide whether this source needs ingesting at all.
+        decide whether this source needs ingesting at all -- and so is the document
+        it was converted into, which is the text those nodes were cut from. The
+        document is stored beside the record rather than in it, and inside this
+        same transaction, so that what a source is, what it holds and what it was
+        converted from commit together: a reader that could fetch a document the
+        index did not receive would be reading a source the service does not have.
 
         The record is written before the nodes, and that order is load-bearing
         rather than incidental: that write claims the source's row, so a second
@@ -1324,6 +1353,10 @@ class IndexPipeline:
                     # the content before.
                     positions={node.node_id: position for position, node in enumerate(nodes)},
                 )
+                # Written after the record, which is the write that claims the
+                # source's row, and inside this transaction, so that a source's
+                # document is never published apart from the content it describes.
+                self._store.store_document(source_key, document)
                 # After the claim, so that the map read is of a source no other
                 # instance is part way through replacing -- and the index is what
                 # reads that map to find the content being removed.
@@ -1384,6 +1417,7 @@ class IndexPipeline:
             nodes,
             name=filename,
             source_type="file",
+            document=markdown,
             collections=collections,
             content_hash=digest,
         )
@@ -1501,6 +1535,7 @@ class IndexPipeline:
             nodes,
             name=url,
             source_type="url",
+            document=markdown,
             collections=collections,
             content_hash=content_hash(body),
         )
@@ -1620,42 +1655,36 @@ class IndexPipeline:
                 )
         return results
 
-    def source_content(self, address: str) -> tuple[SourceRecord, list[dict]] | None:
-        """Every stored chunk of the source *address* names, in reading order.
+    def source_content(self, address: str) -> tuple[SourceRecord, str | None] | None:
+        """The source *address* names, and the document it was converted into.
 
         None for an address no source has, which is a different answer from a
-        source that stored no chunks: the second is a source, reported with an
-        empty list, and collapsing the two would make "you asked for something
-        that is not here" read the same as "here it is, and it was empty" -- the
-        reason `_adjacency` reports no adjacency rather than a guessed one.
+        source that holds no document: that one is reported as the source it is,
+        with None for its document, and collapsing the two would make "you asked
+        for something that is not here" read the same as "here it is, and this
+        service has no document for it" -- the reason `_adjacency` reports no
+        adjacency rather than a guessed one.
 
-        The read embeds nothing and retrieves nothing: it walks what the store
-        already holds, which is why it can answer for a source of any size without
-        loading a model. It holds the same lock the writes hold, because a
-        replacement rewrites the docstore, the records and the positions together,
-        and a reader outside the lock could take one ingestion's nodes against
-        another's positions.
+        The document is the markdown the source was converted into, stored as the
+        source was ingested, which is the text its chunks were cut from. The chunks
+        are not it: a heading repeats in every node of its section, a unit below the
+        floor merges into its neighbour, and text repeated inside one source is
+        stored once. A source ingested before documents were stored holds none, and
+        reads as a source without one until it is ingested again.
 
-        The order comes from the position map rather than from the docstore's own
-        iteration order: the docstore is keyed by node id, so its order is
-        incidental, and the position a node was stored at is what makes its chunks
-        come back as the document reads.
-
-        Each chunk is read by the id the position map names rather than by walking
-        everything the docstore holds, because the durable docstore's lookup by id
-        is indexed and its full contents are a table scan away.
+        The read converts nothing, embeds nothing and retrieves nothing: it returns
+        what the store already holds, which is why it can answer for a source of any
+        size without loading a model. It holds the same lock the writes hold,
+        because a replacement rewrites the document, the record and the chunks
+        together, and a reader outside the lock could take one ingestion's document
+        against another's metadata.
         """
         with self._index_lock:
             record = self._source_records.get(address)
             if record is None:
                 return None
-            positions = self._store.positions(address)
-            chunks = []
-            for node_id, position in sorted(positions.items(), key=lambda item: item[1]):
-                node = self._index.docstore.get_node(node_id, raise_error=False)
-                if node is not None:
-                    chunks.append({"text": node.get_content(), "position": position})
-        return record, chunks
+            document = self._store.document(address)
+        return record, document
 
     def _placement(self, chunk: BaseNode) -> _Placement | None:
         """Where *chunk* sits in its source, or None when that cannot be established.

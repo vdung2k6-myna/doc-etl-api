@@ -5,8 +5,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from doc_etl_api.bootstrap import BootstrapState, BootstrapStatus, corpus_files, ingest_corpus
+from doc_etl_api.claims import InProcessClaimStore, claim_heartbeat
 from doc_etl_api.config import Settings
-from doc_etl_api.pipeline import IndexPipeline
+from doc_etl_api.pipeline import IndexPipeline, content_hash
 from tests.stubs import EMBEDDING_MODEL_NAME, StubEmbedding
 from tests.test_pipeline import stub_page
 
@@ -228,6 +229,7 @@ def _corpus_settings(
     collections: str = "",
     urls: str = "",
     file_collections: dict[str, list[str]] | None = None,
+    **overrides,
 ) -> Settings:
     return Settings(
         vector_store_backend="simple",
@@ -238,6 +240,7 @@ def _corpus_settings(
         knowledge_corpus_urls=urls,
         knowledge_corpus_collections=collections,
         knowledge_corpus_file_collections=file_collections or {},
+        **overrides,
     )
 
 
@@ -486,8 +489,8 @@ def test_a_corpus_source_is_fetchable_by_its_filename(tmp_path):
     assert response.status_code == 200
     body = response.json()
     assert body["name"] == "handbook.txt"
-    assert body["chunks"], "the corpus source stored no chunks"
-    assert "Grounding content" in body["chunks"][0]["text"]
+    assert body["document"], "the corpus source stored no document"
+    assert "Grounding content" in body["document"]
 
 
 # --- A second startup over a corpus the index already holds -------------------
@@ -534,6 +537,52 @@ def test_the_second_startup_over_an_unchanged_corpus_parses_nothing(corpus_dir):
     assert parsed == [], "the second startup parsed an unchanged corpus again"
     assert pipeline.indexed_sources == 2
     assert pipeline.search("alpha", top_k=5), "the corpus is no longer searchable"
+
+
+def test_a_current_corpus_source_with_no_document_is_ingested_once_more(corpus_dir):
+    """A source from before documents were stored is converted again, and only it.
+
+    Its content is current, so the digest comparison on its own would skip it --
+    and the source would stay readable only as chunks, for as long as it went
+    unedited. Requiring a captured document as well is what converts it once more,
+    and what keeps that one conversion from becoming one per source per restart:
+    the file that already holds a document is still skipped, with its converter
+    never called.
+    """
+    pipeline, settings, parsed = _recording_pipeline(corpus_dir)
+    pipeline.ingest_file(
+        source_id="beta",
+        file=BytesIO((corpus_dir / "beta.txt").read_bytes()),
+        filename="beta.txt",
+    )
+    assert parsed == ["beta.txt"], "the fixture did not ingest beta.txt through the converter"
+
+    # alpha.txt, written the way this service wrote a source before it stored
+    # documents: the record as that version kept it -- content digest, collections,
+    # and nothing saying what it was converted from.
+    payload = (corpus_dir / "alpha.txt").read_bytes()
+    pipeline._store.replace(
+        "alpha.txt",
+        name="alpha.txt",
+        source_type="file",
+        collections=(),
+        chunk_count=0,
+        content_hash=content_hash(payload),
+        positions={},
+    )
+    pipeline.refresh()
+    assert pipeline.is_current("alpha.txt", content_hash(payload), [])
+    assert not pipeline.has_document("alpha.txt"), "the fixture left the source a document"
+
+    parsed.clear()
+    state = BootstrapState()
+    ingest_corpus(pipeline, settings, state)
+
+    assert state.status is BootstrapStatus.COMPLETE
+    assert state.failures == []
+    assert parsed == ["alpha.txt"], "a source that already held a document was converted again"
+    assert pipeline.has_document("alpha.txt"), "the source was skipped without a document"
+    assert pipeline.source_content("alpha.txt")[1] == "alpha"
 
 
 def test_editing_one_corpus_file_re_ingests_that_file_alone(corpus_dir):
@@ -616,3 +665,60 @@ def test_a_corpus_page_is_fetched_for_comparison_and_only_converted_when_changed
     assert not any(text.strip() == "Corpus page body." for text in stored), (
         "the superseded page is still stored"
     )
+
+
+# --- An instance that waited another instance's claim out ----------------------
+
+
+def test_a_deferring_instance_reports_a_source_whose_document_was_never_captured(tmp_path):
+    """The question a deferring instance asks is about content, and only content.
+
+    An instance whose wait for another instance's claim runs out answers from the
+    index -- is the source there? -- and being there is its content. A source
+    current in content and holding no document is still one the index holds, so the
+    waiting instance reports it, exactly as it reports a source that has one. The
+    document is the other half of the decision to skip a source, asked by the
+    instance that would do the ingesting; asking it here would report a source the
+    index plainly holds as one that is missing, and would fail a bootstrap over a
+    corpus that is fully loaded.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "guide.txt").write_text("Grounding content.")
+    pipeline, settings, parsed = _recording_pipeline(corpus, job_orphan_threshold_seconds=1)
+
+    # A source current in content, holding no document: what the index holds of one
+    # ingested before this service stored documents.
+    payload = (corpus / "guide.txt").read_bytes()
+    pipeline._store.replace(
+        "guide.txt",
+        name="guide.txt",
+        source_type="file",
+        collections=(),
+        chunk_count=0,
+        content_hash=content_hash(payload),
+        positions={},
+    )
+    pipeline.refresh()
+    assert pipeline.is_current("guide.txt", content_hash(payload), [])
+    assert not pipeline.has_document("guide.txt"), "the fixture left the source a document"
+
+    claims = InProcessClaimStore()
+    assert claims.claim("guide.txt", "instance-holding", 1.0)
+    state = BootstrapState()
+
+    with claim_heartbeat(claims, "guide.txt", "instance-holding", interval=0.05):
+        ingest_corpus(
+            pipeline,
+            settings,
+            state,
+            claims,
+            "instance-deferring",
+            heartbeat_interval=0.05,
+        )
+
+    assert state.status is BootstrapStatus.COMPLETE, state.failures
+    assert state.failures == []
+    assert parsed == [], "the deferring instance loaded the source another holds"
+    assert pipeline.indexed_sources == 1, "the source the index held was not reported"
+    assert not pipeline.has_document("guide.txt"), "the deferring instance captured a document"

@@ -28,7 +28,6 @@ from doc_etl_api.schemas import (
     IngestFileResponse,
     IngestUrlResponse,
     JobStatusResponse,
-    NeighbourChunk,
     SearchRequest,
     SearchResponse,
     SearchResult,
@@ -388,11 +387,14 @@ async def search(
     "/sources/content",
     response_model=SourceContentResponse,
     summary="Get a source's stored content",
-    description="Return every chunk the index stores for one source, in reading order, "
-    "addressed by the `address` the source catalog reports. The chunks are what was "
-    "chunked and indexed, which is not a copy of the document that was submitted. The "
-    "read performs no retrieval and no embedding: it returns what the index already "
-    "holds. An address no indexed source has is reported as not found.",
+    description="Return the document the source at `address` was converted into, addressed by the "
+    "`address` the source catalog reports. The document is the markdown the conversion produced, "
+    "which is the text the source's chunks were cut from: it is not a copy of the file or page "
+    "that was submitted, and it is not the chunks themselves. A source whose document was not "
+    "captured -- one ingested before this service stored documents, and not ingested since -- is "
+    "reported as the source it is, with no document. The read performs no conversion, no "
+    "retrieval and no embedding: it returns what the index already holds. An address no indexed "
+    "source has is reported as not found.",
 )
 async def get_source_content(
     pipeline: PipelineDep,
@@ -407,13 +409,13 @@ async def get_source_content(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Source {address!r} not found.",
         )
-    record, chunks = content
+    record, document = content
     return SourceContentResponse(
         name=record.name,
         source_type=record.source_type,
         collections=list(record.collections),
         chunk_count=record.chunk_count,
-        chunks=[NeighbourChunk(**chunk) for chunk in chunks],
+        document=document,
     )
 
 

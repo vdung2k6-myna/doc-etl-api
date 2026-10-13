@@ -157,12 +157,13 @@ class SourceContentResponse(BaseModel):
         default_factory=list, description="Collections the source belongs to, if any"
     )
     chunk_count: int = Field(..., description="Number of chunks stored for this source")
-    chunks: list[NeighbourChunk] = Field(
-        default_factory=list,
-        description="Every chunk the index stores for this source, ordered by position. These "
-        "are the chunks as they were chunked and indexed, which is not a copy of the document "
-        "that was submitted: chunking removes repeated headings, splits tables and dedupes "
-        "text. Join them to read the content through.",
+    document: str | None = Field(
+        default=None,
+        description="The document this source was converted into, as the conversion produced it. "
+        "This is the text the source's chunks were cut from, rather than the chunks themselves "
+        "and rather than a copy of the file or page that was submitted. Null for a source whose "
+        "document was not captured: one ingested before this service stored documents, and not "
+        "ingested since.",
     )
 
 
